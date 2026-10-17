@@ -48,7 +48,22 @@ bool SlamSystem::Init(const std::string& yaml_path) {
     if (options_.with_visualization_) {
         LOG(INFO) << "slam with 3D UI";
         ui_ = std::make_shared<ui::PangolinWindow>();
-        ui_->Init();
+        ui::LoopDisplayOptions display;
+        const auto settings = yaml["system"]["loop_display"];
+        if (settings && !settings.IsMap()) {
+            LOG(ERROR) << "system.loop_display must be a map";
+            return false;
+        }
+        if (settings) {
+            display.enabled = settings["enabled"].as<bool>(display.enabled);
+            display.min_interval = settings["min_interval"].as<double>(display.min_interval);
+            const auto max_points = settings["max_points"].as<long long>(display.max_points);
+            if (max_points <= 0) return false;
+            display.max_points = static_cast<size_t>(max_points);
+        }
+        if (!display.Valid()) return false;
+        ui_->ConfigureLoopDisplay(display);
+        if (!ui_->Init()) return false;
 
         lio_->SetUI(ui_);
     }
@@ -59,11 +74,6 @@ bool SlamSystem::Init(const std::string& yaml_path) {
 
         g2p5_ = std::make_shared<g2p5::G2P5>(opt);
         g2p5_->Init(yaml_path);
-
-        if (options_.with_loop_closing_) {
-            /// 当发生回环时，触发一次重绘
-            lc_->SetLoopClosedCB([this]() { g2p5_->RedrawGlobalMap(); });
-        }
 
         if (options_.with_2dvisualization_) {
             g2p5_->SetMapUpdateCallback([this](g2p5::G2P5MapPtr map) {
@@ -78,6 +88,14 @@ bool SlamSystem::Init(const std::string& yaml_path) {
                 }
             });
         }
+    }
+
+    if (lc_) {
+        // One callback serves both displays, including configurations with no 2D grid map.
+        lc_->SetLoopClosedCB([this](const std::vector<Keyframe::Ptr>& keyframes) {
+            if (g2p5_) g2p5_->RedrawGlobalMap();
+            if (ui_) ui_->UpdateOptimizedMap(keyframes);
+        });
     }
 
     if (options_.online_mode_) {
@@ -126,6 +144,7 @@ bool SlamSystem::Init(const std::string& yaml_path) {
 }
 
 SlamSystem::~SlamSystem() {
+    lc_.reset();  // Join the backend callback thread before destroying either display.
     if (ui_) {
         ui_->Quit();
     }
@@ -161,7 +180,12 @@ void SlamSystem::SaveMap(const std::string& path) {
         LOG(WARNING) << "save map rejected: no keyframes yet";
         return;
     }
-    auto global_map = lio_->GetGlobalMap(!options_.with_loop_closing_);
+    std::vector<SE3> exported_poses;
+    auto global_map = lio_->GetGlobalMap(!options_.with_loop_closing_, true, -1.0f, &exported_poses);
+    if (exported_poses.size() != keyframes.size()) {
+        LOG(WARNING) << "save map rejected: keyframe snapshot changed";
+        return;
+    }
     if (!global_map || global_map->empty()) {
         LOG(WARNING) << "save map rejected: empty point cloud";
         return;
@@ -187,7 +211,7 @@ void SlamSystem::SaveMap(const std::string& path) {
     tm_options.map_path_ = save_path;
 
     TiledMap tm(tm_options);
-    SE3 start_pose = keyframes.front()->GetOptPose();
+    SE3 start_pose = exported_poses.front();
     tm.ConvertFromFullPCD(global_map, start_pose, save_path);
 
     pcl::io::savePCDFileBinaryCompressed(save_path + "/global.pcd", *global_map);
@@ -196,8 +220,9 @@ void SlamSystem::SaveMap(const std::string& path) {
     /// 每行: id timestamp tx ty tz qx qy qz qw
     std::ofstream kf_file(save_path + "/keyframes.txt");
     kf_file << std::setprecision(18);
-    for (const auto& kf : keyframes) {
-        const SE3 pose = options_.with_loop_closing_ ? kf->GetOptPose() : kf->GetLIOPose();
+    for (size_t i = 0; i < keyframes.size(); ++i) {
+        const auto& kf = keyframes[i];
+        const SE3& pose = exported_poses[i];
         const auto& t = pose.translation();
         const auto q = pose.unit_quaternion();
         kf_file << kf->GetID() << " " << kf->GetState().timestamp_ << " " << t.x() << " " << t.y() << " " << t.z()

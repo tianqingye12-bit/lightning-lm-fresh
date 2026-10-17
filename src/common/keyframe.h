@@ -25,6 +25,19 @@ class Keyframe {
         pose_opt_ = pose_lio_;
     }
 
+    // Serialize whole-graph commits with pose snapshots; individual getters keep their own locks.
+    static std::mutex& PoseGraphMutex() {
+        static std::mutex mutex;
+        return mutex;
+    }
+    static std::vector<SE3> SnapshotPoses(const std::vector<Ptr>& keyframes, bool use_lio_pose = false) {
+        UL graph_lock(PoseGraphMutex());
+        std::vector<SE3> poses;
+        poses.reserve(keyframes.size());
+        for (const auto& kf : keyframes) poses.push_back(use_lio_pose ? kf->GetLIOPose() : kf->GetOptPose());
+        return poses;
+    }
+
     unsigned long GetID() const { return id_; }
     CloudPtr GetCloud() const { return cloud_; }
 

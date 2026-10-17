@@ -960,7 +960,7 @@ void LaserMapping::ObsModel(NavState &s, ESKF::CustomObservationModel &obs) {
 
 ///////////////////////////  private method /////////////////////////////////////////////////////////////////////
 
-CloudPtr LaserMapping::GetGlobalMap(bool use_lio_pose, bool use_voxel, float res) {
+CloudPtr LaserMapping::GetGlobalMap(bool use_lio_pose, bool use_voxel, float res, std::vector<SE3>* exported_poses) {
     if (res < 0.0f) {
         res = static_cast<float>(detail_options_.export_resolution);
     }
@@ -973,7 +973,11 @@ CloudPtr LaserMapping::GetGlobalMap(bool use_lio_pose, bool use_voxel, float res
     pcl::VoxelGrid<PointType> voxel;
     voxel.setLeafSize(res, res, res);
 
-    for (auto &kf : all_keyframes_) {
+    const auto keyframes = all_keyframes_;
+    const auto poses = Keyframe::SnapshotPoses(keyframes, use_lio_pose);
+    if (exported_poses) *exported_poses = poses;
+    for (size_t i = 0; i < keyframes.size(); ++i) {
+        const auto& kf = keyframes[i];
         CloudPtr cloud = kf->GetCloud();
 
         CloudPtr cloud_filter(new PointCloudType);
@@ -988,15 +992,11 @@ CloudPtr LaserMapping::GetGlobalMap(bool use_lio_pose, bool use_voxel, float res
 
         CloudPtr cloud_trans(new PointCloudType);
 
-        if (use_lio_pose) {
-            pcl::transformPointCloud(*cloud_filter, *cloud_trans, kf->GetLIOPose().matrix());
-        } else {
-            pcl::transformPointCloud(*cloud_filter, *cloud_trans, kf->GetOptPose().matrix());
-        }
+        pcl::transformPointCloud(*cloud_filter, *cloud_trans, poses[i].matrix());
 
         *global_map += *cloud_trans;
 
-        LOG(INFO) << "kf " << kf->GetID() << ", pose: " << kf->GetOptPose().translation().transpose();
+        LOG(INFO) << "kf " << kf->GetID() << ", pose: " << poses[i].translation().transpose();
     }
 
     CloudPtr global_map_filtered(new PointCloudType);

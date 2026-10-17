@@ -6,6 +6,7 @@
 #define LIGHTNING_LOOP_CANDIDATE_H
 
 #include "common/eigen_types.h"
+#include "core/loop_closing/loop_quality.h"
 
 namespace lightning {
 
@@ -21,6 +22,8 @@ struct LoopCandidate {
     SE3 Tij_;
 
     double ndt_score_ = 0.0;
+    loop_quality::MatchMetrics quality_;
+    bool verified_ = false;
 };
 
 }  // namespace lightning

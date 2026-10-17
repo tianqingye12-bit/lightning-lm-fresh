@@ -14,6 +14,7 @@ bool PangolinWindow::Init() {
     bool inited = impl_->Init();
     // 创建渲染线程
     if (inited) {
+        impl_->StartLoopMapWorker();
         impl_->render_thread_ = std::thread([this]() { impl_->Render(); });
     }
     return inited;
@@ -22,6 +23,7 @@ bool PangolinWindow::Init() {
 void PangolinWindow::Reset(const std::vector<Keyframe::Ptr>& keyframes) { impl_->Reset(keyframes); }
 
 void PangolinWindow::Quit() {
+    impl_->StopLoopMapWorker();
     if (impl_->render_thread_.joinable()) {
         impl_->exit_flag_.store(true);
         impl_->render_thread_.join();
@@ -90,6 +92,23 @@ void PangolinWindow::UpdateScan(CloudPtr cloud, const SE3& pose) {
 void PangolinWindow::UpdateKF(std::shared_ptr<Keyframe> kf) {
     UL lock(impl_->mtx_current_scan_);
     impl_->all_keyframes_.emplace_back(kf);
+}
+
+void PangolinWindow::ConfigureLoopDisplay(const LoopDisplayOptions& options) {
+    impl_->loop_display_options_ = options;
+}
+
+void PangolinWindow::UpdateOptimizedMap(const std::vector<Keyframe::Ptr>& keyframes) {
+    if (!impl_->loop_display_options_.enabled || keyframes.empty()) return;
+    PangolinWindowImpl::LoopSnapshot snapshot;
+    snapshot.frames.reserve(keyframes.size());
+    const auto poses = Keyframe::SnapshotPoses(keyframes);
+    for (size_t i = 0; i < keyframes.size(); ++i) {
+        snapshot.frames.push_back({keyframes[i]->GetCloud(), poses[i]});
+    }
+    const auto& last = keyframes.back();
+    snapshot.map_from_odom = snapshot.frames.back().pose * last->GetLIOPose().inverse();
+    impl_->loop_map_tasks_.Put(std::move(snapshot));
 }
 
 void PangolinWindow::SetCurrentScanSize(int current_scan_size) { impl_->max_size_of_current_scan_ = current_scan_size; }

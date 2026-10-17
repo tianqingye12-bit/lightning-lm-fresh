@@ -9,6 +9,7 @@
 #include "common/loop_candidate.h"
 #include "common/nav_state.h"
 #include "common/point_def.h"
+#include "ui/loop_display_options.h"
 
 namespace lightning::ui {
 
@@ -49,6 +50,10 @@ class PangolinWindow {
     void UpdateScan(CloudPtr cloud, const SE3& pose);
 
     void UpdateKF(std::shared_ptr<Keyframe> kf);
+
+    // Configure before Init(); called from the loop thread only after a complete graph commit.
+    void ConfigureLoopDisplay(const LoopDisplayOptions& options);
+    void UpdateOptimizedMap(const std::vector<Keyframe::Ptr>& keyframes);
 
     /// 等待显示线程结束，并释放资源
     void Quit();
