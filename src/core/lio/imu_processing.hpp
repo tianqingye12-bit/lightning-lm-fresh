@@ -14,6 +14,7 @@
 #include "common/eigen_types.h"
 #include "common/measure_group.h"
 #include "common/point_def.h"
+#include "common/options.h"
 #include "core/lio/eskf.hpp"
 #include "core/lio/imu_filter.h"
 #include "core/lio/pose6d.h"
@@ -42,6 +43,7 @@ class ImuProcess {
     void SetUseIMUFilter(bool b) { use_imu_filter_ = b; }
 
     double GetMeanAccNorm() const { return mean_acc_.norm(); }
+    double GetAccScaleFactor() const { return acc_scale_factor_; }
 
     Eigen::Matrix<double, 12, 12> Q_;
     Vec3d cov_acc_;
@@ -269,7 +271,7 @@ inline void ImuProcess::UndistortPcl(const MeasureGroup &meas, ESKF &kf_state, C
         return;
     }
 
-    auto it_pcl = pcl_out->points.end() - 1;
+    std::ptrdiff_t point_index = static_cast<std::ptrdiff_t>(pcl_out->size()) - 1;
     for (auto it_kp = imu_pose_.end() - 1; it_kp != imu_pose_.begin(); it_kp--) {
         auto head = it_kp - 1;
         auto tail = it_kp;
@@ -279,8 +281,13 @@ inline void ImuProcess::UndistortPcl(const MeasureGroup &meas, ESKF &kf_state, C
         acc_imu = (tail->acc);
         angvel_avr = (tail->gyr);
 
-        for (; it_pcl->time / double(1000) > head->offset_time && it_pcl != pcl_out->points.begin(); it_pcl--) {
-            dt = it_pcl->time / double(1000) - head->offset_time;
+        for (; point_index >= 0; --point_index) {
+            auto it_pcl = pcl_out->points.begin() + point_index;
+            const double point_time = it_pcl->time / 1000.0;
+            if (point_time < head->offset_time) {
+                break;
+            }
+            dt = point_time - head->offset_time;
 
             /// dt 有时候存在非法数据
             if (dt < 0 || dt > lo::lidar_time_interval) {
@@ -292,7 +299,8 @@ inline void ImuProcess::UndistortPcl(const MeasureGroup &meas, ESKF &kf_state, C
              * Note: Compensation direction is INVERSE of Frame's moving direction
              * So if we want to compensate a point at timestamp-i to the frame-e
              * p_compensate = R_imu_e ^ T * (R_i * P_i + T_ei) where T_ei is represented in global frame */
-            Mat3d R_i(R_imu * math::exp(angvel_avr, dt).matrix());
+            // SO3::exp takes the full rotation vector; math::exp uses quaternion half angles.
+            Mat3d R_i(R_imu * SO3::exp(angvel_avr * dt).matrix());
 
             Vec3d P_i(it_pcl->x, it_pcl->y, it_pcl->z);
             Vec3d T_ei(pos_imu + vel_imu * dt + 0.5 * acc_imu * dt * dt - imu_state.pos_);
@@ -333,10 +341,11 @@ inline void ImuProcess::Process(const MeasureGroup &meas, ESKF &kf_state, CloudP
             cov_gyr_ = cov_gyr_scale_;
             const double mean_acc_norm = mean_acc_.norm();
 
-            if (mean_acc_norm > 0.5 && mean_acc_norm < 1.5) {
-                acc_scale_factor_ = G_m_s2;
-            } else if (mean_acc_norm > 7.0 && mean_acc_norm < 12.0) {
-                acc_scale_factor_ = 1.0;
+            if ((mean_acc_norm > 0.5 && mean_acc_norm < 1.5) ||
+                (mean_acc_norm > 7.0 && mean_acc_norm < 12.0)) {
+                // The initial stationary acceleration and estimated gravity must cancel.
+                // This handles both g and m/s^2 inputs and the measured scale error.
+                acc_scale_factor_ = G_m_s2 / mean_acc_norm;
             } else {
                 acc_scale_factor_ = 1.0;
                 LOG(WARNING) << "imu init mean acc norm is abnormal for unit inference: " << mean_acc_norm

@@ -106,8 +106,8 @@ class ESKF {
     /// IMU预测
     void Predict(const double& dt, const ProcessNoiseType& Q, const Vec3d& gyro, const Vec3d& acce);
 
-    /// 自定义模型更新
-    void Update(ObsType obs, const double& R);
+    /// 自定义模型更新。失败时保留预测状态和协方差，返回 false。
+    bool Update(ObsType obs, const double& R);
 
     // accessors
     const NavState& GetX() const { return x_; }

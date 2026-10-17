@@ -90,7 +90,7 @@ struct NavState {
         timestamp_ += dt;
         pos_ += vec.middleRows(kPosIdx, kBlockDim) * dt;
         rot_ = rot_ * SO3::exp(vec.middleRows(kRotIdx, kBlockDim) * dt);
-        // vel_ += vec.middleRows(kVelIdx, kBlockDim) * dt;
+        vel_ += vec.middleRows(kVelIdx, kBlockDim) * dt;
         bg_ += vec.middleRows(kBgIdx, kBlockDim) * dt;
     }
 

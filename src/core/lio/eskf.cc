@@ -102,7 +102,7 @@ void ESKF::Predict(const double& dt, const ESKF::ProcessNoiseType& Q, const Vec3
  * @param obs
  * @param R
  */
-void ESKF::Update(ESKF::ObsType obs, const double& R) {
+bool ESKF::Update(ESKF::ObsType obs, const double& R) {
     custom_obs_model_.valid_ = true;
     custom_obs_model_.converge_ = true;
 
@@ -114,7 +114,15 @@ void ESKF::Update(ESKF::ObsType obs, const double& R) {
     StateVecType dx_current = StateVecType::Zero();  // 本轮迭代的dx
 
     NavState start_x = x_;  // 迭代的起点
-    NavState last_x = x_;
+    const auto reject_update = [&]() {
+        x_ = start_x;
+        P_ = P_propagated;
+        return false;
+    };
+    if (!std::isfinite(R) || R <= 0.0) {
+        LOG(WARNING) << "Reject ESKF update with invalid measurement noise: " << R;
+        return reject_update();
+    }
 
     int converged_times = 0;
     double last_lidar_res = 0;
@@ -141,15 +149,13 @@ void ESKF::Update(ESKF::ObsType obs, const double& R) {
         }
 
         if (custom_obs_model_.valid_ == false) {
-            x_ = last_x;
-            P_ = P_propagated;
-            return;
+            return reject_update();
         }
 
         if (use_aa_ && i > -1 && (obs == ObsType::LIDAR || obs == ObsType::WHEEL_SPEED_AND_LIDAR) &&
             custom_obs_model_.lidar_residual_mean_ >= last_lidar_res * 1.01) {
-            x_ = last_x;
-            break;
+            LOG(WARNING) << "Reject ESKF update after Anderson acceleration increased residual.";
+            return reject_update();
         }
         iterated_num += 1;
 
@@ -194,12 +200,24 @@ void ESKF::Update(ESKF::ObsType obs, const double& R) {
 
         Mat6d HTH = custom_obs_model_.HTH_;
         Vec6d HTr = custom_obs_model_.HTr_;
+        if (!HTH.allFinite() || !HTr.allFinite()) {
+            LOG(WARNING) << "Reject ESKF update with non-finite observation.";
+            return reject_update();
+        }
         Mat6d HTH_sym = 0.5 * (HTH + HTH.transpose());
 
-        Eigen::SelfAdjointEigenSolver<Mat6d> eigen_solver(HTH_sym);
+        // Translation and rotation columns have different units and scales. Test
+        // observability in scaled coordinates dx = S * dy, then transform the
+        // projected information back. A full-rank observation keeps its weight.
+        const Vec6d information_scale = HTH_sym.diagonal().cwiseMax(1e-12).cwiseSqrt();
+        const Mat6d S = information_scale.cwiseInverse().asDiagonal();
+        const Mat6d S_inv = information_scale.asDiagonal();
+        const Mat6d HTH_normalized = S * HTH_sym * S;
+        const Vec6d HTr_normalized = S * HTr;
+        Eigen::SelfAdjointEigenSolver<Mat6d> eigen_solver(HTH_normalized);
         if (eigen_solver.info() != Eigen::Success) {
             LOG(WARNING) << "Failed to decompose ESKF observation information matrix.";
-            continue;
+            return reject_update();
         }
 
         const Vec6d eigen_values = eigen_solver.eigenvalues();
@@ -218,10 +236,14 @@ void ESKF::Update(ESKF::ObsType obs, const double& R) {
                 nullity++;
             }
         }
+        if (nullity == pose_obs_dim_) {
+            LOG(WARNING) << "Reject ESKF update without observable pose directions.";
+            return reject_update();
+        }
 
         const Mat6d observable_projector = eigen_vectors * observable_mask.asDiagonal() * eigen_vectors.transpose();
-        const Mat6d HTH_eff = observable_projector * HTH_sym * observable_projector;
-        const Vec6d HTr_eff = observable_projector * HTr;
+        const Mat6d HTH_eff = S_inv * observable_projector * HTH_normalized * observable_projector * S_inv;
+        const Vec6d HTr_eff = S_inv * observable_projector * HTr_normalized;
 
         CovType P_temp = (P_ / R).inverse();  // P阵上面已经更新
 
@@ -247,11 +269,9 @@ void ESKF::Update(ESKF::ObsType obs, const double& R) {
 
         dx_current = K_r + (K_H - Eigen::Matrix<double, state_dim_, state_dim_>::Identity()) * dx_current;
 
-        // check nan
-        for (int j = 0; j < state_dim_; ++j) {
-            if (std::isnan(dx_current(j, 0))) {
-                return;
-            }
+        if (!dx_current.allFinite()) {
+            LOG(WARNING) << "Reject ESKF update with non-finite state increment.";
+            return reject_update();
         }
 
         // Vec3d dv = dx_current.middleRows(NavState::kVelIdx, NavState::kBlockDim);
@@ -271,9 +291,7 @@ void ESKF::Update(ESKF::ObsType obs, const double& R) {
             dx_rotation_deg > options_.max_update_rotation_step_deg_) {
             LOG(ERROR) << "Reject ESKF iter update, dtrans: " << dx_translation << ", drot_deg: " << dx_rotation_deg
                        << ", dvel: " << dx_current.segment<NavState::kBlockDim>(NavState::kVelIdx).norm();
-            x_ = start_x;
-            P_ = P_propagated;
-            return;
+            return reject_update();
         }
 
         if (!use_aa_) {
@@ -288,11 +306,13 @@ void ESKF::Update(ESKF::ObsType obs, const double& R) {
                 // 利用AA计算dx from start
                 auto dx_all = x_.boxminus(start_x);
                 auto new_dx_all = aa_.compute(dx_all);
+                if (!new_dx_all.allFinite()) {
+                    LOG(WARNING) << "Reject ESKF update with non-finite Anderson acceleration increment.";
+                    return reject_update();
+                }
                 x_ = start_x.boxplus(new_dx_all);
             }
         }
-
-        last_x = x_;
 
         // update last res
         last_lidar_res = custom_obs_model_.lidar_residual_mean_;
@@ -343,16 +363,21 @@ void ESKF::Update(ESKF::ObsType obs, const double& R) {
             P_ = L_ - K_H.block<state_dim_, pose_obs_dim_>(0, 0) * P_.template block<pose_obs_dim_, state_dim_>(0, 0);
 
             if (nullity > 0) {
-                // LOG_EVERY_N(INFO, 50) << "ESKF observation degeneracy rank " << (pose_obs_dim_ - nullity) << "/"
-                //                      << pose_obs_dim_;
+                LOG_EVERY_N(INFO, 50) << "ESKF observation degeneracy rank " << (pose_obs_dim_ - nullity) << "/"
+                                      << pose_obs_dim_ << ", normalized eigenvalues: " << eigen_values.transpose();
                 P_.block<pose_obs_dim_, pose_obs_dim_>(0, 0) *= options_.degeneracy_cov_inflation_;
             }
 
-            break;
+            if (!P_.allFinite()) {
+                LOG(WARNING) << "Reject ESKF update with non-finite posterior covariance.";
+                return reject_update();
+            }
+            SymmetrizeAndFloorCovariance(P_, options_.min_cov_diag_);
+            return true;
         }
     }
 
-    SymmetrizeAndFloorCovariance(P_, options_.min_cov_diag_);
+    return reject_update();
 }
 
 }  // namespace lightning

@@ -32,18 +32,8 @@ list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 include(cmake/packages.cmake)
 
 # msg 和 srv
-set(MY_SRV_FILES "")
-set(SRC_DIR ${PROJECT_SOURCE_DIR}/srv)
-file(GLOB_RECURSE SRC_FILES ${SRC_DIR}/*.srv)
-foreach (SRC_FILE ${SRC_FILES})
-    file(RELATIVE_PATH REL_PATH ${SRC_DIR} ${SRC_FILE})
-    list(APPEND MY_SRV_FILES ${PROJECT_SOURCE_DIR}:srv/${REL_PATH})
-endforeach ()
-
 rosidl_generate_interfaces(${PROJECT_NAME}
-        ${MY_SRV_FILES}
-        ${MY_MSG_FILES}
-        ${MY_ACTION_FILES}
+        "srv/SaveMap.srv"
         DEPENDENCIES std_msgs geometry_msgs sensor_msgs nav_msgs
 )
 
@@ -51,8 +41,8 @@ include_directories(
         ${CMAKE_CURRENT_BINARY_DIR}/rosidl_generator_cpp
 )
 
-install(DIRECTORY config
-        DESTINATION lib/${PROJECT_NAME}/
+install(DIRECTORY config launch
+        DESTINATION share/${PROJECT_NAME}/
 )
 
 add_subdirectory(thirdparty/livox_ros_driver)

@@ -96,7 +96,19 @@ Lightning-LM特性：
 ### 环境
 
 Ubuntu 22.04 或更高版本。
+方法 1：使用环境变量（推荐，最简单,这样编译电脑不会卡顿）
 
+MAKEFLAGS=-j2 nice -n 19 colcon build --parallel-workers 1
+
+方法 2：使用双横线分隔符
+
+nice -n 19 colcon build --parallel-workers 1 --cmake-args -- -j2
+
+方法 3：使用 CMake 变量
+
+nice -n 19 colcon build --parallel-workers 1 --cmake-args -DCMAKE_BUILD_PARALLEL_LEVEL=2
+
+我推荐使用方法 1（环境变量），最简洁可靠：
 Ubuntu 20.04 应该也可行，未测试。
 
 ### 依赖

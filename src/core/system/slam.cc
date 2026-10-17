@@ -12,6 +12,8 @@
 
 #include <yaml-cpp/yaml.h>
 #include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <opencv2/opencv.hpp>
 
 namespace lightning {
@@ -136,6 +138,11 @@ void SlamSystem::StartSLAM(std::string map_name) {
 
 void SlamSystem::SaveMap(const SaveMapService::Request::SharedPtr request,
                          SaveMapService::Response::SharedPtr response) {
+    if (!lio_ || lio_->GetAllKeyframes().empty()) {
+        LOG(WARNING) << "save map rejected: no keyframes yet";
+        response->response = 3;
+        return;
+    }
     map_name_ = request->map_id;
     std::string save_path = "./data/" + map_name_ + "/";
 
@@ -144,6 +151,21 @@ void SlamSystem::SaveMap(const SaveMapService::Request::SharedPtr request,
 }
 
 void SlamSystem::SaveMap(const std::string& path) {
+    // Validate before accessing front() or replacing an existing map directory.
+    if (!lio_) {
+        LOG(WARNING) << "save map rejected: LIO is not initialized";
+        return;
+    }
+    const auto keyframes = lio_->GetAllKeyframes();
+    if (keyframes.empty()) {
+        LOG(WARNING) << "save map rejected: no keyframes yet";
+        return;
+    }
+    auto global_map = lio_->GetGlobalMap(!options_.with_loop_closing_);
+    if (!global_map || global_map->empty()) {
+        LOG(WARNING) << "save map rejected: empty point cloud";
+        return;
+    }
     std::string save_path = path;
     if (save_path.empty()) {
         save_path = "./data/" + map_name_ + "/";
@@ -159,17 +181,28 @@ void SlamSystem::SaveMap(const std::string& path) {
     }
 
     // auto global_map_no_loop = lio_->GetGlobalMap(true);
-    auto global_map = lio_->GetGlobalMap(!options_.with_loop_closing_);
     // auto global_map_raw = lio_->GetGlobalMap(!options_.with_loop_closing_, false, 0.1);
 
     TiledMap::Options tm_options;
     tm_options.map_path_ = save_path;
 
     TiledMap tm(tm_options);
-    SE3 start_pose = lio_->GetAllKeyframes().front()->GetOptPose();
+    SE3 start_pose = keyframes.front()->GetOptPose();
     tm.ConvertFromFullPCD(global_map, start_pose, save_path);
 
     pcl::io::savePCDFileBinaryCompressed(save_path + "/global.pcd", *global_map);
+
+    /// 保存关键帧时间戳和位姿（与 global.pcd 使用同一套位姿），供离线去除车辆等后处理使用
+    /// 每行: id timestamp tx ty tz qx qy qz qw
+    std::ofstream kf_file(save_path + "/keyframes.txt");
+    kf_file << std::setprecision(18);
+    for (const auto& kf : keyframes) {
+        const SE3 pose = options_.with_loop_closing_ ? kf->GetOptPose() : kf->GetLIOPose();
+        const auto& t = pose.translation();
+        const auto q = pose.unit_quaternion();
+        kf_file << kf->GetID() << " " << kf->GetState().timestamp_ << " " << t.x() << " " << t.y() << " " << t.z()
+                << " " << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << "\n";
+    }
     // pcl::io::savePCDFileBinaryCompressed(save_path + "/global_no_loop.pcd", *global_map_no_loop);
     // pcl::io::savePCDFileBinaryCompressed(save_path + "/global_raw.pcd", *global_map_raw);
 

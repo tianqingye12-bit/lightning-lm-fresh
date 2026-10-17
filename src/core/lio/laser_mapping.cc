@@ -151,7 +151,14 @@ void LaserMapping::ProcessIMU(const lightning::IMUPtr &imu) {
 
     if (p_imu_->IsIMUInited()) {
         /// 更新最新imu状态
-        kf_imu_.Predict(timestamp - last_timestamp_imu_, p_imu_->Q_, imu->angular_velocity, imu->linear_acceleration);
+        if (kf_imu_.GetX().timestamp_ <= 0.0) {
+            kf_imu_ = kf_;
+        }
+        const double dt = timestamp - kf_imu_.GetX().timestamp_;
+        if (dt > 0.0) {
+            kf_imu_.Predict(dt, p_imu_->Q_, imu->angular_velocity,
+                            imu->linear_acceleration * p_imu_->GetAccScaleFactor());
+        }
 
         // LOG(INFO) << "newest wrt lidar: " << timestamp - kf_.GetX().timestamp_;
 
@@ -264,7 +271,7 @@ bool LaserMapping::Run() {
     // pred_state.pos_ = state_point_.pos_;  // 假定位置不动行不行,防止速度漂移
     // kf_.ChangeX(pred_state);
 
-    kf_.Update(ESKF::ObsType::LIDAR, 1.0);
+    const bool update_accepted = kf_.Update(ESKF::ObsType::LIDAR, 1.0);
 
     state_point_ = kf_.GetX();
     state_point_.timestamp_ = measures_.lidar_end_time_;
@@ -291,8 +298,11 @@ bool LaserMapping::Run() {
     //     LOG(ERROR) << "please check";
     // }
 
-    /// keyframes
-    if (last_kf_ == nullptr) {
+    /// Only registered scans may enter the local map or saved keyframes.
+    if (!update_accepted) {
+        LOG(WARNING) << "LIO registration rejected at " << std::setprecision(14) << measures_.lidar_end_time_
+                     << "; retain IMU prediction, skip keyframe and map insertion";
+    } else if (last_kf_ == nullptr) {
         MakeKF();
     } else {
         SE3 last_pose = last_kf_->GetLIOPose();
@@ -310,11 +320,12 @@ bool LaserMapping::Run() {
     /// 更新kf_for_imu
     kf_imu_ = kf_;
     if (!measures_.imu_.empty()) {
-        double t = measures_.imu_.back()->timestamp;
         for (auto &imu : imu_buffer_) {
-            double dt = imu->timestamp - t;
-            kf_imu_.Predict(dt, p_imu_->Q_, imu->angular_velocity, imu->linear_acceleration);
-            t = imu->timestamp;
+            const double dt = imu->timestamp - kf_imu_.GetX().timestamp_;
+            if (dt > 0.0) {
+                kf_imu_.Predict(dt, p_imu_->Q_, imu->angular_velocity,
+                                imu->linear_acceleration * p_imu_->GetAccScaleFactor());
+            }
         }
     }
 
@@ -326,7 +337,7 @@ bool LaserMapping::Run() {
               << state_point_.rot_.angleZ<double>() * 180 / M_PI << ", vel: " << state_point_.vel_.transpose()
               << ", grav: " << state_point_.grav_.transpose() << ", grav norm: " << state_point_.grav_.norm();
 
-    return true;
+    return update_accepted;
 }
 
 void LaserMapping::ProjectKFs(CloudPtr cloud, int size_limit) {

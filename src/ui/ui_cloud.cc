@@ -48,10 +48,9 @@ void UiCloud::SetCloud(CloudPtr cloud, const SE3& pose) {
 }
 
 void UiCloud::Render() {
-    // glPointSize(2.0);
+    glPointSize(point_size_);
 
     glBegin(GL_POINTS);
-    glPointSize(point_size_);
 
     for (int i = 0; i < xyz_data_.size(); ++i) {
         if (use_color_ == UseColor::PCL_COLOR) {
@@ -63,7 +62,7 @@ void UiCloud::Render() {
             glColor4f(color_data_height_[i][0], color_data_height_[i][1], color_data_height_[i][2], ui::opacity);
         } else if (use_color_ == UseColor::GRAY_COLOR) {
             glColor4f(color_data_gray_[i][0], color_data_gray_[i][1], color_data_gray_[i][2], ui::opacity);
-        } else if (use_color_ = UseColor::CUSTOM_COLOR) {
+        } else if (use_color_ == UseColor::CUSTOM_COLOR) {
             glColor4f(custom_color_[0], custom_color_[1], custom_color_[2], ui::opacity);
         }
 
