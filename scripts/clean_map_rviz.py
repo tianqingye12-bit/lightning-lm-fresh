@@ -58,7 +58,7 @@ class RvizPublisher:
         xyz = np.asarray(xyz, dtype=np.float32).reshape(-1, 3)
         if len(xyz) > max_points:  # 大地图按 5cm 体素降采样，RViz 才显示得动
             from clean_map_vehicles import voxel_keys
-            _, keep = np.unique(voxel_keys(xyz.astype(float), 0.05), return_index=True)
+            _, keep = np.unique(voxel_keys(xyz.astype(float), 0.05), axis=0, return_index=True)
             xyz = xyz[keep]
             intensity = None if intensity is None else np.asarray(intensity)[keep]
         fields = [PointField(name=n, offset=4 * i, datatype=PointField.FLOAT32, count=1)
@@ -125,7 +125,7 @@ def main():
             viz.publish_cloud(name, xyz[np.isfinite(xyz).all(axis=1)])
             print(f'/clean_map/{name}: {len(cloud)} points from {file}', flush=True)
     if (map_dir / 'keyframes.txt').exists():
-        viz.publish_trajectory(Trajectory(map_dir / 'keyframes.txt', np.inf))
+        viz.publish_trajectory(Trajectory(map_dir / 'keyframes.txt', np.finfo(float).max))
     print('Published (latched). Ctrl+C to exit.', flush=True)
     viz.spin()
 
