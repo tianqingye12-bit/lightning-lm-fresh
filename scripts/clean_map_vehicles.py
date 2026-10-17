@@ -33,7 +33,10 @@ def read_pcd(path):
     with open(path, 'rb') as f:
         header = []
         while True:
-            line = f.readline().decode('ascii').strip()
+            raw = f.readline()
+            if not raw:
+                raise ValueError(f'{path}: missing PCD DATA header')
+            line = raw.decode('ascii').strip()
             header.append(line)
             if line.startswith('DATA'):
                 break
@@ -114,12 +117,29 @@ class Trajectory:
 
     def __init__(self, path, max_gap):
         data = np.loadtxt(path, ndmin=2)
+        if data.shape[0] == 0 or data.shape[1] != 9 or not np.isfinite(data).all():
+            raise ValueError('keyframes.txt must contain finite id timestamp tx ty tz qx qy qz qw rows')
+        if not np.isfinite(max_gap) or max_gap <= 0:
+            raise ValueError('max_kf_gap must be positive and finite')
         order = np.argsort(data[:, 1])
         self.t, self.p, self.q = data[order, 1], data[order, 2:5], data[order, 5:9]
+        if np.any(np.diff(self.t) <= 0):
+            raise ValueError('Keyframe timestamps must be unique')
+        norms = np.linalg.norm(self.q, axis=1)
+        if np.any(norms < 1e-12):
+            raise ValueError('Keyframe quaternions must have nonzero norm')
+        self.q = self.q / norms[:, None]
         self.max_gap = max_gap
 
     def pose(self, t):
+        if not np.isfinite(t):
+            return None
         i = np.searchsorted(self.t, t)
+        if i < len(self.t) and self.t[i] == t:
+            T = np.eye(4)
+            T[:3, :3] = quat_to_mat(self.q[i])
+            T[:3, 3] = self.p[i]
+            return T
         if i == 0 or i == len(self.t):
             return None
         t0, t1 = self.t[i - 1], self.t[i]
@@ -133,8 +153,13 @@ class Trajectory:
 
 
 def voxel_keys(xyz, size):
-    k = np.floor(xyz / size).astype(np.int64) + (1 << 20)
-    return (k[:, 0] << 42) | (k[:, 1] << 21) | k[:, 2]
+    """Collision-free integer triplets, including negative and large coordinates."""
+    if not np.isfinite(size) or size <= 0:
+        raise ValueError('Voxel size must be positive and finite')
+    scaled = np.floor(np.asarray(xyz, dtype=float) / size)
+    if not np.isfinite(scaled).all() or np.any(np.abs(scaled) >= 2.0 ** 63):
+        raise ValueError('Voxel coordinates must be finite and fit int64')
+    return scaled.astype(np.int64)
 
 
 def estimate_floor(centroids, traj):
@@ -159,16 +184,23 @@ def components(centroids, size):
     """体素 26 邻域连通分量。"""
     from scipy.sparse import coo_matrix
     from scipy.sparse.csgraph import connected_components
+    if len(centroids) == 0:
+        return np.empty(0, dtype=np.int32)
     keys = voxel_keys(centroids, size)
-    uniq, cell = np.unique(keys, return_inverse=True)
+    uniq, cell = np.unique(keys, axis=0, return_inverse=True)
+    # Structured lexicographic keys avoid packed-coordinate overflow and carry.
+    key_dtype = np.dtype([('x', '<i8'), ('y', '<i8'), ('z', '<i8')])
+    def records(cells):
+        return np.ascontiguousarray(cells, dtype='<i8').view(key_dtype).ravel()
+    ordered = records(uniq)
     rows, cols = [], []
     offsets = [(dx, dy, dz) for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1)
                if (dx, dy, dz) > (0, 0, 0)]
     for dx, dy, dz in offsets:
-        nb = uniq + (dx << 42) + (dy << 21) + dz
-        j = np.searchsorted(uniq, nb)
-        j[j == len(uniq)] = 0
-        hit = uniq[j] == nb
+        nb = records(uniq + np.array([dx, dy, dz], dtype=np.int64))
+        j = np.searchsorted(ordered, nb)
+        j = np.minimum(j, len(uniq) - 1)
+        hit = ordered[j] == nb
         rows.append(np.nonzero(hit)[0])
         cols.append(j[hit])
     rows, cols = np.concatenate(rows), np.concatenate(cols)
@@ -206,7 +238,9 @@ def decode_image(msg, depth=False):
 
 class VehicleVoter:
     def __init__(self, cfg, centroids, model, device):
+        from scipy.spatial import cKDTree
         self.cfg, self.centroids, self.model, self.device = cfg, centroids, model, device
+        self.spatial_index = cKDTree(centroids)
         self.K = np.array(cfg['K'], dtype=float).reshape(3, 3)
         self.dist = np.array(cfg['distortion'], dtype=float)
         self.T_cam_lidar = np.array(cfg['T_cam_lidar'], dtype=float).reshape(4, 4)
@@ -234,7 +268,8 @@ class VehicleVoter:
             raise RuntimeError(f'Image {image.shape[1]}x{image.shape[0]} != calibration {self.w}x{self.h}')
         T = self.T_cam_lidar @ np.linalg.inv(T_world_lidar)
         rng = self.cfg['max_range']
-        near = np.nonzero((np.abs(self.centroids - T_world_lidar[:3, 3]) < rng).all(axis=1))[0]
+        near = np.asarray(self.spatial_index.query_ball_point(
+            T_world_lidar[:3, 3], rng, p=np.inf), dtype=np.intp)
         cam = self.centroids[near] @ T[:3, :3].T + T[:3, 3]
         z = cam[:, 2]
         keep = (z > 0.3) & (z < rng)
@@ -256,6 +291,8 @@ class VehicleVoter:
         visible = z <= zbuf[v // b, u // b] + tol
         scene = np.repeat(np.repeat(zbuf, b, axis=0), b, axis=1)[:self.h, :self.w]
         if depth is not None:
+            if depth.shape != (self.h, self.w):
+                raise ValueError('Depth image must be aligned to color image and have the same resolution')
             dimg = depth.astype(np.float32) * self.cfg['depth_scale']
             dimg[~(np.isfinite(dimg) & (dimg > 0.1))] = np.nan
             d = dimg[v, u].astype(float)
@@ -323,7 +360,8 @@ def main():
     parser.add_argument('--device', default=None, help='YOLO 设备, 如 cpu / 0')
     parser.add_argument('--rviz', action='store_true', help='在 RViz 中实时显示 (见 config/clean_map.rviz)')
     args = parser.parse_args()
-    cfg = yaml.safe_load(open(args.config))
+    with open(args.config) as config_file:
+        cfg = yaml.safe_load(config_file)
     map_dir = Path(args.map)
 
     from ultralytics import YOLO
@@ -334,11 +372,13 @@ def main():
     header, cloud = read_pcd(map_dir / 'global.pcd')
     xyz = np.column_stack([cloud['x'], cloud['y'], cloud['z']]).astype(float)
     finite = np.isfinite(xyz).all(axis=1)
-    xyz[~finite] = 0
-    _, point_voxel = np.unique(voxel_keys(xyz, cfg['voxel_size']), return_inverse=True)
+    if not finite.any():
+        raise ValueError('Map contains no finite XYZ points')
+    # Invalid points must not bias the centroid of the voxel around the origin.
+    _, point_voxel = np.unique(voxel_keys(xyz[finite], cfg['voxel_size']), axis=0, return_inverse=True)
     n_vox = point_voxel.max() + 1
     centroids = np.zeros((n_vox, 3))
-    np.add.at(centroids, point_voxel, xyz)
+    np.add.at(centroids, point_voxel, xyz[finite])
     centroids /= np.bincount(point_voxel, minlength=n_vox)[:, None]
     traj = Trajectory(map_dir / 'keyframes.txt', cfg['max_kf_gap'])
     print(f'map: {len(cloud)} points, {n_vox} voxels, {len(traj.t)} keyframes', flush=True)
@@ -371,7 +411,7 @@ def main():
 
     above = np.nonzero(~floor)[0]
     label = components(centroids[above], cfg['cluster_voxel'])
-    n_comp = label.max() + 1
+    n_comp = int(label.max()) + 1 if len(label) else 0
     obs_cnt = np.bincount(label, weights=observed[above], minlength=n_comp)
     veh_cnt = np.bincount(label, weights=remove[above], minlength=n_comp)
     lo = np.full((n_comp, 3), np.inf)
@@ -386,7 +426,8 @@ def main():
                (veh_cnt >= cfg['cluster_vehicle_ratio'] * obs_cnt) & (ext <= lim).all(axis=1)
     remove[above[car_comp[label]]] = True
 
-    drop = remove[point_voxel] & finite
+    drop = np.zeros(len(cloud), dtype=bool)
+    drop[finite] = remove[point_voxel]
     write_pcd(map_dir / 'global_clean.pcd', header, cloud[~drop])
     write_pcd(map_dir / 'global_vehicles.pcd', header, cloud[drop])
     print(f'views={voter.views}, observed voxels={observed.sum()}/{n_vox}, '
@@ -401,3 +442,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
