@@ -12,6 +12,7 @@
 #include "common/options.h"
 #include "core/ivox3d/ivox3d.h"
 #include "core/lio/eskf.hpp"
+#include "core/lio/feature_quality.h"
 #include "core/lio/imu_processing.hpp"
 #include "pointcloud_preprocess.h"
 
@@ -38,6 +39,11 @@ class LaserMapping {
         bool enable_icp_part_ = true;    // 是否添加ICP部分
         double plane_icp_weight_ = 1.0;  // 点面ICP部分的权重
         double icp_weight_ = 100;        // ICP部分的权重
+
+        features::PlaneQualityOptions plane_quality_;
+        bool robust_plane_weight_ = true;
+        double plane_huber_delta_ = 0.10;  // metres; point-to-plane residual
+        int feature_stats_interval_ = 20;  // processed scans; 0 disables reporting
 
         int min_pts = 300;  // 配准所需的点数
 
@@ -222,6 +228,9 @@ class LaserMapping {
 
     bool use_aa_ = false;  // use anderson acceleration?
 
+    features::FeatureStats feature_stats_;  // last observation evaluation for this scan
+    std::size_t feature_stats_scan_count_ = 0;
+
     std::list<Keyframe::Ptr> proj_kfs_;  // 投影到当前帧的关键帧
 
     std::shared_ptr<ui::PangolinWindow> ui_ = nullptr;
@@ -230,3 +239,4 @@ class LaserMapping {
 }  // namespace lightning
 
 #endif  // FASTER_LIO_LASER_MAPPING_H
+
