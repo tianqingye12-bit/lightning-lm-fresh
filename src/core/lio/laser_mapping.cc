@@ -1,10 +1,13 @@
 #include <pcl/common/transforms.h>
 #include <yaml-cpp/yaml.h>
 #include <fstream>
+#include <algorithm>
+#include <stdexcept>
 
 #include "common/options.h"
 #include "core/lightning_math.hpp"
 #include "laser_mapping.h"
+#include "core/lio/map_detail_cloud.h"
 
 #include <opencv2/core/mat.hpp>
 #include <opencv2/highgui.hpp>
@@ -104,6 +107,45 @@ bool LaserMapping::LoadParamsFromYAML(const std::string &yaml_file) {
             return false;
         }
 
+        const auto detail = yaml["fasterlio"]["map_detail"];
+        if (detail && !detail.IsMap()) {
+            LOG(ERROR) << "fasterlio.map_detail must be a map";
+            return false;
+        }
+        if (detail) {
+            detail_options_.input_point_filter_num = detail["input_point_filter_num"].as<int>(0);
+            detail_options_.keyframe_resolution = detail["keyframe_resolution"].as<double>(0.0);
+            const auto max_points = detail["keyframe_max_points"].as<long long>(0);
+            if (max_points < 0) {
+                LOG(ERROR) << "keyframe_max_points must be nonnegative";
+                return false;
+            }
+            detail_options_.keyframe_max_points = static_cast<std::size_t>(max_points);
+            detail_options_.export_resolution = detail["export_resolution"].as<double>(0.1);
+            detail_options_.registration_min_ratio = detail["registration_min_ratio"].as<double>(0.1);
+            const auto fill = detail["local_fill"];
+            if (fill && !fill.IsMap()) {
+                LOG(ERROR) << "fasterlio.map_detail.local_fill must be a map";
+                return false;
+            }
+            if (fill) {
+                detail_options_.local_fill_enabled = fill["enabled"].as<bool>(false);
+                detail_options_.local_fill_min_interval = fill["min_interval"].as<double>(0.2);
+                detail_options_.local_fill_translation = fill["translation"].as<double>(0.2);
+                detail_options_.local_fill_rotation_deg = fill["rotation_deg"].as<double>(3.0);
+                detail_options_.local_fill_min_effective = fill["min_effective"].as<int>(20);
+            }
+        }
+        if (!detail_options_.Valid() || !std::isfinite(filter_size_scan) || filter_size_scan <= 0 ||
+            !std::isfinite(filter_size_map_min_) || filter_size_map_min_ <= 0 ||
+            preprocess_->PointFilterNum() < 1) {
+            LOG(ERROR) << "invalid map detail / scan / map resolution or point filter settings";
+            return false;
+        }
+        if (detail_options_.input_point_filter_num > 0) {
+            preprocess_->PointFilterNum() = detail_options_.input_point_filter_num;
+        }
+
         bool use_imu_filter = yaml["fasterlio"]["imu_filter"].as<bool>();
         p_imu_->SetUseIMUFilter(use_imu_filter);
         options_.proj_kfs_ = yaml["fasterlio"]["proj_kfs"].as<bool>();
@@ -112,6 +154,14 @@ bool LaserMapping::LoadParamsFromYAML(const std::string &yaml_file) {
         LOG(ERROR) << "bad conversion";
         return false;
     }
+
+    LOG(INFO) << "[map_detail] input_stride=" << preprocess_->PointFilterNum()
+              << " registration_m=" << filter_size_scan << " local_map_m=" << filter_size_map_min_
+              << " registration_min_ratio=" << detail_options_.registration_min_ratio
+              << " keyframe_m=" << detail_options_.keyframe_resolution
+              << " keyframe_max_points=" << detail_options_.keyframe_max_points
+              << " export_m=" << detail_options_.export_resolution
+              << " local_fill=" << detail_options_.local_fill_enabled;
 
     LOG(INFO) << "feature quality: pca=" << options_.plane_quality_.enabled
               << " min_spread=" << options_.plane_quality_.min_spread
@@ -224,14 +274,23 @@ bool LaserMapping::Run() {
         LOG(INFO) << "first scan pts: " << scan_undistort_->size();
 
         state_point_ = kf_.GetX();
-        scan_down_world_->resize(scan_undistort_->size());
-        for (int i = 0; i < scan_undistort_->size(); i++) {
-            PointBodyToWorld(scan_undistort_->points[i], scan_down_world_->points[i]);
+        CloudPtr bootstrap = scan_undistort_;
+        if (detail_options_.input_point_filter_num > 0) {
+            bootstrap.reset(new PointCloudType());
+            voxel_scan_.setInputCloud(scan_undistort_);
+            voxel_scan_.filter(*bootstrap);
+        }
+        scan_down_world_->resize(bootstrap->size());
+        for (size_t i = 0; i < bootstrap->size(); i++) {
+            PointBodyToWorld(bootstrap->points[i], scan_down_world_->points[i]);
         }
         ivox_->AddPoints(scan_down_world_->points);
 
         first_lidar_time_ = measures_.lidar_end_time_;
         state_point_.timestamp_ = lidar_end_time_;
+        last_map_update_pose_ = state_point_.GetPose();
+        last_map_update_time_ = state_point_.timestamp_;
+        has_map_update_ = true;
         flg_first_scan_ = false;
         return true;
     }
@@ -273,7 +332,7 @@ bool LaserMapping::Run() {
 
     int cur_pts = scan_down_body_->size();
 
-    if (cur_pts < (scan_undistort_->size() * 0.1) || cur_pts < options_.min_pts) {
+    if (cur_pts < (scan_undistort_->size() * detail_options_.registration_min_ratio) || cur_pts < options_.min_pts) {
         /// 降采样太狠了,有效点数不够，用0.1分辨率代替
         // LOG(INFO) << "too few points, using 0.1 resol";
         auto v = voxel_scan_;
@@ -352,8 +411,16 @@ bool LaserMapping::Run() {
             MakeKF();
         } else if (!options_.is_in_slam_mode_ && (state_point_.timestamp_ - last_kf_->GetState().timestamp_) > 2.0) {
             MakeKF();
-        } else if ((last_pose.so3().inverse() * cur_pose.so3()).log().norm() > 1.0 * M_PI / 180.0) {
-            // MapIncremental();
+        } else if (has_map_update_ && detail_options_.local_fill_enabled) {
+            const double translation = (cur_pose.translation() - last_map_update_pose_.translation()).norm();
+            const double rotation_deg =
+                (last_map_update_pose_.so3().inverse() * cur_pose.so3()).log().norm() * 180.0 / M_PI;
+            if (detail_options_.ShouldFill(update_accepted, std::max(effect_feat_surf_, effect_feat_icp_),
+                                          state_point_.timestamp_ - last_map_update_time_, translation, rotation_deg)) {
+                Timer::Evaluate([this]() { MapIncremental(); }, "    Local Map Fill");
+                LOG(INFO) << "[map_detail] local_fill points=" << scan_down_body_->size()
+                          << " translation=" << translation << " rotation_deg=" << rotation_deg;
+            }
         }
     }
 
@@ -412,8 +479,15 @@ void LaserMapping::ProjectKFs(CloudPtr cloud, int size_limit) {
     }
 }
 
+CloudPtr LaserMapping::RetainKeyframeCloud() const {
+    return mapping::RetainCloud<PointType>(scan_undistort_, detail_options_);
+}
+
 void LaserMapping::MakeKF() {
-    Keyframe::Ptr kf = std::make_shared<Keyframe>(kf_id_++, scan_undistort_, state_point_);
+    CloudPtr retained = RetainKeyframeCloud();
+    Keyframe::Ptr kf = std::make_shared<Keyframe>(kf_id_++, retained, state_point_);
+    LOG(INFO) << "[map_detail] keyframe_points=" << retained->size()
+              << " input_points=" << scan_undistort_->size();
 
     if (last_kf_) {
         /// opt pose 用之前的递推
@@ -652,6 +726,9 @@ void LaserMapping::MapIncremental() {
             ivox_->AddPoints(point_no_need_downsample);
         },
         "    IVox Add Points");
+    last_map_update_pose_ = state_point_.GetPose();
+    last_map_update_time_ = state_point_.timestamp_;
+    has_map_update_ = true;
 }
 
 /**
@@ -884,6 +961,13 @@ void LaserMapping::ObsModel(NavState &s, ESKF::CustomObservationModel &obs) {
 ///////////////////////////  private method /////////////////////////////////////////////////////////////////////
 
 CloudPtr LaserMapping::GetGlobalMap(bool use_lio_pose, bool use_voxel, float res) {
+    if (res < 0.0f) {
+        res = static_cast<float>(detail_options_.export_resolution);
+    }
+    if (use_voxel && (!std::isfinite(res) || res <= 0.0f)) {
+        throw std::invalid_argument("map export resolution must be finite and positive");
+    }
+    LOG(INFO) << "[map_detail] export voxel=" << use_voxel << " resolution_m=" << res;
     CloudPtr global_map(new PointCloudType);
 
     pcl::VoxelGrid<PointType> voxel;
