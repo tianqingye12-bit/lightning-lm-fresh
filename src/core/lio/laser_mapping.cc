@@ -303,7 +303,7 @@ bool LaserMapping::Run() {
             /// 更新UI中的内容
             if (ui_) {
                 ui_->UpdateNavState(kf_.GetX());
-                ui_->UpdateScan(scan_undistort_, kf_.GetX().GetPose());
+                ui_->UpdateScan(CloudInImuFrame(scan_undistort_), kf_.GetX().GetPose());
             }
 
             return false;
@@ -437,7 +437,7 @@ bool LaserMapping::Run() {
     }
 
     if (ui_) {
-        ui_->UpdateScan(scan_down_body_, state_point_.GetPose());
+        ui_->UpdateScan(CloudInImuFrame(scan_down_body_), state_point_.GetPose());
     }
 
     LOG(INFO) << "LIO state: " << state_point_.pos_.transpose() << ", yaw "
@@ -456,7 +456,7 @@ void LaserMapping::ProjectKFs(CloudPtr cloud, int size_limit) {
         // LOG(INFO) << "projecting kf: " << kf->GetID();
         // if (last_kf_) {
         // auto kf = last_kf_;
-        SE3 pose = pose_cur * kf->GetLIOPose();
+        SE3 pose = GetTImuLidar().inverse() * pose_cur * kf->GetLIOPose();
 
         int cnt = 0;
         for (auto &pt : kf->GetCloud()->points) {
@@ -479,13 +479,19 @@ void LaserMapping::ProjectKFs(CloudPtr cloud, int size_limit) {
     }
 }
 
+CloudPtr LaserMapping::CloudInImuFrame(const CloudPtr& cloud) const {
+    // Always allocate: RetainCloud can alias the deskewed registration input.
+    return mapping::CloudInBodyFrame<PointType>(cloud, GetTImuLidar().matrix());
+}
+
 CloudPtr LaserMapping::RetainKeyframeCloud() const {
-    return mapping::RetainCloud<PointType>(scan_undistort_, detail_options_);
+    // Graph poses are T_world_imu, so every graph consumer receives IMU-frame points.
+    return CloudInImuFrame(mapping::RetainCloud<PointType>(scan_undistort_, detail_options_));
 }
 
 void LaserMapping::MakeKF() {
     CloudPtr retained = RetainKeyframeCloud();
-    Keyframe::Ptr kf = std::make_shared<Keyframe>(kf_id_++, retained, state_point_);
+    Keyframe::Ptr kf = std::make_shared<Keyframe>(kf_id_++, retained, state_point_, GetTImuLidar());
     LOG(INFO) << "[map_detail] keyframe_points=" << retained->size()
               << " input_points=" << scan_undistort_->size();
 
@@ -1034,7 +1040,7 @@ CloudPtr LaserMapping::GetRecentCloud() {
 }
 
 CloudPtr LaserMapping::GetProjCloud() {
-    auto cloud = scan_undistort_;
+    CloudPtr cloud(new PointCloudType(*scan_undistort_));
     ProjectKFs(cloud);
     return cloud;
 }

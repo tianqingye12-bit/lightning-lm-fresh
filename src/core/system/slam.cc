@@ -228,6 +228,18 @@ void SlamSystem::SaveMap(const std::string& path) {
         kf_file << kf->GetID() << " " << kf->GetState().timestamp_ << " " << t.x() << " " << t.y() << " " << t.z()
                 << " " << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << "\n";
     }
+    // Version the coordinate contract; cleaning interpolates IMU poses first, then applies T_imu_lidar.
+    std::ofstream frame_file(save_path + "/map_frames.yaml");
+    frame_file << std::setprecision(18)
+               << "format_version: 2\nkeyframe_pose_frame: imu\nkeyframe_cloud_frame: imu\nT_imu_lidar: [";
+    const auto T_imu_lidar = lio_->GetTImuLidar().matrix();
+    for (int row = 0; row < 4; ++row) {
+        for (int col = 0; col < 4; ++col) {
+            if (row || col) frame_file << ", ";
+            frame_file << T_imu_lidar(row, col);
+        }
+    }
+    frame_file << "]\n";
     // pcl::io::savePCDFileBinaryCompressed(save_path + "/global_no_loop.pcd", *global_map_no_loop);
     // pcl::io::savePCDFileBinaryCompressed(save_path + "/global_raw.pcd", *global_map_raw);
 

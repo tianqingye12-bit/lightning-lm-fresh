@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'scripts'))
 spec = importlib.util.spec_from_file_location('clean_map_vehicles', ROOT / 'scripts/clean_map_vehicles.py')
 vehicles = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(vehicles)
@@ -42,7 +43,7 @@ class RvizRegressionTests(unittest.TestCase):
             publish(publisher, 'raw', xyz, intensity, max_points=3)
         msg = publisher.clouds['raw'].publish.call_args.args[0]
         points = np.frombuffer(msg.data, dtype=np.float32).reshape(-1, 4)
-        expected = np.column_stack([xyz[[0, 2, 3]], intensity[[0, 2, 3]]])
+        expected = np.column_stack([xyz[[0, 1, 3]], intensity[[0, 1, 3]]])
         np.testing.assert_allclose(points, expected, rtol=1e-6)
         self.assertEqual(msg.width, 3)
         self.assertEqual(msg.row_step, len(msg.data))

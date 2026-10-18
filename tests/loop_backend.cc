@@ -58,6 +58,26 @@ class LoopHarness : public lightning::LoopClosing {
 };
 
 int main() {
+    // Round 4: body-frame graph clouds and sensor-frame G2P5 clouds represent the same world point.
+    const lightning::SE3 extrinsic(lightning::SO3::exp(lightning::Vec3d(0.1, -0.2, 0.3)),
+                                    lightning::Vec3d(0.5, -0.3, 0.8));
+    const lightning::Vec3d lidar_point(1, 2, 3);
+    lightning::CloudPtr body(new lightning::PointCloudType());
+    lightning::PointType point;
+    point.getVector3fMap() = (extrinsic * lidar_point).cast<float>();
+    point.intensity = 42;
+    body->push_back(point);
+    lightning::NavState state;
+    state.pos_ = lightning::Vec3d(10, 20, -1);
+    lightning::Keyframe frame(0, body, state, extrinsic);
+    auto sensor = frame.GetLidarCloud();
+    assert(sensor != body && sensor->front().intensity == 42);
+    assert((sensor->front().getVector3fMap().cast<double>() - lidar_point).norm() < 1e-5);
+    const lightning::Vec3d from_body = frame.GetOptPose() * body->front().getVector3fMap().cast<double>();
+    const lightning::Vec3d from_sensor = frame.GetOptPose() * frame.GetTImuLidar() * lidar_point;
+    assert((from_body - from_sensor).norm() < 1e-5);
+    assert(body->front().x == point.x);
+
     LoopHarness graph;
     graph.Append(0); graph.Append(1);
     assert(graph.Anchored() && graph.callbacks == 0);

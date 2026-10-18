@@ -107,6 +107,10 @@ class LaserMapping {
         }
     }
 
+    // T_imu_lidar maps raw/deskewed LiDAR points into the IMU body frame.
+    SE3 GetTImuLidar() const { return SE3(SO3(offset_R_lidar_fixed_), offset_t_lidar_fixed_); }
+    CloudPtr CloudInImuFrame(const CloudPtr& cloud) const;
+
     CloudPtr GetScanUndist() const { return scan_undistort_; }
     CloudPtr GetProjCloud();
 

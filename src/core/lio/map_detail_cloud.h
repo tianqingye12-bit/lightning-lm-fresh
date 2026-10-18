@@ -2,10 +2,20 @@
 #define LIGHTNING_MAP_DETAIL_CLOUD_H
 
 #include <pcl/filters/voxel_grid.h>
+#include <pcl/common/transforms.h>
 #include "core/lio/map_detail.h"
 
 namespace lightning {
 namespace mapping {
+
+// Allocate even for identity: callers may hold shared registration input.
+template <typename PointT>
+typename pcl::PointCloud<PointT>::Ptr CloudInBodyFrame(
+    const typename pcl::PointCloud<PointT>::Ptr& input, const Eigen::Matrix4d& T_body_lidar) {
+    typename pcl::PointCloud<PointT>::Ptr body(new pcl::PointCloud<PointT>);
+    pcl::transformPointCloud(*input, *body, T_body_lidar);
+    return body;
+}
 
 // Read-only input: retaining a keyframe must never decimate the registration scan.
 template <typename PointT>
