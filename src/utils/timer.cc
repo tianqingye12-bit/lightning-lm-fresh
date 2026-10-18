@@ -13,6 +13,7 @@ namespace lightning {
 std::map<std::string, Timer::TimerRecord> Timer::records_;
 
 void Timer::PrintAll() {
+    std::lock_guard<std::mutex> lock(RecordsMutex());
     LOG(INFO) << (">>> ===== Printing run time =====");
     for (auto& r : records_) {
         auto& rec = r.second.time_usage_in_ms_;
@@ -27,6 +28,7 @@ void Timer::PrintAll() {
 }
 
 void Timer::DumpIntoFile(const std::string& file_name) {
+    std::lock_guard<std::mutex> lock(RecordsMutex());
     std::ofstream ofs(file_name, std::ios::out);
     if (!ofs.is_open()) {
         LOG(ERROR) << "Failed to open file: " << file_name;
@@ -58,6 +60,7 @@ void Timer::DumpIntoFile(const std::string& file_name) {
 }
 
 double Timer::GetMeanTime(const std::string& func_name) {
+    std::lock_guard<std::mutex> lock(RecordsMutex());
     if (records_.find(func_name) == records_.end()) {
         return 0.0;
     }

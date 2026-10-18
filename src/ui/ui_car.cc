@@ -24,12 +24,13 @@ void UiCar::SetPose(const SE3& pose) {
     }
 }
 
-void UiCar::Render() {
+void UiCar::Render(bool stale) {
     glLineWidth(5.0);
     glBegin(GL_LINES);
 
     /// x -红, y-绿 z-蓝
-    glColor3f(color_[0], color_[1], color_[2]);
+    if (stale) glColor3f(0.5f, 0.5f, 0.5f);
+    else glColor3f(color_[0], color_[1], color_[2]);
     glVertex3f(pts_[0][0], pts_[0][1], pts_[0][2]);
     glVertex3f(pts_[1][0], pts_[1][1], pts_[1][2]);
 

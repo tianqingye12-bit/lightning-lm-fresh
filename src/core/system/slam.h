@@ -16,6 +16,7 @@
 #include "common/eigen_types.h"
 #include "common/imu.h"
 #include "common/keyframe.h"
+#include "utils/serial_worker.h"
 
 namespace lightning {
 
@@ -77,6 +78,14 @@ class SlamSystem {
    private:
     /// ros端保存地图的实现
     void SaveMap(const SaveMapService::Request::SharedPtr request, SaveMapService::Response::SharedPtr response);
+
+    void Enqueue(SerialWorker::Kind kind, std::function<void()> task);
+    void ReportRuntime();
+    std::unique_ptr<SerialWorker> online_worker_;
+    rclcpp::CallbackGroup::SharedPtr save_callback_group_;
+    int runtime_stats_interval_ = 20;
+    size_t runtime_frames_ = 0;
+    std::atomic<bool> input_fault_{false};
 
     Options options_;
     std::atomic_bool running_ = false;

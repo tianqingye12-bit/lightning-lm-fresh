@@ -69,6 +69,15 @@ class PangolinWindowImpl {
         std::vector<SE3> trajectory;
         SE3 map_from_odom;
     };
+    RuntimeDisplayOptions runtime_display_options_;
+    RuntimeStats* runtime_stats_ = nullptr;  // owner joins render before destroying SLAM core
+    std::chrono::steady_clock::time_point last_scan_submit_{};
+    std::chrono::steady_clock::time_point last_nav_arrival_{};
+    bool prediction_valid_ = false, prediction_break_pending_ = false;
+    std::string prediction_reason_ = "waiting", runtime_status_ = "waiting";
+    double prediction_lead_s_ = 0;
+    bool render_prediction_valid_ = false;
+    size_t scans_total_points_ = 0;
     LoopDisplayOptions loop_display_options_;
     LatestTask<LoopSnapshot> loop_map_tasks_;
     std::thread loop_map_thread_;
@@ -109,11 +118,11 @@ class PangolinWindowImpl {
 
     /// 滤波器状态
     Sophus::SE3d pose_;
-    double confidence_;
-    Vec3d vel_;
-    Vec3d bias_acc_;
-    Vec3d bias_gyr_;
-    Vec3d grav_;
+    double confidence_ = 0;
+    Vec3d vel_ = Vec3d::Zero();
+    Vec3d bias_acc_ = Vec3d::Zero();
+    Vec3d bias_gyr_ = Vec3d::Zero();
+    Vec3d grav_ = Vec3d::Zero();
 
     Sophus::SE3d T_imu_lidar_;
     int max_size_of_current_scan_ = 200;  // 当前扫描数据保留多少个

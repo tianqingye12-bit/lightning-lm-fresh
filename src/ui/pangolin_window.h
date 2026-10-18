@@ -10,6 +10,8 @@
 #include "common/nav_state.h"
 #include "common/point_def.h"
 #include "ui/loop_display_options.h"
+#include "ui/runtime_display.h"
+#include "utils/runtime_stats.h"
 
 namespace lightning::ui {
 
@@ -40,6 +42,9 @@ class PangolinWindow {
 
     /// 更新kalman滤波器状态
     void UpdateNavState(const NavState& state);
+    void ConfigureRuntimeDisplay(const RuntimeDisplayOptions& options, RuntimeStats* stats = nullptr);
+    void UpdatePredictionStatus(bool valid, const std::string& reason, double lead_s);
+    void UpdateRuntimeStatus(const std::string& text);
 
     /// 更新最新的pose
     void UpdateRecentPose(const SE3& pose);
@@ -47,7 +52,7 @@ class PangolinWindow {
     void UpdatePredictPose(const SE3& pose);
 
     /// 更新一次scan和它对应的Pose
-    void UpdateScan(CloudPtr cloud, const SE3& pose);
+    void UpdateScan(CloudPtr cloud, const SE3& pose, const SE3& cloud_to_body = SE3());
 
     void UpdateKF(std::shared_ptr<Keyframe> kf);
 

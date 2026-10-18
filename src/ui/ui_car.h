@@ -13,7 +13,7 @@ class UiCar {
     void SetPose(const SE3& pose);
 
     /// 渲染小车
-    void Render();
+    void Render(bool stale = false);
 
    private:
     Vec3f color_;

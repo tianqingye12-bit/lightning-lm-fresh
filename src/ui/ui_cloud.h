@@ -30,6 +30,7 @@ class UiCloud {
 
     /// 渲染这个点云
     void Render();
+    size_t Size() const { return xyz_data_.size(); }
 
     /// 指定内置颜色
     void SetRenderColor(UseColor use_color);

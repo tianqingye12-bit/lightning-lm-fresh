@@ -1,4 +1,6 @@
 #include "ui/pangolin_window_impl.h"
+#include <algorithm>
+#include <stdexcept>
 
 namespace lightning::ui {
 
@@ -62,6 +64,10 @@ void PangolinWindow::UpdateNavState(const NavState& state) {
     std::unique_lock<std::mutex> lock_lio_res(impl_->mtx_nav_state_);
 
     impl_->pose_ = state.GetPose();
+    impl_->prediction_valid_ = state.pose_is_ok_;
+    impl_->prediction_reason_ = state.pose_is_ok_ ? "valid" : "invalid_state";
+    if (!state.pose_is_ok_) impl_->prediction_break_pending_ = true;
+    impl_->last_nav_arrival_ = std::chrono::steady_clock::now();
     impl_->vel_ = state.GetVel();
     impl_->bias_acc_ = state.Getba();
     impl_->bias_gyr_ = state.Getbg();
@@ -72,7 +78,11 @@ void PangolinWindow::UpdateNavState(const NavState& state) {
 
 void PangolinWindow::UpdateRecentPose(const SE3& pose) {
     std::lock_guard<std::mutex> lock(impl_->mtx_nav_state_);
-    impl_->newest_frontend_pose_ = pose;
+    impl_->pose_ = pose;
+    impl_->prediction_valid_ = true;
+    impl_->prediction_reason_ = "pose_update";
+    impl_->last_nav_arrival_ = std::chrono::steady_clock::now();
+    impl_->kf_result_need_update_.store(true);
 }
 
 void PangolinWindow::UpdatePredictPose(const SE3& pose) {
@@ -80,11 +90,45 @@ void PangolinWindow::UpdatePredictPose(const SE3& pose) {
     impl_->predicted_pose_ = pose;
 }
 
-void PangolinWindow::UpdateScan(CloudPtr cloud, const SE3& pose) {
-    std::lock_guard<std::mutex> lock(impl_->mtx_current_scan_);
-    std::lock_guard<std::mutex> lock2(impl_->mtx_nav_state_);
+void PangolinWindow::ConfigureRuntimeDisplay(const RuntimeDisplayOptions& options, RuntimeStats* stats) {
+    if (!options.Valid()) throw std::invalid_argument("invalid runtime display options");
+    impl_->runtime_display_options_ = options;
+    impl_->max_size_of_current_scan_ = static_cast<int>(options.history_scans);
+    impl_->runtime_stats_ = stats;
+}
 
-    *impl_->current_scan_ = *cloud;  // need deep copy
+void PangolinWindow::UpdatePredictionStatus(bool valid, const std::string& reason, double lead_s) {
+    std::lock_guard<std::mutex> lock(impl_->mtx_nav_state_);
+    impl_->prediction_valid_ = valid;
+    impl_->prediction_reason_ = reason;
+    impl_->prediction_lead_s_ = lead_s;
+    // Latch even if pause and recovery both arrive between two render frames.
+    if (!valid) impl_->prediction_break_pending_ = true;
+}
+
+void PangolinWindow::UpdateRuntimeStatus(const std::string& text) {
+    std::lock_guard<std::mutex> lock(impl_->mtx_nav_state_);
+    impl_->runtime_status_ = text;
+}
+
+void PangolinWindow::UpdateScan(CloudPtr cloud, const SE3& pose, const SE3& cloud_to_body) {
+    std::lock_guard<std::mutex> lock(impl_->mtx_current_scan_);
+    if (!cloud || cloud->empty()) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - impl_->last_scan_submit_ < std::chrono::duration<double>(1.0 / impl_->runtime_display_options_.scan_hz))
+        return;
+    impl_->last_scan_submit_ = now;
+    CloudPtr display(new PointCloudType());
+    const size_t n = std::min(cloud->size(), impl_->runtime_display_options_.scan_max_points);
+    display->reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        const size_t index = n > 1 ? i * (cloud->size() - 1) / (n - 1) : 0;
+        auto point = cloud->points[index];
+        const Vec3d xyz = cloud_to_body * point.getVector3fMap().cast<double>();
+        point.getVector3fMap() = xyz.cast<float>();
+        display->push_back(point);
+    }
+    impl_->current_scan_ = std::move(display);  // immutable snapshot; input never retained or modified
     impl_->current_scan_pose_ = pose;
     impl_->current_scan_need_update_.store(true);
 }
