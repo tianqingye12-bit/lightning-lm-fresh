@@ -6,6 +6,7 @@
 #define LIGHTNING_G2P5_MAP_H
 
 #include "common/eigen_types.h"
+#include <cstddef>
 #include "common/std_types.h"
 #include "core/g2p5/g2p5_subgrid.h"
 
@@ -26,6 +27,7 @@ namespace lightning::g2p5 {
 class G2P5Map {
    public:
     struct Options {
+        std::size_t max_cells_ = 0;
         float resolution_ = 0.05;      /// 子网格的最高分辨率
         float occupancy_ratio_ = 0.3;  // 占用比例
     };

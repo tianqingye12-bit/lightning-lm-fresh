@@ -9,6 +9,8 @@
 #include <pcl/sample_consensus/method_types.h>
 #include <pcl/sample_consensus/model_types.h>
 #include <map>
+#include <stdexcept>
+#include <cmath>
 #include <pcl/filters/impl/voxel_grid.hpp>
 #include <pcl/segmentation/impl/sac_segmentation.hpp>
 
@@ -33,7 +35,7 @@ void G2P5::Quit() {
 
 void G2P5::PushKeyframe(Keyframe::Ptr kf) {
     UL lock(kf_mutex_);
-    all_keyframes_.emplace_back(kf);
+    if (options_.online_mode_ || options_.retain_offline_keyframes_) all_keyframes_.emplace_back(kf);
 
     if (options_.online_mode_) {
         draw_frontend_map_thread_.AddMessage(kf);
@@ -51,7 +53,10 @@ void G2P5::RenderFront(Keyframe::Ptr kf) {
     {
         UL lock{newest_map_mutex_};
 
-        lightning::Timer::Evaluate([&]() { AddKfToMap({kf}, frontend_map_); }, "G2P5 Occupancy Mapping", true);
+        bool updated = false;
+        lightning::Timer::Evaluate([&]() { updated = AddKfToMap({kf}, frontend_map_); },
+                                  "G2P5 Occupancy Mapping", options_.verbose_);
+        if (!updated) return;
         newest_map_ = frontend_map_;
     }
 
@@ -61,7 +66,9 @@ void G2P5::RenderFront(Keyframe::Ptr kf) {
     }
 }
 
-void G2P5::RedrawGlobalMap() { backend_redraw_flag_ = true; }
+void G2P5::RedrawGlobalMap() {
+    if (options_.online_mode_ || options_.retain_offline_keyframes_) backend_redraw_flag_ = true;
+}
 
 void G2P5::RenderBack() {
     while (!quit_flag_) {
@@ -92,12 +99,13 @@ void G2P5::RenderBack() {
 
         G2P5Map::Options opt;
         opt.resolution_ = options_.grid_map_resolution_;
+        opt.max_cells_ = options_.max_grid_cells_;
         backend_map_ = std::make_shared<G2P5Map>(opt);
         auto cur_kf = all_keyframes.begin();
         bool abort = false;
 
         for (; cur_kf != all_keyframes.end(); ++cur_kf) {
-            AddKfToMap({*cur_kf}, backend_map_);
+            if (!AddKfToMap({*cur_kf}, backend_map_)) { abort = true; break; }
             if (backend_redraw_flag_) {
                 LOG(INFO) << "backend redraw triggered in process, abort";
                 abort = true;
@@ -139,9 +147,11 @@ void G2P5::RenderBack() {
                 }
             }
 
-            AddKfToMap(kfs, backend_map_);
+            if (!AddKfToMap(kfs, backend_map_)) { abort = true; break; }
             cur_idx = frontend_idx;
         }
+
+        if (abort) { is_busy_ = false; continue; }
 
         {
             /// 同步前后端地图，替换newest map
@@ -250,8 +260,15 @@ bool G2P5::ResizeMap(const std::vector<Keyframe::Ptr> &kfs, G2P5MapPtr &map) {
 }
 
 bool G2P5::AddKfToMap(const std::vector<Keyframe::Ptr> &kfs, G2P5MapPtr &map) {
-    /// 如果需要，更新地图大小
-    ResizeMap(kfs, map);
+    if (grid_fault_) return false;
+    // Offline export fails explicitly. Online mapping keeps LIO alive but invalidates the grid.
+    try { ResizeMap(kfs, map); }
+    catch (const std::length_error& error) {
+        if (!options_.online_mode_) throw;
+        grid_fault_ = true;
+        LOG(ERROR) << error.what() << "; G2P5 disabled until restart; LIO remains active";
+        return false;
+    }
 
     for (const auto &kf : kfs) {
         Convert3DTo2DScan(kf, map);
@@ -263,7 +280,7 @@ bool G2P5::AddKfToMap(const std::vector<Keyframe::Ptr> &kfs, G2P5MapPtr &map) {
 G2P5MapPtr G2P5::GetNewestMap() {
     UL lock{newest_map_mutex_};
     LOG(INFO) << "getting newest map";
-    if (newest_map_ == nullptr) {
+    if (grid_fault_ || newest_map_ == nullptr) {
         return nullptr;
     }
 
@@ -491,8 +508,15 @@ void G2P5::Init(std::string yaml_path) {
     options_.grid_map_resolution_ = yaml["g2p5"]["grid_map_resolution"].as<float>();
     options_.default_floor_height_ = yaml["g2p5"]["floor_height"].as<float>();
 
+    const auto limit = yaml["g2p5"]["max_grid_cells"].as<long long>(static_cast<long long>(options_.max_grid_cells_));
+    if (limit < 0 || !std::isfinite(options_.grid_map_resolution_) || options_.grid_map_resolution_ <= 0 ||
+        !std::isfinite(options_.min_th_floor_) || !std::isfinite(options_.max_th_floor_) ||
+        options_.min_th_floor_ >= options_.max_th_floor_ || !std::isfinite(options_.default_floor_height_) ||
+        !std::isfinite(options_.lidar_height_)) throw std::invalid_argument("invalid G2P5 geometry/height configuration");
+    options_.max_grid_cells_ = static_cast<std::size_t>(limit);
     G2P5Map::Options opt;
     opt.resolution_ = options_.grid_map_resolution_;
+    opt.max_cells_ = options_.max_grid_cells_;
     frontend_map_ = std::make_shared<G2P5Map>(opt);
 
     if (options_.online_mode_) {
@@ -500,7 +524,8 @@ void G2P5::Init(std::string yaml_path) {
         draw_frontend_map_thread_.Start();
     }
 
-    draw_backend_map_thread_ = std::thread([this]() { RenderBack(); });
+    if (options_.online_mode_ || options_.retain_offline_keyframes_)
+        draw_backend_map_thread_ = std::thread([this]() { RenderBack(); });
 }
 
 }  // namespace lightning::g2p5

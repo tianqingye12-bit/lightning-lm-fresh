@@ -63,3 +63,11 @@ target_link_libraries(test_ui
 
 install(TARGETS run_slam_offline run_slam_online run_loc_offline run_loc_online
         DESTINATION lib/${PROJECT_NAME})
+
+add_executable(build_navigation_grid build_navigation_grid.cc)
+target_link_libraries(build_navigation_grid ${PROJECT_NAME}.libs ${third_party_libs})
+install(TARGETS build_navigation_grid DESTINATION lib/${PROJECT_NAME})
+
+# Optional integration check; requires the full ROS/PCL build and is not built by default.
+add_executable(test_navigation_export EXCLUDE_FROM_ALL ../../tests/navigation_integration.cc)
+target_link_libraries(test_navigation_export ${PROJECT_NAME}.libs ${third_party_libs})

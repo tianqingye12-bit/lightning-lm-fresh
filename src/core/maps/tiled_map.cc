@@ -27,6 +27,7 @@ bool TiledMap::ConvertFromFullPCD(CloudPtr map, const SE3& start_pose, const std
         } else {
             int id = chunk_id_;
             auto new_chunk = std::make_shared<MapChunk>(id, grid, "");
+            new_chunk->AddPoint(pt);
             static_chunks_.emplace(grid, new_chunk);
             id_to_grid_.emplace(id, grid);
             chunk_id_++;

@@ -6,6 +6,7 @@
 #define LIGHTNING_G2P5_H
 
 #include "common/eigen_types.h"
+#include <cstddef>
 #include "common/keyframe.h"
 #include "core/g2p5/g2p5_map.h"
 #include "core/system/async_message_process.h"
@@ -45,6 +46,7 @@ class G2P5 {
     struct Options {
         Options() {}
 
+        bool retain_offline_keyframes_ = true;  // false: streaming export, no backend redraw
         bool online_mode_ = true;  // 是否为在线模式
         bool esti_floor_ = false;  // 是否需要估计地面
 
@@ -57,6 +59,7 @@ class G2P5 {
 
         double grid_map_resolution_ = 0.1;  // 栅格地图的分辨率，室外建议为0.1，室内可以用0.05
 
+        std::size_t max_grid_cells_ = 0;  // 0: legacy unlimited; guards allocation before resize
         bool verbose_ = true;
     };
 
@@ -116,6 +119,7 @@ class G2P5 {
     Options options_;
 
     std::atomic_bool parallel_render_ = false;  // 是否需要并行渲染
+    std::atomic_bool grid_fault_ = false;  // online allocation guard: stop publishing a partial grid
     std::atomic_bool is_busy_ = false;          // 是否仍有未渲染完的
     MapUpdateCallback map_update_cb_;           // 地图更新的回调函数
     std::atomic_bool quit_flag_ = false;        // 退出标记位

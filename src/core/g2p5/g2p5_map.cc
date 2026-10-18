@@ -3,6 +3,7 @@
 //
 
 #include "core/g2p5/g2p5_map.h"
+#include "core/maps/grid_budget.h"
 
 #include <malloc.h>
 #include <cstdlib>
@@ -17,6 +18,8 @@ bool G2P5Map::Init(const float &temp_min_x, const float &temp_min_y, const float
     max_x_ = temp_max_x;
     max_y_ = temp_max_y;
 
+    navigation::CheckGridBudget(ceil((max_x_ - min_x_) / grid_reso_),
+                                ceil((max_y_ - min_y_) / grid_reso_), sub_grid_width_, options_.max_cells_);
     grid_size_x_ = ceil((max_x_ - min_x_) / grid_reso_);
     grid_size_y_ = ceil((max_y_ - min_y_) / grid_reso_);
 
@@ -53,6 +56,9 @@ std::shared_ptr<G2P5Map> G2P5Map::MakeDeepCopy() {
 
 bool G2P5Map::Resize(const float &temp_min_x, const float &temp_min_y, const float &temp_max_x,
                      const float &temp_max_y) {
+    navigation::CheckGridBudget(ceil((temp_max_x - temp_min_x) / grid_reso_) + 1,
+                                ceil((temp_max_y - temp_min_y) / grid_reso_) + 1,
+                                sub_grid_width_, options_.max_cells_);
     int temp_grid_size_x = ceil((temp_max_x - temp_min_x) / grid_reso_) + 1;
     int temp_grid_size_y = ceil((temp_max_y - temp_min_y) / grid_reso_) + 1;
 
