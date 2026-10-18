@@ -109,10 +109,17 @@ bool SlamSystem::Init(const std::string& yaml_path) {
         livox_topic_ = yaml["common"]["livox_lidar_topic"].as<std::string>();
 
         rclcpp::QoS qos(10);
-        // qos.best_effort();
+        // A 200 Hz IMU history of 10 messages covers only 50 ms while this same executor maps a scan.
+        const int imu_queue_depth = yaml["common"]["imu_queue_depth"].as<int>(2000);
+        if (imu_queue_depth < 10 || imu_queue_depth > 100000) {
+            LOG(ERROR) << "common.imu_queue_depth must be between 10 and 100000";
+            return false;
+        }
+        rclcpp::QoS imu_qos{rclcpp::KeepLast(static_cast<size_t>(imu_queue_depth))};
+        LOG(INFO) << "[imu_clock] IMU subscription history=" << imu_queue_depth;
 
         imu_sub_ = node_->create_subscription<sensor_msgs::msg::Imu>(
-            imu_topic_, qos, [this](sensor_msgs::msg::Imu::SharedPtr msg) {
+            imu_topic_, imu_qos, [this](sensor_msgs::msg::Imu::SharedPtr msg) {
                 IMUPtr imu = std::make_shared<IMU>();
                 imu->timestamp = ToSec(msg->header.stamp);
                 imu->linear_acceleration =

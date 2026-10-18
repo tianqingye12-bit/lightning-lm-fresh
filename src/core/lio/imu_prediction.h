@@ -40,6 +40,26 @@ inline const char* Name(Decision decision) {
     return "unknown";
 }
 
+// Main-filter integration uses absolute target times. Subdivision bridges a short missing-data
+// interval under a held-average-input assumption; the affected scan must NOT be deskewed/mapped.
+struct PropagationPlan {
+    bool valid = false;
+    bool gap = false;
+    int steps = 0;
+    double duration = 0;
+};
+inline PropagationPlan PlanPropagation(double current, double target) {
+    PropagationPlan result;
+    if (!std::isfinite(current) || !std::isfinite(target)) return result;
+    const double dt = target - current;
+    if (dt < -1e-6 || dt > 1.0 + 1e-6) return result;
+    result.valid = true;
+    result.duration = dt > 0 ? dt : 0;
+    result.gap = dt > 0.10 + 1e-6;
+    if (dt > 1e-6) result.steps = static_cast<int>(std::ceil(dt / 0.02));
+    return result;
+}
+
 // Keep UI timestamps monotonic across LiDAR rebases and skipped scans.
 inline bool CanPublish(double timestamp, double last_published) {
     return std::isfinite(timestamp) && timestamp > last_published;

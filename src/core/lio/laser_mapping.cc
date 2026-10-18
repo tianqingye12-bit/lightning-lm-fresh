@@ -274,7 +274,7 @@ void LaserMapping::RebaseImuPrediction(bool update_accepted) {
     const auto previous = kf_imu_.GetX();
     if (update_accepted) last_accepted_lio_time_ = measures_.lidar_end_time_;
     kf_imu_ = kf_;
-    imu_prediction_suspended_ = last_accepted_lio_time_ <= 0;
+    imu_prediction_suspended_ = last_accepted_lio_time_ <= 0 || p_imu_->HasPropagationFault();
     for (const auto& imu : imu_buffer_) {
         AdvanceImuPrediction(imu, "replay");
         if (imu_prediction_suspended_) break;
@@ -335,8 +335,16 @@ bool LaserMapping::Run() {
     /// IMU process, kf prediction, undistortion
     p_imu_->Process(measures_, kf_, scan_undistort_);
 
-    if (scan_undistort_->empty() || (scan_undistort_ == nullptr)) {
-        LOG(WARNING) << "No point, skip this scan!";
+    if (!scan_undistort_ || scan_undistort_->empty()) {
+        if (p_imu_->IsIMUInited()) RebaseImuPrediction(false);
+        LOG(WARNING) << "No point or unreliable IMU coverage, skip this scan!";
+        return false;
+    }
+
+    const double imu_clock_error = kf_.GetX().timestamp_ - measures_.lidar_end_time_;
+    if (!std::isfinite(imu_clock_error) || std::abs(imu_clock_error) > 1e-5) {
+        LOG(ERROR) << "[imu_clock] reject scan: state/frame time mismatch " << imu_clock_error;
+        RebaseImuPrediction(false);
         return false;
     }
 

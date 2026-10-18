@@ -32,6 +32,18 @@ int main() {
     assert(p::CheckTime(0, 1000, 0, options) == p::Decision::invalid_time);
     assert(!p::CanPublish(10, 10) && !p::CanPublish(9, 10) && p::CanPublish(11, 10));
     assert(!p::CanPublish(std::numeric_limits<double>::infinity(), 10));
+    // Main-filter clock plans must cover the WHOLE missing interval, not just relabel time.
+    const auto gap = p::PlanPropagation(1000.2, 1000.45);
+    assert(gap.valid && gap.gap && gap.steps == 13);
+    assert(std::abs(gap.duration - .25) < 1e-10);
+    assert(gap.duration / gap.steps <= .02);
+    const auto normal = p::PlanPropagation(1000.45, 1000.455);
+    assert(normal.valid && !normal.gap && normal.steps == 1);
+    assert(!p::PlanPropagation(1000.5, 1000.4).valid);  // no absolute-value backward propagation
+    assert(!p::PlanPropagation(1000.5, 1002).valid);    // bounded recovery work
+    assert(!p::PlanPropagation(1000.5, std::numeric_limits<double>::infinity()).valid);
+    const auto same = p::PlanPropagation(1000.5, 1000.5);
+    assert(same.valid && same.steps == 0 && same.duration == 0);
     options.max_step_s = 0;
     assert(!options.Valid());
     options.max_step_s = .5;
