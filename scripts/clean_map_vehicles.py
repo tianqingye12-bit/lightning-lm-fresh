@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""离线去除 SLAM 地图中的车辆点云 (地下车库)。
+"""离线实例分割去车：累计地图投票或逐关键帧清理重建。
+
+--mode keyframes 使用 keyframe_clouds/index.csv 和版本2坐标约定；
+输出路径及限制见 doc/INSTANCE_CLEANUP_ROUND6.md。
 
 SLAM 用完整点云建图，结束后用 SaveMap 导出的 global.pcd + keyframes.txt，
 回放 bag 中的彩色图 (和对齐深度图)，YOLO 分割车辆，把地图体素投影到每个视角投票：
@@ -27,7 +30,8 @@ import cv2
 import numpy as np
 import yaml
 
-from clean_map_runtime import MaskCache, ViewSelector, file_digest, load_frame_contract, rigid_transform
+from clean_map_runtime import ViewSelector, file_digest, load_frame_contract, rigid_transform
+from clean_map_instances import InstanceMaskCache, associate_instances, association_options, removal_votes
 
 PCD_TYPES = {('F', 4): 'f4', ('F', 8): 'f8', ('U', 1): 'u1', ('U', 2): 'u2', ('U', 4): 'u4',
              ('I', 1): 'i1', ('I', 2): 'i2', ('I', 4): 'i4'}
@@ -136,6 +140,11 @@ class Trajectory:
         if not np.isfinite(max_gap) or max_gap <= 0:
             raise ValueError('max_kf_gap must be positive and finite')
         order = np.argsort(data[:, 1])
+        if np.any(data[:, 0] < 0) or np.any(data[:, 0] != np.floor(data[:, 0])) or np.any(data[:, 0] >= 2.0 ** 63):
+            raise ValueError('Keyframe IDs must be nonnegative int64 integers')
+        self.ids = data[order, 0].astype(np.int64)
+        if len(np.unique(self.ids)) != len(self.ids):
+            raise ValueError('Keyframe IDs must be unique')
         self.t, self.p, self.q = data[order, 1], data[order, 2:5], data[order, 5:9]
         if np.any(np.diff(self.t) <= 0):
             raise ValueError('Keyframe timestamps must be unique')
@@ -264,7 +273,8 @@ class VehicleVoter:
         self.y_lim = 1.2 * max(self.K[1, 2], self.h - self.K[1, 2]) / self.K[1, 1]
         self.visible = np.zeros(len(centroids), np.int32)
         self.vehicle = np.zeros(len(centroids), np.int32)
-        self.kernel = np.ones((2 * cfg['mask_dilate_px'] + 1,) * 2, np.uint8)
+        self.background = np.zeros(len(centroids), np.int32)
+        association_options(cfg)
         self.views = 0
         self.cache = None
         self.last_stats = {}
@@ -282,13 +292,19 @@ class VehicleVoter:
 
     def infer_mask(self, image):
         r = self.model(image, conf=self.cfg['yolo_conf'], classes=self.cfg['vehicle_classes'],
+                       imgsz=int(self.cfg.get('yolo_imgsz', 640)), max_det=100,
                        retina_masks=True, verbose=False, device=self.device)[0]
         if r.masks is None:
-            return np.zeros((self.h, self.w), bool), 0
-        mask = r.masks.data.cpu().numpy().any(axis=0).astype(np.uint8)
-        if mask.shape != (self.h, self.w):
-            mask = cv2.resize(mask, (self.w, self.h), interpolation=cv2.INTER_NEAREST)
-        return mask > 0, len(r.masks)
+            if r.boxes is not None and len(r.boxes):
+                raise RuntimeError('Detections have no segmentation masks; use a compatible -seg model')
+            return np.empty((0, self.h, self.w), bool), 0
+        masks = r.masks.data.cpu().numpy()
+        if masks.ndim != 3:
+            raise RuntimeError('YOLO masks must be NxHxW')
+        if masks.shape[1:] != (self.h, self.w):
+            masks = np.stack([cv2.resize(mask, (self.w, self.h),
+                                        interpolation=cv2.INTER_NEAREST) for mask in masks])
+        return masks > 0.5, len(masks)
 
     def add_view(self, T_world_lidar, image, depth):
         if image.shape[:2] != (self.h, self.w):
@@ -331,16 +347,14 @@ class VehicleVoter:
             visible[valid] = np.abs(z[valid] - d[valid]) < tol[valid]
             scene = np.where(np.isfinite(dimg), dimg, scene)
 
-        # 掩码膨胀用最小值滤波实现：膨胀区域内只有不深于车辆前表面 + depth_margin 的体素才算车辆，
-        # 避免轮廓边缘和车窗后面的墙柱被误删
-        mask, n_obj = self.vehicle_mask(image)
-        front = np.where(mask, scene, 1e6).astype(np.float32)
-        front = cv2.erode(front, self.kernel)
-        is_vehicle = (front[v, u] < 1e5) & (z <= front[v, u] + self.cfg['depth_margin'])
+        masks, n_obj = self.vehicle_mask(image)
+        is_vehicle, background, mask = associate_instances(masks, scene, u, v, z, visible, self.cfg)
         self.visible[near[visible]] += 1
         self.vehicle[near[visible & is_vehicle]] += 1
+        self.background[near[visible & background]] += 1
         self.views += 1
         self.last_view = (u, v, visible, is_vehicle, mask)
+        self.last_background = background
         self.last_stats = dict(projected=len(near), visible=int(visible.sum()),
                                occluded=int((~visible).sum()),
                                vehicle_votes=int((visible & is_vehicle).sum()), objects=n_obj)
@@ -348,12 +362,14 @@ class VehicleVoter:
 
 
 def make_overlay(voter, image, timestamp):
-    """Blue mask; gray occluded; green visible background; red vehicle votes."""
+    """Blue mask; gray occluded; yellow unknown; green background; red vehicle votes."""
     u, v, visible, vehicle, mask = voter.last_view
     output = image.copy()
     output[mask] = (0.5 * output[mask] + [127, 60, 0]).astype(np.uint8)
     output[v[~visible], u[~visible]] = (128, 128, 128)
-    background = visible & ~vehicle
+    background = visible & voter.last_background
+    unknown = visible & ~vehicle & ~voter.last_background
+    output[v[unknown], u[unknown]] = (0, 255, 255)
     output[v[background], u[background]] = (0, 255, 0)
     hit = visible & vehicle
     output[v[hit], u[hit]] = (0, 0, 255)
@@ -369,6 +385,8 @@ def iterate_views(bag, cfg, traj, selector=None):
     color_topic, depth_topic = cfg['color_topic'], cfg.get('depth_topic') or None
     selector = selector or ViewSelector(cfg)
     T_imu_lidar = np.asarray(cfg.get('_T_imu_lidar', np.eye(4)))
+    keyframe_times = cfg.get('_keyframe_times')
+    keyframe_times = None if keyframe_times is None else np.asarray(keyframe_times)
     with AnyReader([Path(bag)], default_typestore=get_typestore(Stores.ROS2_HUMBLE)) as reader:
         conns = {c.topic: c for c in reader.connections}
         if color_topic not in conns:
@@ -384,6 +402,12 @@ def iterate_views(bag, cfg, traj, selector=None):
                 pose = traj.pose(t + cfg['time_offset'])
                 if pose is not None:
                     pose = pose @ T_imu_lidar
+                if keyframe_times is not None:
+                    times = keyframe_times
+                    i = np.searchsorted(times, t + cfg['time_offset'])
+                    if min((abs(times[j] - t - cfg['time_offset'])
+                            for j in (i-1, i) if 0 <= j < len(times)), default=np.inf) > cfg['_keyframe_window']:
+                        continue
                 if not selector.accept(t, pose):
                     continue
                 depth = None
@@ -414,16 +438,28 @@ def main():
     parser.add_argument('--bag', required=True, help='建图时录制的 bag (ROS1 .bag 或 ROS2 目录)')
     parser.add_argument('--config', default='config/garage_clean.yaml')
     parser.add_argument('--device', default=None, help='YOLO 设备, 如 cpu / 0')
-    parser.add_argument('--rviz', action='store_true', help='在 RViz 中实时显示 (见 config/clean_map.rviz)')
+    parser.add_argument('--rviz', action='store_true',
+                        help='RViz preview: map mode live; keyframe mode final sampled clouds')
+    parser.add_argument('--mode', choices=['map', 'keyframes'], default=None,
+                        help='map: existing map voting; keyframes: clean saved frames and rebuild')
     parser.add_argument('--no-cache', action='store_true', help='Disable segmentation cache')
     args = parser.parse_args()
     with open(args.config) as config_file:
         cfg = yaml.safe_load(config_file)
+    association_options(cfg)
+    mode = args.mode or cfg.get('clean_mode', 'map')
+    if mode not in ('map', 'keyframes'):
+        raise ValueError('clean_mode must be map or keyframes')
     map_dir = Path(args.map)
     T_imu_lidar, frame_contract = load_frame_contract(map_dir)
     cfg['_T_imu_lidar'] = T_imu_lidar.tolist()
     selector = ViewSelector(cfg)
     print(f'coordinate contract: {frame_contract}', flush=True)
+
+    if mode == 'keyframes':
+        from clean_map_keyframes import run_keyframe_clean
+        run_keyframe_clean(args, cfg, frame_contract)
+        return
 
     from ultralytics import YOLO
     model = YOLO(cfg['yolo_model'])
@@ -450,12 +486,13 @@ def main():
         weights = Path(getattr(model, 'ckpt_path', None) or cfg['yolo_model'])
         if not weights.is_file():
             raise RuntimeError('Cannot fingerprint model weights for cache; use --no-cache')
-        identity = dict(schema=1, weights=file_digest(weights),
+        identity = dict(schema=2, instance_masks=True, imgsz=int(cfg.get("yolo_imgsz", 640)),
+                        max_det=100, weights=file_digest(weights),
                         ultralytics=importlib.metadata.version('ultralytics'),
                         torch=importlib.metadata.version('torch'), device=args.device,
                         conf=cfg['yolo_conf'], classes=cfg['vehicle_classes'],
                         width=cfg['width'], height=cfg['height'], retina_masks=True)
-        voter.cache = MaskCache(cache_options.get('directory') or map_dir / '.vehicle_mask_cache', identity)
+        voter.cache = InstanceMaskCache(cache_options.get('directory') or map_dir / '.vehicle_mask_cache', identity)
     viz = None
     if args.rviz:
         from clean_map_rviz import RvizPublisher
@@ -508,9 +545,8 @@ def main():
                            f'no_projection={no_projection}; check time_offset, calibration and map frames')
 
     print('Voting finished; estimating floor and growing vehicle components...', flush=True)
-    observed = voter.visible >= cfg['min_views']
-    ratio = voter.vehicle / np.maximum(voter.visible, 1)
-    remove = observed & (ratio >= cfg['vehicle_ratio'])
+    observed, remove = removal_votes(voter.visible, voter.vehicle,
+                                     voter.background, cfg)
     floor = centroids[:, 2] < estimate_floor(centroids, traj) + cfg['floor_keep']
     remove &= ~floor
     by_voxel = int(remove.sum())
@@ -531,7 +567,7 @@ def main():
     car_comp = (obs_cnt >= cfg['cluster_min_observed']) & \
                (veh_cnt >= cfg['cluster_vehicle_ratio'] * obs_cnt) & (ext <= lim).all(axis=1)
     # Never grow into voxels with enough observations that explicitly voted for background.
-    growth = car_comp[label] & (~observed[above] | remove[above])
+    growth = car_comp[label] & (~observed[above] | remove[above]) & (voter.background[above] == 0)
     remove[above[growth]] = True
 
     drop = np.zeros(len(cloud), dtype=bool)

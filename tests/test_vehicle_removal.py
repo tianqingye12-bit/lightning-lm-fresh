@@ -84,7 +84,8 @@ class VehicleRemovalTests(unittest.TestCase):
     def test_projection_votes_only_for_visible_front_surface(self):
         cfg = yaml.safe_load((ROOT / 'config/m2dgr_clean.yaml').read_text())
         cfg.update(width=32, height=32, K=[10., 0., 16., 0., 10., 16., 0., 0., 1.],
-                   distortion=[0.] * 5, T_cam_lidar=np.eye(4).ravel().tolist(), mask_dilate_px=0)
+                   distortion=[0.] * 5, T_cam_lidar=np.eye(4).ravel().tolist(), mask_dilate_px=0,
+                   instance_filter={"min_depth_pixels": 1})
         xyz = np.array([[0., 0., 2.], [0., 0., 5.], [0., 0., -1.]])
         voter = vr.VehicleVoter(cfg, xyz, None, 'cpu')
         voter.vehicle_mask = lambda _: (np.ones((32, 32), dtype=bool), 1)
@@ -118,6 +119,7 @@ class VehicleRemovalTests(unittest.TestCase):
                     np.testing.assert_array_equal(centroids, [[1., 2., 3.]])
                     self.visible = np.array([3])
                     self.vehicle = np.array([3])
+                    self.background = np.array([0])
                     self.views = 0
                     self.last_stats = dict(projected=1, visible=1, occluded=0, vehicle_votes=1, objects=1)
                 def add_view(self, *args):
@@ -154,6 +156,7 @@ class VehicleRemovalTests(unittest.TestCase):
                 def __init__(self, *args):
                     self.visible = np.array([3, 3, 3, 0])
                     self.vehicle = np.array([3, 3, 0, 0])
+                    self.background = np.array([0, 0, 3, 0])
                     self.views = 0
                     self.last_stats = dict(projected=4, visible=3, occluded=1, vehicle_votes=2, objects=1)
                 def add_view(self, *args):
