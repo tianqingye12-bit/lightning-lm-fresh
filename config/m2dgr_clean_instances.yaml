@@ -1,0 +1,77 @@
+# M2DGR 关键帧实例分割去车配置: Velodyne32 + D435i 彩色 (无对齐深度图, 使用地图 z-buffer)
+# 标定来自官方 calibration_results.txt (与 scripts/m2dgr_fusion.py 一致)
+
+color_topic: /camera/color/image_raw/compressed
+# 与彩色图对齐的深度图 (奥比 ROS 驱动开启 depth_registration)，不用则留空，改用地图 z-buffer 判断遮挡
+depth_topic: ''
+depth_scale: 0.001                           # 深度图数值 -> 米 (16UC1 毫米为 0.001)
+
+width: 640
+height: 480
+K: [617.971050917033, 0.0, 327.710279392468,
+    0.0, 616.445131524790, 253.976983707814,
+    0.0, 0.0, 1.0]
+distortion: [0.148000794688248, -0.217835187249065, 0.0, 0.0]
+# 雷达坐标系 -> 彩色相机光学坐标系 (z 朝前, x 朝右, y 朝下), 行优先 4x4
+T_cam_lidar: [-0.000000, -1.000000, -0.000000, 0.000650,
+              -0.000000, -0.000000, -1.000000, 0.653760,
+              1.000000, 0.000000, 0.000000, -0.304560,
+              0.000000, 0.000000, 0.000000, 1.000000]
+# 图像时间戳相对雷达时间戳的固定偏差 (秒)，t_lidar = t_image + time_offset
+time_offset: 0.0
+
+# 实例分割
+yolo_model: yolo26n-seg.pt                   # 必须是分割模型 (-seg)，检测框会把背景一起删掉
+yolo_conf: 0.25                              # 多视角投票会过滤误检，单帧阈值可以放低
+vehicle_classes: [1, 2, 3, 5, 7]             # COCO: bicycle car motorcycle bus truck
+mask_dilate_px: 2                            # 掩码膨胀，补偿标定和时间误差
+# 深度保护使用下方 instance_filter；不再使用旧 depth_margin。
+yolo_imgsz: 640
+clean_mode: keyframes
+image_period: 0.2                            # 每隔多少秒处理一张图像
+max_kf_gap: 2.0                              # 图像两侧关键帧间隔超过此值则跳过 (无法可靠插值位姿)
+
+# 投票
+voxel_size: 0.1
+max_range: 15.0                              # 只统计这个距离内的可见体素
+occlusion_tol: 0.25                          # 深度一致性容差 (米)，另加 2% 距离
+min_views: 3                                 # 至少被相机看到几次才参与判定
+vehicle_ratio: 0.5                           # 被判为车辆的视角占比阈值
+
+# 地面保护：贴地这一层不删，避免地面和车位线出现空洞
+floor_cell: 1.0
+floor_keep: 0.12
+
+# 仅 --mode map 使用的簇扩展参数；keyframes 模式不做无证据扩展
+cluster_voxel: 0.15
+cluster_min_observed: 20
+cluster_vehicle_ratio: 0.5
+cluster_max_extent: [7.0, 7.0, 3.0]          # 超过此尺寸的簇视为和墙柱连在一起，只做体素级删除
+
+
+# Round 4: time gate + translation OR rotation OR heartbeat. Zero motion thresholds restore time-only sampling.
+view_selection:
+  translation_m: 0.0
+  rotation_deg: 0.0
+  max_period_s: 0.0
+cache:
+  enabled: true
+  directory: ''  # default <map>/.vehicle_mask_cache; raw masks only
+rviz_max_points: 300000  # display only, exported PCD remains full resolution
+diagnostics:
+  every_views: 20
+  max_overlays: 20
+
+# Round 6: per-instance depth support, unknown abstention, explicit background veto.
+# min_views/min_vehicle_views count selected images, not independent viewpoints.
+instance_filter:
+  min_depth_pixels: 3
+  depth_quantile: 0.10
+  max_depth_span_m: 3.0
+  depth_band_margin_m: 0.25
+  min_vehicle_views: 3
+  min_background_views: 3
+  background_ratio: 0.5
+keyframe_clean:
+  max_image_dt_s: 0.35
+  max_active_frames: 8

@@ -35,6 +35,7 @@ bool SlamSystem::Init(const std::string& yaml_path) {
     }
 
     auto yaml = YAML::LoadFile(yaml_path);
+    export_keyframe_clouds_ = yaml["system"]["export_keyframe_clouds"].as<bool>(false);
     options_.with_loop_closing_ = yaml["system"]["with_loop_closing"].as<bool>();
     options_.with_visualization_ = yaml["system"]["with_ui"].as<bool>();
     options_.with_2dvisualization_ = yaml["system"]["with_2dui"].as<bool>();
@@ -285,13 +286,37 @@ void SlamSystem::SaveMap(const std::string& path) {
     /// 每行: id timestamp tx ty tz qx qy qz qw
     std::ofstream kf_file(save_path + "/keyframes.txt");
     kf_file << std::setprecision(18);
+    // Publish the manifest only after all frame files have been saved successfully.
+    std::ofstream frame_index;
+    if (export_keyframe_clouds_) {
+        std::filesystem::create_directories(save_path + "/keyframe_clouds");
+        frame_index.open(save_path + "/keyframe_clouds/index.csv.tmp");
+        frame_index << "id,timestamp,file\n" << std::setprecision(18);
+        if (!frame_index) throw std::runtime_error("cannot create keyframe cloud manifest");
+    }
+
     for (size_t i = 0; i < keyframes.size(); ++i) {
         const auto& kf = keyframes[i];
+        if (export_keyframe_clouds_) {
+            const auto cloud = kf->GetCloud();
+            const auto filename = std::to_string(kf->GetID()) + ".pcd";
+            if (!cloud || pcl::io::savePCDFileBinary(save_path + "/keyframe_clouds/" + filename, *cloud) < 0)
+                throw std::runtime_error("failed to export keyframe " + filename);
+            frame_index << kf->GetID() << "," << kf->GetState().timestamp_ << "," << filename << "\n";
+        }
         const SE3& pose = exported_poses[i];
         const auto& t = pose.translation();
         const auto q = pose.unit_quaternion();
         kf_file << kf->GetID() << " " << kf->GetState().timestamp_ << " " << t.x() << " " << t.y() << " " << t.z()
                 << " " << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << "\n";
+    }
+    if (export_keyframe_clouds_) {
+        frame_index.flush();
+        if (!frame_index) throw std::runtime_error("failed to write keyframe cloud manifest");
+        frame_index.close();
+        std::filesystem::rename(save_path + "/keyframe_clouds/index.csv.tmp",
+                                save_path + "/keyframe_clouds/index.csv");
+        LOG(INFO) << "exported " << keyframes.size() << " IMU-frame keyframe clouds for offline cleaning";
     }
     // Version the coordinate contract; cleaning interpolates IMU poses first, then applies T_imu_lidar.
     std::ofstream frame_file(save_path + "/map_frames.yaml");

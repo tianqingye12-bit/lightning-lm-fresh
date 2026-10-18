@@ -18,7 +18,8 @@ class Round4Tests(unittest.TestCase):
     def config(self):
         cfg = yaml.safe_load((ROOT / 'config/m2dgr_clean.yaml').read_text())
         cfg.update(width=32, height=32, K=[10., 0., 16., 0., 10., 16., 0., 0., 1.],
-                   distortion=[0.] * 5, T_cam_lidar=np.eye(4).ravel().tolist(), mask_dilate_px=0)
+                   distortion=[0.] * 5, T_cam_lidar=np.eye(4).ravel().tolist(), mask_dilate_px=0,
+                   instance_filter={"min_depth_pixels": 1})
         return cfg
 
     def test_metadata_legacy_and_invalid(self):

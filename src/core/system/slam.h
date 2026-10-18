@@ -87,6 +87,7 @@ class SlamSystem {
     size_t runtime_frames_ = 0;
     std::atomic<bool> input_fault_{false};
 
+    bool export_keyframe_clouds_ = false;  // opt-in disk export for offline frame cleaning
     Options options_;
     std::atomic_bool running_ = false;
 
