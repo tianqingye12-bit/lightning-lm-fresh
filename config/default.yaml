@@ -43,6 +43,16 @@ fasterlio:
   imu_filter: false
   proj_kfs: false
 
+  # 可选；其他旧配置不增加这一节也可运行，使用同样默认值。
+  feature_quality:
+    enabled: true                # 中心化 PCA 平面质量检查；false 使用原 QR 拟合
+    min_spread: 0.03             # 次大特征值的平方根下限，单位 m
+    min_tangent_ratio: 0.01      # 次大/最大特征值下限，拒绝近似共线邻域
+    max_normal_ratio: 0.10       # 最小/次大特征值上限，拒绝非平面邻域
+    robust_weight: true         # 点面残差采用 Huber 权重
+    huber_delta: 0.10            # Huber 拐点，单位 m
+    stats_interval: 20          # 每 20 个配准扫描输出统计；0 关闭输出
+
 
 g2p5:
   esti_floor: false   # 是否动态估计地面
@@ -137,3 +147,4 @@ ui:
   car_width: 1.6
   car_height: 1.7
   scans: 1
+

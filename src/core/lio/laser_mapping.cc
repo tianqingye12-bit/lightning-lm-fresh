@@ -80,6 +80,30 @@ bool LaserMapping::LoadParamsFromYAML(const std::string &yaml_file) {
         options_.min_pts = yaml["fasterlio"]["min_pts"].as<int>();
         options_.plane_icp_weight_ = yaml["fasterlio"]["plane_icp_weight"].as<float>();
 
+        // Optional nested settings: old dataset YAML files remain valid.
+        const auto feature = yaml["fasterlio"]["feature_quality"];
+        if (feature && !feature.IsMap()) {
+            LOG(ERROR) << "fasterlio.feature_quality must be a map";
+            return false;
+        }
+        if (feature) {
+            options_.plane_quality_.enabled = feature["enabled"].as<bool>(options_.plane_quality_.enabled);
+            options_.plane_quality_.min_spread = feature["min_spread"].as<double>(options_.plane_quality_.min_spread);
+            options_.plane_quality_.min_tangent_ratio =
+                feature["min_tangent_ratio"].as<double>(options_.plane_quality_.min_tangent_ratio);
+            options_.plane_quality_.max_normal_ratio =
+                feature["max_normal_ratio"].as<double>(options_.plane_quality_.max_normal_ratio);
+            options_.robust_plane_weight_ = feature["robust_weight"].as<bool>(options_.robust_plane_weight_);
+            options_.plane_huber_delta_ = feature["huber_delta"].as<double>(options_.plane_huber_delta_);
+            options_.feature_stats_interval_ = feature["stats_interval"].as<int>(options_.feature_stats_interval_);
+        }
+        if (!options_.plane_quality_.Valid() || !std::isfinite(options_.plane_huber_delta_) ||
+            options_.plane_huber_delta_ <= 0.0 || options_.feature_stats_interval_ < 0 ||
+            !std::isfinite(fasterlio::ESTI_PLANE_THRESHOLD) || fasterlio::ESTI_PLANE_THRESHOLD <= 0.0f) {
+            LOG(ERROR) << "invalid feature quality thresholds";
+            return false;
+        }
+
         bool use_imu_filter = yaml["fasterlio"]["imu_filter"].as<bool>();
         p_imu_->SetUseIMUFilter(use_imu_filter);
         options_.proj_kfs_ = yaml["fasterlio"]["proj_kfs"].as<bool>();
@@ -88,6 +112,14 @@ bool LaserMapping::LoadParamsFromYAML(const std::string &yaml_file) {
         LOG(ERROR) << "bad conversion";
         return false;
     }
+
+    LOG(INFO) << "feature quality: pca=" << options_.plane_quality_.enabled
+              << " min_spread=" << options_.plane_quality_.min_spread
+              << " tangent_ratio=" << options_.plane_quality_.min_tangent_ratio
+              << " normal_ratio=" << options_.plane_quality_.max_normal_ratio
+              << " huber=" << options_.robust_plane_weight_
+              << " delta_m=" << options_.plane_huber_delta_
+              << " stats_interval=" << options_.feature_stats_interval_;
 
     LOG(INFO) << "lidar_type " << lidar_type;
     if (lidar_type == 1) {
@@ -271,7 +303,15 @@ bool LaserMapping::Run() {
     // pred_state.pos_ = state_point_.pos_;  // 假定位置不动行不行,防止速度漂移
     // kf_.ChangeX(pred_state);
 
+    feature_stats_ = features::FeatureStats{};
     const bool update_accepted = kf_.Update(ESKF::ObsType::LIDAR, 1.0);
+
+    ++feature_stats_scan_count_;
+    if (options_.feature_stats_interval_ > 0 &&
+        feature_stats_scan_count_ % options_.feature_stats_interval_ == 0) {
+        LOG(INFO) << "[features] scan=" << feature_stats_scan_count_ << " update_accepted=" << update_accepted
+                  << " " << feature_stats_.Summary();
+    }
 
     state_point_ = kf_.GetX();
     state_point_.timestamp_ = measures_.lidar_end_time_;
@@ -624,6 +664,10 @@ void LaserMapping::MapIncremental() {
 void LaserMapping::ObsModel(NavState &s, ESKF::CustomObservationModel &obs) {
     int cnt_pts = scan_down_body_->size();
 
+    // Each worker writes one enum element; aggregate only after the parallel loop.
+    std::vector<features::PlaneStatus> match_status(cnt_pts, features::PlaneStatus::InsufficientNeighbors);
+    feature_stats_ = features::FeatureStats{};
+
     std::vector<size_t> index(cnt_pts);
     for (size_t i = 0; i < index.size(); ++i) {
         index[i] = i;
@@ -647,6 +691,12 @@ void LaserMapping::ObsModel(NavState &s, ESKF::CustomObservationModel &obs) {
 
                 auto &points_near = nearest_points_[i];
                 points_near.clear();
+                point_selected_surf_[i] = false;
+                point_selected_icp_[i] = false;
+                if (!p_body.allFinite() || !point_world.getVector3fMap().allFinite()) {
+                    match_status[i] = features::PlaneStatus::InvalidInput;
+                    return;
+                }
 
                 /** Find the closest surfaces in the map **/
                 ivox_->GetClosestPoint(point_world, points_near, fasterlio::NUM_MATCH_POINTS);
@@ -654,10 +704,22 @@ void LaserMapping::ObsModel(NavState &s, ESKF::CustomObservationModel &obs) {
 
                 point_selected_icp_[i] = point_selected_surf_[i];
 
-                /// 能找到3个点以上，则估计平面
+                // Check local shape before accepting a point-to-plane constraint.
                 if (point_selected_surf_[i]) {
-                    point_selected_surf_[i] =
-                        math::esti_plane(plane_coef_[i], points_near, fasterlio::ESTI_PLANE_THRESHOLD);
+                    if (options_.plane_quality_.enabled) {
+                        match_status[i] = features::FitPlane(points_near, plane_coef_[i],
+                            fasterlio::ESTI_PLANE_THRESHOLD, options_.plane_quality_);
+                    } else {
+                        const bool fitted = math::esti_plane(plane_coef_[i], points_near,
+                                                            fasterlio::ESTI_PLANE_THRESHOLD);
+                        match_status[i] = fitted ? features::PlaneStatus::Accepted : features::PlaneStatus::NonPlanar;
+                    }
+                    point_selected_surf_[i] = match_status[i] == features::PlaneStatus::Accepted;
+                    if (point_selected_surf_[i] && (!plane_coef_[i].allFinite() ||
+                                                    plane_coef_[i].head<3>().norm() < 1e-6f)) {
+                        point_selected_surf_[i] = false;
+                        match_status[i] = features::PlaneStatus::InvalidInput;
+                    }
                 }
 
                 /// 计算平面阈值
@@ -666,11 +728,12 @@ void LaserMapping::ObsModel(NavState &s, ESKF::CustomObservationModel &obs) {
                     temp[3] = 1.0;
                     float pd2 = plane_coef_[i].dot(temp);
 
-                    if (p_body.norm() > 81 * pd2 * pd2) {
+                    if (std::isfinite(pd2) && p_body.norm() > 81 * pd2 * pd2) {
                         point_selected_surf_[i] = true;
                         residuals_[i] = pd2;
                     } else {
                         point_selected_surf_[i] = false;
+                        match_status[i] = features::PlaneStatus::ResidualRejected;
                     }
                 }
             });
@@ -683,10 +746,16 @@ void LaserMapping::ObsModel(NavState &s, ESKF::CustomObservationModel &obs) {
     corr_pts_.resize(cnt_pts);
     corr_norm_.resize(cnt_pts);
     for (int i = 0; i < cnt_pts; i++) {
+        feature_stats_.Record(match_status[i]);
         if (point_selected_surf_[i]) {
             corr_norm_[effect_feat_surf_] = plane_coef_[i];
             corr_pts_[effect_feat_surf_] = scan_down_body_->points[i].getVector4fMap();
             corr_pts_[effect_feat_surf_][3] = residuals_[i];
+
+            const double weight = options_.robust_plane_weight_
+                ? features::HuberWeight(residuals_[i], options_.plane_huber_delta_) : 1.0;
+            feature_stats_.AddAccepted(scan_down_body_->points[i].getVector3fMap().cast<double>(),
+                                      plane_coef_[i].head<3>().cast<double>(), weight);
 
             effect_feat_surf_++;
         }
@@ -738,8 +807,10 @@ void LaserMapping::ObsModel(NavState &s, ESKF::CustomObservationModel &obs) {
 
         float res = -corr_pts_[i][3];
 
-        // double w = huber_weight(res);
-        double w = 1.0;
+        // IRLS information weight: apply the SAME factor to HTH and HTr.
+        // Keep res_sq unweighted for the existing ESKF rejection diagnostics.
+        const double w = options_.robust_plane_weight_
+            ? features::HuberWeight(res, options_.plane_huber_delta_) : 1.0;
 
         JTJ[i] = (J.transpose() * J).eval() * w;
         JTr[i] = J.transpose() * res * w;
@@ -885,3 +956,4 @@ CloudPtr LaserMapping::GetProjCloud() {
 }
 
 }  // namespace lightning
+
