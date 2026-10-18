@@ -15,6 +15,7 @@
 #include "core/lio/feature_quality.h"
 #include "core/lio/map_detail.h"
 #include "core/lio/imu_prediction.h"
+#include "utils/runtime_stats.h"
 #include "core/lio/imu_processing.hpp"
 #include "pointcloud_preprocess.h"
 
@@ -88,6 +89,13 @@ class LaserMapping {
 
     /// 保存前端的地图
     void SaveMap();
+
+    struct InputStats { size_t imu, lidar, dropped_lidar; bool fault; };
+    void ConfigureInputLimits(size_t imu_limit, size_t lidar_limit) {
+        max_imu_buffer_ = imu_limit; max_lidar_buffer_ = lidar_limit;
+    }
+    InputStats GetInputStats();
+    RuntimeStats& Stats() { return runtime_stats_; }
 
     void SetUI(std::shared_ptr<ui::PangolinWindow> ui) { ui_ = ui; }
 
@@ -164,6 +172,7 @@ class LaserMapping {
     void ProjectKFs(CloudPtr cloud, int size_limit = 1000);
 
    private:
+    RuntimeStats runtime_stats_;
     Options options_;
 
     /// modules
@@ -207,6 +216,9 @@ class LaserMapping {
     /// 点到点相关
     std::vector<char> point_selected_icp_;  // 点到点的selected points
 
+    // Only configured for online SLAM; offline providers retain their existing input policy.
+    size_t max_imu_buffer_ = 0, max_lidar_buffer_ = 0, dropped_input_lidar_ = 0;
+    bool input_buffer_fault_ = false;
     std::mutex mtx_buffer_;
     std::deque<double> time_buffer_;
 

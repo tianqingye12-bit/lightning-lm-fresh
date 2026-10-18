@@ -14,6 +14,10 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <sstream>
+#include <algorithm>
+#include <rclcpp/executors/multi_threaded_executor.hpp>
+#include <stdexcept>
 #include <opencv2/opencv.hpp>
 
 namespace lightning {
@@ -62,6 +66,24 @@ bool SlamSystem::Init(const std::string& yaml_path) {
             display.max_points = static_cast<size_t>(max_points);
         }
         if (!display.Valid()) return false;
+        ui::RuntimeDisplayOptions render_options;
+        auto render = yaml["system"]["runtime_display"];
+        if (!render) render = YAML::Node(YAML::NodeType::Map);
+        if (!render.IsMap()) return false;
+        render_options.render_hz = render["render_hz"].as<double>(20);
+        render_options.scan_hz = render["scan_hz"].as<double>(5);
+        render_options.stale_wall_s = render["stale_wall_s"].as<double>(1);
+        const auto read_budget = [&](const char* key, size_t& budget) {
+            const auto value = render[key].as<long long>(static_cast<long long>(budget));
+            if (value <= 0 || value > 100000000) return false;
+            budget = static_cast<size_t>(value); return true;
+        };
+        if (!read_budget("scan_max_points", render_options.scan_max_points) ||
+            !read_budget("history_max_points", render_options.history_max_points) ||
+            !read_budget("history_scans", render_options.history_scans) ||
+            !read_budget("trajectory_max_points", render_options.trajectory_max_points) ||
+            !render_options.Valid()) return false;
+        ui_->ConfigureRuntimeDisplay(render_options, &lio_->Stats());
         ui_->ConfigureLoopDisplay(display);
         if (!ui_->Init()) return false;
 
@@ -99,6 +121,21 @@ bool SlamSystem::Init(const std::string& yaml_path) {
     }
 
     if (options_.online_mode_) {
+        auto runtime = yaml["system"]["runtime"];
+        if (!runtime) runtime = YAML::Node(YAML::NodeType::Map);
+        if (runtime && !runtime.IsMap()) return false;
+        runtime_stats_interval_ = runtime["stats_interval"].as<int>(20);
+        const int imu_capacity = runtime["imu_capacity"].as<int>(4096);
+        const int lidar_capacity = runtime["lidar_capacity"].as<int>(2);
+        if (runtime_stats_interval_ < 0 || imu_capacity < 10 || imu_capacity > 100000 ||
+            lidar_capacity < 1 || lidar_capacity > 100) return false;
+        lio_->ConfigureInputLimits(static_cast<size_t>(imu_capacity),
+                                   std::max<size_t>(4, static_cast<size_t>(lidar_capacity) + 2));
+        if (runtime["async"].as<bool>(true)) {
+            online_worker_.reset(new SerialWorker({static_cast<size_t>(imu_capacity),
+                                                   static_cast<size_t>(lidar_capacity), 8}));
+            online_worker_->Start();
+        }
         LOG(INFO) << "online mode, creating ros2 node ... ";
 
         /// subscribers
@@ -132,17 +169,19 @@ bool SlamSystem::Init(const std::string& yaml_path) {
 
         cloud_sub_ = node_->create_subscription<sensor_msgs::msg::PointCloud2>(
             cloud_topic_, qos, [this](sensor_msgs::msg::PointCloud2::SharedPtr cloud) {
-                Timer::Evaluate([&]() { ProcessLidar(cloud); }, "Proc Lidar", true);
+                Timer::Evaluate([&]() { ProcessLidar(cloud); }, "Receive Lidar", false);
             });
 
         livox_sub_ = node_->create_subscription<livox_ros_driver2::msg::CustomMsg>(
             livox_topic_, qos, [this](livox_ros_driver2::msg::CustomMsg ::SharedPtr cloud) {
-                Timer::Evaluate([&]() { ProcessLidar(cloud); }, "Proc Lidar", true);
+                Timer::Evaluate([&]() { ProcessLidar(cloud); }, "Receive Lidar", false);
             });
 
+        save_callback_group_ = node_->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
         savemap_service_ = node_->create_service<SaveMapService>(
             "lightning/save_map", [this](const SaveMapService::Request::SharedPtr& req,
-                                         SaveMapService::Response::SharedPtr res) { SaveMap(req, res); });
+                                         SaveMapService::Response::SharedPtr res) { SaveMap(req, res); },
+            rmw_qos_profile_services_default, save_callback_group_);
 
         LOG(INFO) << "online slam node has been created.";
     }
@@ -151,6 +190,7 @@ bool SlamSystem::Init(const std::string& yaml_path) {
 }
 
 SlamSystem::~SlamSystem() {
+    if (online_worker_) online_worker_->Stop();  // Drain core work before backend/UI teardown.
     lc_.reset();  // Join the backend callback thread before destroying either display.
     if (ui_) {
         ui_->Quit();
@@ -158,12 +198,25 @@ SlamSystem::~SlamSystem() {
 }
 
 void SlamSystem::StartSLAM(std::string map_name) {
+    if (online_worker_ && !online_worker_->IsCurrent()) {
+        online_worker_->Call([this, map_name] { StartSLAM(map_name); });
+        return;
+    }
+    if (input_fault_.load()) {
+        LOG(ERROR) << "[runtime] start rejected after input fault; restart the SLAM node";
+        return;
+    }
     map_name_ = map_name;
     running_ = true;
 }
 
 void SlamSystem::SaveMap(const SaveMapService::Request::SharedPtr request,
                          SaveMapService::Response::SharedPtr response) {
+    if (online_worker_ && !online_worker_->IsCurrent()) {
+        try { online_worker_->Call([this, request, response] { SaveMap(request, response); }); }
+        catch (const std::exception& e) { LOG(ERROR) << e.what(); response->response = 3; }
+        return;
+    }
     if (!lio_ || lio_->GetAllKeyframes().empty()) {
         LOG(WARNING) << "save map rejected: no keyframes yet";
         response->response = 3;
@@ -177,11 +230,16 @@ void SlamSystem::SaveMap(const SaveMapService::Request::SharedPtr request,
 }
 
 void SlamSystem::SaveMap(const std::string& path) {
+    if (online_worker_ && !online_worker_->IsCurrent()) {
+        online_worker_->Call([this, path] { SaveMap(path); });
+        return;
+    }
     // Validate before accessing front() or replacing an existing map directory.
     if (!lio_) {
         LOG(WARNING) << "save map rejected: LIO is not initialized";
         return;
     }
+    RuntimeStats::Scope save_time(lio_->Stats(), RuntimeStats::save_map);
     const auto keyframes = lio_->GetAllKeyframes();
     if (keyframes.empty()) {
         LOG(WARNING) << "save map rejected: no keyframes yet";
@@ -308,17 +366,76 @@ void SlamSystem::SaveMap(const std::string& path) {
     LOG(INFO) << "map saved";
 }
 
+void SlamSystem::Enqueue(SerialWorker::Kind kind, std::function<void()> task) {
+    if (!running_.load()) return;
+    if (!online_worker_->Post(kind, [this, kind, task = std::move(task)](double wait_ms) {
+            lio_->Stats().Observe(kind == SerialWorker::imu ? RuntimeStats::imu_wait : RuntimeStats::lidar_wait, wait_ms);
+            try {
+                task();
+                if (lio_->GetInputStats().fault) {
+                    running_.store(false); input_fault_.store(true);
+                    if (ui_) ui_->UpdatePredictionStatus(false, "core_input_fault", 0);
+                }
+            }
+            catch (const std::exception& e) {
+                running_.store(false); input_fault_.store(true);
+                LOG(ERROR) << "[runtime] core task failed: " << e.what();
+                if (ui_) ui_->UpdatePredictionStatus(false, "core_fault", 0);
+            } catch (...) {
+                running_.store(false); input_fault_.store(true);
+                LOG(ERROR) << "[runtime] unknown core task failure";
+                if (ui_) ui_->UpdatePredictionStatus(false, "core_fault", 0);
+            }
+            if (kind == SerialWorker::lidar) ReportRuntime();
+        })) {
+        const auto state = online_worker_->State();
+        if (kind == SerialWorker::imu) {
+            running_.store(false); input_fault_.store(true);
+            LOG(ERROR) << "[runtime] IMU queue overflow: stop core ingestion; save map and restart slower";
+            if (ui_) ui_->UpdatePredictionStatus(false, "input_overflow", 0);
+        } else if (state.rejected[kind] == 1 || state.rejected[kind] % 20 == 0) {
+            LOG(WARNING) << "[runtime] drop newest queued LiDAR frame count=" << state.rejected[kind];
+        }
+    }
+}
+
+void SlamSystem::ReportRuntime() {
+    ++runtime_frames_;
+    const auto state = online_worker_ ? online_worker_->State() : SerialWorker::Snapshot{};
+    const auto core_input = lio_->GetInputStats();
+    std::ostringstream status;
+    status << (input_fault_.load() ? "INPUT FAULT" : "worker active")
+           << " queue imu/lidar=" << state.queued[0] << '/' << state.queued[1]
+           << " core queue=" << core_input.imu << '/' << core_input.lidar
+           << " rejected imu/lidar=" << state.rejected[0] << '/' << state.rejected[1]
+           << " core_lidar_dropped=" << core_input.dropped_lidar;
+    if (ui_) ui_->UpdateRuntimeStatus(status.str());
+    if (runtime_stats_interval_ > 0 && runtime_frames_ % runtime_stats_interval_ == 0) {
+        LOG(INFO) << "[runtime] " << status.str() << lio_->Stats().Summary();
+    }
+}
+
 void SlamSystem::ProcessIMU(const lightning::IMUPtr& imu) {
+    if (online_worker_ && !online_worker_->IsCurrent()) {
+        Enqueue(SerialWorker::imu, [this, imu] { ProcessIMU(imu); });
+        return;
+    }
     if (running_ == false) {
         return;
     }
+    RuntimeStats::Scope imu_time(lio_->Stats(), RuntimeStats::imu_update);
     lio_->ProcessIMU(imu);
 }
 
 void SlamSystem::ProcessLidar(const sensor_msgs::msg::PointCloud2::SharedPtr& cloud) {
+    if (online_worker_ && !online_worker_->IsCurrent()) {
+        Enqueue(SerialWorker::lidar, [this, cloud] { ProcessLidar(cloud); });
+        return;
+    }
     if (running_ == false) {
         return;
     }
+    RuntimeStats::Scope frame_time(lio_->Stats(), RuntimeStats::frame_total);
 
     lio_->ProcessPointCloud2(cloud);
     lio_->Run();
@@ -348,9 +465,14 @@ void SlamSystem::ProcessLidar(const sensor_msgs::msg::PointCloud2::SharedPtr& cl
 }
 
 void SlamSystem::ProcessLidar(const livox_ros_driver2::msg::CustomMsg::SharedPtr& cloud) {
+    if (online_worker_ && !online_worker_->IsCurrent()) {
+        Enqueue(SerialWorker::lidar, [this, cloud] { ProcessLidar(cloud); });
+        return;
+    }
     if (running_ == false) {
         return;
     }
+    RuntimeStats::Scope frame_time(lio_->Stats(), RuntimeStats::frame_total);
 
     lio_->ProcessPointCloud2(cloud);
     lio_->Run();
@@ -381,7 +503,15 @@ void SlamSystem::ProcessLidar(const livox_ros_driver2::msg::CustomMsg::SharedPtr
 
 void SlamSystem::Spin() {
     if (options_.online_mode_ && node_ != nullptr) {
-        spin(node_);
+        // Sensors share the node's mutually-exclusive group; the save service has its own.
+        // Both only submit to ONE core worker, so ESKF/map access remains serialized.
+        if (online_worker_) {
+            rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 2);
+            executor.add_node(node_);
+            executor.spin();
+        } else {
+            rclcpp::spin(node_);  // synchronous fallback retains one callback thread
+        }
     }
 }
 

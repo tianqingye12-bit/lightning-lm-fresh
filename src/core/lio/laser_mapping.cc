@@ -244,6 +244,7 @@ bool LaserMapping::AdvanceImuPrediction(const IMUPtr& imu, const char* source) {
     if (decision != prediction::Decision::predict || !imu->angular_velocity.allFinite() ||
         !imu->linear_acceleration.allFinite()) {
         imu_prediction_suspended_ = true;
+        if (ui_) ui_->UpdatePredictionStatus(false, prediction::Name(decision), imu->timestamp-last_accepted_lio_time_);
         ++prediction_rejections_;
         if (prediction_rejections_ <= 5 || prediction_rejections_ % 100 == 0) {
             LOG(WARNING) << "[imu_prediction] suspended source=" << source
@@ -263,6 +264,7 @@ bool LaserMapping::AdvanceImuPrediction(const IMUPtr& imu, const char* source) {
         LOG(ERROR) << "[imu_prediction] nonfinite prediction; suspend until next LiDAR rebase";
         kf_imu_ = kf_;
         imu_prediction_suspended_ = true;
+        if (ui_) ui_->UpdatePredictionStatus(false, "nonfinite_state", 0);
         return false;
     }
     return true;
@@ -275,6 +277,7 @@ void LaserMapping::RebaseImuPrediction(bool update_accepted) {
     if (update_accepted) last_accepted_lio_time_ = measures_.lidar_end_time_;
     kf_imu_ = kf_;
     imu_prediction_suspended_ = last_accepted_lio_time_ <= 0 || p_imu_->HasPropagationFault();
+    if (imu_prediction_suspended_ && ui_) ui_->UpdatePredictionStatus(false, "waiting_or_core_fault", 0);
     for (const auto& imu : imu_buffer_) {
         AdvanceImuPrediction(imu, "replay");
         if (imu_prediction_suspended_) break;
@@ -295,10 +298,22 @@ void LaserMapping::RebaseImuPrediction(bool update_accepted) {
     }
 }
 
+LaserMapping::InputStats LaserMapping::GetInputStats() {
+    UL lock(mtx_buffer_);
+    return {imu_buffer_.size(), lidar_buffer_.size(), dropped_input_lidar_, input_buffer_fault_};
+}
+
 void LaserMapping::ProcessIMU(const lightning::IMUPtr &imu) {
     publish_count_++;
     const double timestamp = imu->timestamp;
     UL lock(mtx_buffer_);
+    if (input_buffer_fault_) return;
+    if (max_imu_buffer_ && imu_buffer_.size() >= max_imu_buffer_) {
+        input_buffer_fault_ = true; imu_prediction_suspended_ = true;
+        if (ui_) ui_->UpdatePredictionStatus(false, "core_imu_overflow", 0);
+        LOG(ERROR) << "[runtime] core IMU buffer overflow: restart slower or restore LiDAR input";
+        return;
+    }
     if (!std::isfinite(timestamp) || !imu->angular_velocity.allFinite() ||
         !imu->linear_acceleration.allFinite()) {
         LOG(WARNING) << "[imu_prediction] discard nonfinite IMU input";
@@ -312,6 +327,7 @@ void LaserMapping::ProcessIMU(const lightning::IMUPtr &imu) {
         const auto& state = kf_imu_.GetX();
         if (ui_ && prediction::CanPublish(state.timestamp_, last_prediction_published_time_)) {
             ui_->UpdateNavState(state);
+            ui_->UpdatePredictionStatus(true, "valid", timestamp-last_accepted_lio_time_);
             last_prediction_published_time_ = state.timestamp_;
         }
         if (imu_prediction_options_.stats_interval > 0 &&
@@ -327,13 +343,14 @@ void LaserMapping::ProcessIMU(const lightning::IMUPtr &imu) {
 }
 
 bool LaserMapping::Run() {
+    if (input_buffer_fault_) return false;
     if (!SyncPackages()) {
         LOG(WARNING) << "sync package failed";
         return false;
     }
 
     /// IMU process, kf prediction, undistortion
-    p_imu_->Process(measures_, kf_, scan_undistort_);
+    Measure(runtime_stats_, RuntimeStats::deskew, [&] { p_imu_->Process(measures_, kf_, scan_undistort_); });
 
     if (!scan_undistort_ || scan_undistort_->empty()) {
         if (p_imu_->IsIMUInited()) RebaseImuPrediction(false);
@@ -382,7 +399,8 @@ bool LaserMapping::Run() {
         if (skip_lidar_cnt_ != 0) {
             /// 更新UI中的内容
             if (ui_) {
-                ui_->UpdateScan(CloudInImuFrame(scan_undistort_), kf_.GetX().GetPose());
+                Measure(runtime_stats_, RuntimeStats::ui_prepare, [&] {
+                    ui_->UpdateScan(scan_undistort_, kf_.GetX().GetPose(), GetTImuLidar()); });
             }
 
             RebaseImuPrediction(false);
@@ -404,7 +422,7 @@ bool LaserMapping::Run() {
 
     /// downsample
     voxel_scan_.setInputCloud(scan_undistort_);
-    voxel_scan_.filter(*scan_down_body_);
+    Measure(runtime_stats_, RuntimeStats::downsample, [&] { voxel_scan_.filter(*scan_down_body_); });
 
     // if (options_.proj_kfs_) {
     //     ProjectKFs();
@@ -418,7 +436,7 @@ bool LaserMapping::Run() {
         auto v = voxel_scan_;
         v.setLeafSize(0.1, 0.1, 0.1);
         v.setInputCloud(scan_undistort_);
-        v.filter(*scan_down_body_);
+        Measure(runtime_stats_, RuntimeStats::downsample, [&] { v.filter(*scan_down_body_); });
 
         // LOG(INFO) << "Now pts: " << scan_down_body_->size() << ", before: " << cur_pts;
         cur_pts = scan_down_body_->size();
@@ -443,7 +461,8 @@ bool LaserMapping::Run() {
     // kf_.ChangeX(pred_state);
 
     feature_stats_ = features::FeatureStats{};
-    const bool update_accepted = kf_.Update(ESKF::ObsType::LIDAR, 1.0);
+    const bool update_accepted = Measure(runtime_stats_, RuntimeStats::registration,
+        [&] { return kf_.Update(ESKF::ObsType::LIDAR, 1.0); });
 
     ++feature_stats_scan_count_;
     if (options_.feature_stats_interval_ > 0 &&
@@ -507,7 +526,8 @@ bool LaserMapping::Run() {
     RebaseImuPrediction(update_accepted);
 
     if (ui_) {
-        ui_->UpdateScan(CloudInImuFrame(scan_down_body_), state_point_.GetPose());
+        Measure(runtime_stats_, RuntimeStats::ui_prepare, [&] {
+            ui_->UpdateScan(scan_down_body_, state_point_.GetPose(), GetTImuLidar()); });
     }
 
     LOG(INFO) << "LIO state: " << state_point_.pos_.transpose() << ", yaw "
@@ -612,6 +632,13 @@ void LaserMapping::MakeKF() {
 
 void LaserMapping::ProcessPointCloud2(const sensor_msgs::msg::PointCloud2::SharedPtr &msg) {
     UL lock(mtx_buffer_);
+    if (input_buffer_fault_) return;
+    if (max_lidar_buffer_ && lidar_buffer_.size() >= max_lidar_buffer_) {
+        ++dropped_input_lidar_;
+        if (dropped_input_lidar_ == 1 || dropped_input_lidar_ % 20 == 0)
+            LOG(WARNING) << "[runtime] drop newest core LiDAR frame count=" << dropped_input_lidar_;
+        return;
+    }
     Timer::Evaluate(
         [&, this]() {
             scan_count_++;
@@ -625,7 +652,7 @@ void LaserMapping::ProcessPointCloud2(const sensor_msgs::msg::PointCloud2::Share
                       << ", latest imu: " << last_timestamp_imu_;
 
             CloudPtr cloud(new PointCloudType());
-            preprocess_->Process(msg, cloud);
+            Measure(runtime_stats_, RuntimeStats::preprocess, [&] { preprocess_->Process(msg, cloud); });
 
             lidar_buffer_.push_back(cloud);
             time_buffer_.push_back(timestamp);
@@ -636,6 +663,13 @@ void LaserMapping::ProcessPointCloud2(const sensor_msgs::msg::PointCloud2::Share
 
 void LaserMapping::ProcessPointCloud2(const livox_ros_driver2::msg::CustomMsg::SharedPtr &msg) {
     UL lock(mtx_buffer_);
+    if (input_buffer_fault_) return;
+    if (max_lidar_buffer_ && lidar_buffer_.size() >= max_lidar_buffer_) {
+        ++dropped_input_lidar_;
+        if (dropped_input_lidar_ == 1 || dropped_input_lidar_ % 20 == 0)
+            LOG(WARNING) << "[runtime] drop newest core LiDAR frame count=" << dropped_input_lidar_;
+        return;
+    }
     Timer::Evaluate(
         [&, this]() {
             scan_count_++;
@@ -649,7 +683,7 @@ void LaserMapping::ProcessPointCloud2(const livox_ros_driver2::msg::CustomMsg::S
             //           << ", latest imu: " << last_timestamp_imu_;
 
             CloudPtr cloud(new PointCloudType());
-            preprocess_->Process(msg, cloud);
+            Measure(runtime_stats_, RuntimeStats::preprocess, [&] { preprocess_->Process(msg, cloud); });
 
             lidar_buffer_.push_back(cloud);
             time_buffer_.push_back(timestamp);
@@ -660,6 +694,13 @@ void LaserMapping::ProcessPointCloud2(const livox_ros_driver2::msg::CustomMsg::S
 
 void LaserMapping::ProcessPointCloud2(CloudPtr cloud) {
     UL lock(mtx_buffer_);
+    if (input_buffer_fault_) return;
+    if (max_lidar_buffer_ && lidar_buffer_.size() >= max_lidar_buffer_) {
+        ++dropped_input_lidar_;
+        if (dropped_input_lidar_ == 1 || dropped_input_lidar_ % 20 == 0)
+            LOG(WARNING) << "[runtime] drop newest core LiDAR frame count=" << dropped_input_lidar_;
+        return;
+    }
     Timer::Evaluate(
         [&, this]() {
             scan_count_++;
@@ -744,6 +785,7 @@ bool LaserMapping::SyncPackages() {
 }
 
 void LaserMapping::MapIncremental() {
+    RuntimeStats::Scope map_time(runtime_stats_, RuntimeStats::map_update);
     PointVector points_to_add;
     PointVector point_no_need_downsample;
 
@@ -830,6 +872,7 @@ void LaserMapping::ObsModel(NavState &s, ESKF::CustomObservationModel &obs) {
 
     Timer::Evaluate(
         [&, this]() {
+            RuntimeStats::Scope matching_time(runtime_stats_, RuntimeStats::matching);
             Mat3f R_wl = (s.rot_.matrix() * offset_R_lidar_fixed_).cast<float>();
             Vec3f t_wl = (s.rot_ * offset_t_lidar_fixed_ + s.pos_).cast<float>();
 

@@ -29,8 +29,8 @@ bool PangolinWindowImpl::Init() {
     pangolin::GetBoundWindow()->RemoveCurrent();
 
     // 雷达定位轨迹opengl设置
-    traj_newest_state_.reset(new ui::UiTrajectory(Vec3f(1.0, 0.0, 0.0)));  // 红色
-    traj_scans_.reset(new ui::UiTrajectory(Vec3f(0.0, 1.0, 0.0)));         // 绿色
+    traj_newest_state_.reset(new ui::UiTrajectory(Vec3f(1.0, 0.0, 0.0), runtime_display_options_.trajectory_max_points));  // 红色
+    traj_scans_.reset(new ui::UiTrajectory(Vec3f(0.0, 1.0, 0.0), runtime_display_options_.trajectory_max_points));         // 绿色
 
     current_scan_.reset(new PointCloudType);  // 重置pcl点云指针
     current_scan_ui_.reset(new ui::UiCloud);  // 重置用于渲染的点云指针
@@ -49,6 +49,7 @@ void PangolinWindowImpl::Reset(const std::vector<Keyframe::Ptr> &keyframes) {
     UL lock(mtx_reset_);
     cloud_map_ui_.clear();
     scans_.clear();
+    scans_total_points_ = 0;
     current_scan_ui_ = nullptr;
     traj_scans_->Clear();
 
@@ -218,6 +219,7 @@ bool PangolinWindowImpl::UpdateCurrentScan() {
         if (current_scan_ui_) {
             current_scan_ui_->SetRenderColor(ui::UiCloud::UseColor::HEIGHT_COLOR);
             scans_.emplace_back(current_scan_ui_);
+            scans_total_points_ += current_scan_ui_->Size();
         }
 
         current_scan_ui_ = std::make_shared<ui::UiCloud>();
@@ -234,7 +236,9 @@ bool PangolinWindowImpl::UpdateCurrentScan() {
         newest_backend_pose_ = current_scan_pose_;
     }
 
-    while (scans_.size() >= max_size_of_current_scan_) {
+    while (!scans_.empty() && (scans_.size() >= static_cast<size_t>(std::max(1, max_size_of_current_scan_)) ||
+           scans_total_points_ + (current_scan_ui_ ? current_scan_ui_->Size() : 0) > runtime_display_options_.history_max_points)) {
+        scans_total_points_ -= scans_.front()->Size();
         scans_.pop_front();
     }
 
@@ -242,11 +246,13 @@ bool PangolinWindowImpl::UpdateCurrentScan() {
 }
 
 bool PangolinWindowImpl::UpdateState() {
-    if (!kf_result_need_update_.load()) {
-        return false;
-    }
-
     std::lock_guard<std::mutex> lock(mtx_nav_state_);
+    const bool recent = std::chrono::steady_clock::now() - last_nav_arrival_ <
+                        std::chrono::duration<double>(runtime_display_options_.stale_wall_s);
+    render_prediction_valid_ = prediction_valid_ && recent;
+    if (!render_prediction_valid_ || prediction_break_pending_) traj_newest_state_->Break();
+    if (!kf_result_need_update_.load()) return false;
+    if (render_prediction_valid_) prediction_break_pending_ = false;
     Vec3d pos = pose_.translation().eval();
     Vec3d vel_baselink = pose_.so3().inverse() * vel_;
     double roll = pose_.angleX();
@@ -260,7 +266,7 @@ bool PangolinWindowImpl::UpdateState() {
     log_confidence_.Log(confidence_);
 
     newest_frontend_pose_ = pose_;
-    traj_newest_state_->AddPt(newest_frontend_pose_);
+    if (render_prediction_valid_) traj_newest_state_->AddPt(newest_frontend_pose_);
 
     std::ostringstream ss;
     ss << std::fixed << std::setprecision(4) << "ba: [" << bias_acc_(0) << ", " << bias_acc_(1) << ", " << bias_acc_(2)
@@ -299,7 +305,7 @@ void PangolinWindowImpl::DrawAll() {
         traj_newest_state_->Render();
         // 车
         frontend_car_.SetPose(newest_frontend_pose_);  // 车在current pose上
-        frontend_car_.Render();
+        frontend_car_.Render(!render_prediction_valid_);
     }
 
     if (draw_backend_traj_) {
@@ -393,6 +399,21 @@ void PangolinWindowImpl::RenderLabels() {
     glColor3ub(180, 220, 180);
     gltext_label_state_.Draw();
 
+    std::string prediction_text, runtime_text;
+    {
+        std::lock_guard<std::mutex> lock(mtx_nav_state_);
+        std::ostringstream text;
+        text << "IMU prediction: " << (render_prediction_valid_ ? "VALID" : "PAUSED")
+             << " (" << (prediction_valid_ && !render_prediction_valid_ ? "no_recent_imu" : prediction_reason_)
+             << ") lead_s=" << std::fixed << std::setprecision(3) << prediction_lead_s_;
+        prediction_text = text.str(); runtime_text = runtime_status_;
+    }
+    glTranslatef(0, -1.5f * gltext_label_global_.Height(), 0);
+    if (render_prediction_valid_) glColor3ub(100, 220, 100); else glColor3ub(180, 180, 180);
+    pangolin::default_font().Text(prediction_text).Draw();
+    glTranslatef(0, -1.5f * gltext_label_global_.Height(), 0);
+    pangolin::default_font().Text(runtime_text).Draw();
+
     // Restore modelview / project matrices
     glMatrixMode(GL_PROJECTION);
     glPopMatrix();
@@ -474,6 +495,7 @@ void PangolinWindowImpl::Render() {
 
     exit_flag_.store(false);
     while (!pangolin::ShouldQuit() && !exit_flag_) {
+        const auto frame_started = std::chrono::steady_clock::now();
         // Clear entire screen
         glClearColor(20.0 / 255.0, 20.0 / 255.0, 20.0 / 255.0, 1.0);
         // 清除了颜色缓冲区（GL_COLOR_BUFFER_BIT）和深度缓冲区（GL_DEPTH_BUFFER_BIT）。
@@ -519,7 +541,10 @@ void PangolinWindowImpl::Render() {
         // 完成当前帧的渲染并处理与窗口交互相关的事件
 
         pangolin::FinishFrame();
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        if (runtime_stats_) runtime_stats_->Observe(RuntimeStats::render_frame,
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - frame_started).count());
+        std::this_thread::sleep_until(frame_started + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(1.0 / runtime_display_options_.render_hz)));
     }
 
     // unset the current context from the main thread
