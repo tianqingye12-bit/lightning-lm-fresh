@@ -83,6 +83,21 @@ bool LaserMapping::LoadParamsFromYAML(const std::string &yaml_file) {
         options_.min_pts = yaml["fasterlio"]["min_pts"].as<int>();
         options_.plane_icp_weight_ = yaml["fasterlio"]["plane_icp_weight"].as<float>();
 
+        const auto prediction = yaml["fasterlio"]["imu_prediction"];
+        if (prediction && !prediction.IsMap()) {
+            LOG(ERROR) << "fasterlio.imu_prediction must be a map";
+            return false;
+        }
+        if (prediction) {
+            imu_prediction_options_.max_step_s = prediction["max_step_s"].as<double>(0.10);
+            imu_prediction_options_.max_horizon_s = prediction["max_horizon_s"].as<double>(0.30);
+            imu_prediction_options_.stats_interval = prediction["stats_interval"].as<int>(200);
+        }
+        if (!imu_prediction_options_.Valid()) {
+            LOG(ERROR) << "invalid IMU prediction time limits";
+            return false;
+        }
+
         // Optional nested settings: old dataset YAML files remain valid.
         const auto feature = yaml["fasterlio"]["feature_quality"];
         if (feature && !feature.IsMap()) {
@@ -220,38 +235,94 @@ LaserMapping::LaserMapping(Options options) : options_(options) {
     p_imu_.reset(new ImuProcess());
 }
 
+bool LaserMapping::AdvanceImuPrediction(const IMUPtr& imu, const char* source) {
+    if (imu_prediction_suspended_) return false;
+    const double current = kf_imu_.GetX().timestamp_;
+    const auto decision = prediction::CheckTime(current, imu->timestamp, last_accepted_lio_time_,
+                                                imu_prediction_options_);
+    if (decision == prediction::Decision::already_covered) return false;
+    if (decision != prediction::Decision::predict || !imu->angular_velocity.allFinite() ||
+        !imu->linear_acceleration.allFinite()) {
+        imu_prediction_suspended_ = true;
+        ++prediction_rejections_;
+        if (prediction_rejections_ <= 5 || prediction_rejections_ % 100 == 0) {
+            LOG(WARNING) << "[imu_prediction] suspended source=" << source
+                         << " reason=" << ((!imu->angular_velocity.allFinite() || !imu->linear_acceleration.allFinite())
+                                               ? "invalid_sample" : prediction::Name(decision))
+                         << " step_s=" << imu->timestamp - current
+                         << " accepted_lio_age_s=" << imu->timestamp - last_accepted_lio_time_
+                         << " imu_queue=" << imu_buffer_.size() << " lidar_queue=" << lidar_buffer_.size();
+        }
+        return false;
+    }
+    kf_imu_.Predict(imu->timestamp - current, p_imu_->Q_, imu->angular_velocity,
+                    imu->linear_acceleration * p_imu_->GetAccScaleFactor());
+    kf_imu_.SetTime(imu->timestamp);
+    const auto& predicted = kf_imu_.GetX();
+    if (!predicted.pos_.allFinite() || !predicted.vel_.allFinite() || !predicted.rot_.matrix().allFinite()) {
+        LOG(ERROR) << "[imu_prediction] nonfinite prediction; suspend until next LiDAR rebase";
+        kf_imu_ = kf_;
+        imu_prediction_suspended_ = true;
+        return false;
+    }
+    return true;
+}
+
+void LaserMapping::RebaseImuPrediction(bool update_accepted) {
+    // Caller has finished the LIO update. Replay and live IMU use the SAME time checks.
+    UL lock(mtx_buffer_);
+    const auto previous = kf_imu_.GetX();
+    if (update_accepted) last_accepted_lio_time_ = measures_.lidar_end_time_;
+    kf_imu_ = kf_;
+    imu_prediction_suspended_ = last_accepted_lio_time_ <= 0;
+    for (const auto& imu : imu_buffer_) {
+        AdvanceImuPrediction(imu, "replay");
+        if (imu_prediction_suspended_) break;
+    }
+    ++prediction_rebases_;
+    const auto& current = kf_imu_.GetX();
+    const double jump = std::abs(previous.timestamp_ - current.timestamp_) < 1e-6
+                            ? (previous.pos_ - current.pos_).norm() : -1.0;
+    if (prediction_rebases_ % 20 == 0 || jump > 0.2) {
+        LOG(INFO) << "[imu_prediction] rebase accepted=" << update_accepted
+                  << " suspended=" << imu_prediction_suspended_
+                  << " lead_s=" << current.timestamp_ - measures_.lidar_end_time_
+                  << " latest_imu_lead_s=" << last_timestamp_imu_ - measures_.lidar_end_time_
+                  << " lio_clock_error_s=" << kf_.GetX().timestamp_ - measures_.lidar_end_time_
+                  << " accepted_lio_age_s=" << current.timestamp_ - last_accepted_lio_time_
+                  << " same_time_jump_m=" << jump << " speed_mps=" << current.vel_.norm()
+                  << " imu_queue=" << imu_buffer_.size() << " lidar_queue=" << lidar_buffer_.size();
+    }
+}
+
 void LaserMapping::ProcessIMU(const lightning::IMUPtr &imu) {
     publish_count_++;
-
-    double timestamp = imu->timestamp;
-
+    const double timestamp = imu->timestamp;
     UL lock(mtx_buffer_);
-    if (timestamp < last_timestamp_imu_) {
-        LOG(WARNING) << "imu loop back, clear buffer";
-        imu_buffer_.clear();
+    if (!std::isfinite(timestamp) || !imu->angular_velocity.allFinite() ||
+        !imu->linear_acceleration.allFinite()) {
+        LOG(WARNING) << "[imu_prediction] discard nonfinite IMU input";
+        return;
     }
-
-    if (p_imu_->IsIMUInited()) {
-        /// 更新最新imu状态
-        if (kf_imu_.GetX().timestamp_ <= 0.0) {
-            kf_imu_ = kf_;
+    if (timestamp <= last_timestamp_imu_) {
+        LOG(WARNING) << "[imu_prediction] discard non-increasing IMU timestamp; restart SLAM for a new bag epoch";
+        return;
+    }
+    if (p_imu_->IsIMUInited() && AdvanceImuPrediction(imu, "live")) {
+        const auto& state = kf_imu_.GetX();
+        if (ui_ && prediction::CanPublish(state.timestamp_, last_prediction_published_time_)) {
+            ui_->UpdateNavState(state);
+            last_prediction_published_time_ = state.timestamp_;
         }
-        const double dt = timestamp - kf_imu_.GetX().timestamp_;
-        if (dt > 0.0) {
-            kf_imu_.Predict(dt, p_imu_->Q_, imu->angular_velocity,
-                            imu->linear_acceleration * p_imu_->GetAccScaleFactor());
-        }
-
-        // LOG(INFO) << "newest wrt lidar: " << timestamp - kf_.GetX().timestamp_;
-
-        /// 更新ui
-        if (ui_) {
-            ui_->UpdateNavState(kf_imu_.GetX());
+        if (imu_prediction_options_.stats_interval > 0 &&
+            publish_count_ % imu_prediction_options_.stats_interval == 0) {
+            LOG(INFO) << "[imu_prediction] live lead_s=" << timestamp - kf_.GetX().timestamp_
+                      << " accepted_lio_age_s=" << timestamp - last_accepted_lio_time_
+                      << " offset_m=" << (state.pos_ - kf_.GetX().pos_).norm()
+                      << " speed_mps=" << state.vel_.norm();
         }
     }
-
     last_timestamp_imu_ = timestamp;
-
     imu_buffer_.emplace_back(imu);
 }
 
@@ -292,6 +363,7 @@ bool LaserMapping::Run() {
         last_map_update_time_ = state_point_.timestamp_;
         has_map_update_ = true;
         flg_first_scan_ = false;
+        RebaseImuPrediction(true);
         return true;
     }
 
@@ -302,10 +374,10 @@ bool LaserMapping::Run() {
         if (skip_lidar_cnt_ != 0) {
             /// 更新UI中的内容
             if (ui_) {
-                ui_->UpdateNavState(kf_.GetX());
                 ui_->UpdateScan(CloudInImuFrame(scan_undistort_), kf_.GetX().GetPose());
             }
 
+            RebaseImuPrediction(false);
             return false;
         }
     }
@@ -424,17 +496,7 @@ bool LaserMapping::Run() {
         }
     }
 
-    /// 更新kf_for_imu
-    kf_imu_ = kf_;
-    if (!measures_.imu_.empty()) {
-        for (auto &imu : imu_buffer_) {
-            const double dt = imu->timestamp - kf_imu_.GetX().timestamp_;
-            if (dt > 0.0) {
-                kf_imu_.Predict(dt, p_imu_->Q_, imu->angular_velocity,
-                                imu->linear_acceleration * p_imu_->GetAccScaleFactor());
-            }
-        }
-    }
+    RebaseImuPrediction(update_accepted);
 
     if (ui_) {
         ui_->UpdateScan(CloudInImuFrame(scan_down_body_), state_point_.GetPose());
