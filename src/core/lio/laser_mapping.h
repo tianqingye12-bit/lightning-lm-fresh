@@ -13,6 +13,7 @@
 #include "core/ivox3d/ivox3d.h"
 #include "core/lio/eskf.hpp"
 #include "core/lio/feature_quality.h"
+#include "core/lio/map_detail.h"
 #include "core/lio/imu_processing.hpp"
 #include "pointcloud_preprocess.h"
 
@@ -116,10 +117,11 @@ class LaserMapping {
 
     /**
      * 计算全局地图
+     * @param res negative uses configured export resolution; explicit positive overrides it
      * @param use_lio_pose
      * @return
      */
-    CloudPtr GetGlobalMap(bool use_lio_pose, bool use_voxel = true, float res = 0.1);
+    CloudPtr GetGlobalMap(bool use_lio_pose, bool use_voxel = true, float res = -1.0f);
 
    private:
     // sync lidar with imu
@@ -139,6 +141,7 @@ class LaserMapping {
     }
 
     void MapIncremental();
+    CloudPtr RetainKeyframeCloud() const;
 
     bool LoadParamsFromYAML(const std::string &yaml);
 
@@ -159,6 +162,10 @@ class LaserMapping {
 
     /// local map related
     double filter_size_map_min_ = 0;
+    mapping::DetailOptions detail_options_;
+    SE3 last_map_update_pose_;
+    double last_map_update_time_ = 0.0;
+    bool has_map_update_ = false;
 
     /// params
     std::vector<double> extrinT_{3, 0.0};  // lidar-imu translation
