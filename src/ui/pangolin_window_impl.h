@@ -20,6 +20,7 @@
 #include "ui/ui_car.h"
 #include "ui/ui_cloud.h"
 #include "ui/ui_trajectory.h"
+#include "utils/latest_task.h"
 
 namespace lightning::ui {
 
@@ -55,6 +56,28 @@ class PangolinWindowImpl {
     /// 后台渲染线程
     std::thread render_thread_;
 
+    struct LoopFrame {
+        CloudPtr cloud;
+        SE3 pose;
+    };
+    struct LoopSnapshot {
+        std::vector<LoopFrame> frames;
+        SE3 map_from_odom;
+    };
+    struct LoopMapResult {
+        CloudPtr cloud;
+        std::vector<SE3> trajectory;
+        SE3 map_from_odom;
+    };
+    LoopDisplayOptions loop_display_options_;
+    LatestTask<LoopSnapshot> loop_map_tasks_;
+    std::thread loop_map_thread_;
+    std::mutex mtx_loop_map_result_;
+    std::shared_ptr<LoopMapResult> loop_map_result_;
+    void StartLoopMapWorker();
+    void StopLoopMapWorker();
+    void LoopMapWorker();
+
     /// 一些辅助的锁和原子变量
     std::mutex mtx_map_cloud_;
     std::mutex mtx_current_scan_;
@@ -64,13 +87,13 @@ class PangolinWindowImpl {
 
     std::mutex mtx_reset_;
 
-    std::atomic<bool> exit_flag_;
+    std::atomic<bool> exit_flag_{false};
 
-    std::atomic<bool> cloud_global_need_update_;   // 全局点云是否需要更新
-    std::atomic<bool> cloud_dynamic_need_update_;  // 动态点云是否需要更新
-    std::atomic<bool> kf_result_need_update_;      // 卡尔曼滤波结果
-    std::atomic<bool> current_scan_need_update_;   // 更新当前扫描
-    std::atomic<bool> lidarloc_need_update_;       // 雷达位置？
+    std::atomic<bool> cloud_global_need_update_{false};   // 全局点云是否需要更新
+    std::atomic<bool> cloud_dynamic_need_update_{false};  // 动态点云是否需要更新
+    std::atomic<bool> kf_result_need_update_{false};      // 卡尔曼滤波结果
+    std::atomic<bool> current_scan_need_update_{false};   // 更新当前扫描
+    std::atomic<bool> lidarloc_need_update_{false};       // 雷达位置？
 
     pcl::PointCloud<PointType>::Ptr current_scan_ = nullptr;  // 当前scan
     SE3 newest_frontend_pose_;                                // 最新pose
@@ -109,6 +132,7 @@ class PangolinWindowImpl {
     /// 渲染点云，调用各种Update函数
     void RenderClouds();
     bool UpdateGlobalMap();
+    void UpdateLoopMap();
     bool UpdateDynamicMap();
     bool UpdateState();
     bool UpdateCurrentScan();
@@ -140,6 +164,11 @@ class PangolinWindowImpl {
 
     // camera
     pangolin::OpenGlRenderState s_cam_main_;
+
+    // Render-thread-only state; all corrections switch together when a snapshot is consumed.
+    std::shared_ptr<ui::UiCloud> optimized_map_ui_;
+    std::vector<SE3> optimized_trajectory_;
+    SE3 map_from_odom_;
 
     /// cloud rendering
     ui::UiCar backend_car_{Vec3f(0.2, 0.2, 0.8)};   // 白色车

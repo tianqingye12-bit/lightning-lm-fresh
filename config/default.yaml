@@ -83,6 +83,10 @@ system:
   with_2dui: false # 是否需要2D UI
   with_g2p5: true # 是否需要栅格地图
   step_on_kf: false # 是否在关键帧处暂停
+  loop_display:
+    enabled: true       # 回环优化后后台刷新 Pangolin 全局关键帧地图
+    min_interval: 2.0   # 两次后台重建至少间隔(s)，合并等待中的旧请求
+    max_points: 200000  # 显示点数上限；不影响保存地图
 
   enable_lidar_loc_skip: false
   enable_lidar_loc_rviz: false
@@ -100,6 +104,17 @@ loop_closing:
   max_range: 20.0       # 候选帧的最大距离
   ndt_score_th: 1.3     # ndt位姿分值
   with_height: false
+  validation:
+    overlap_distance: 0.5   # 最近邻距离门槛(m)
+    min_overlap: 0.3        # 当前关键帧采样点中落入历史子图的比例
+    max_inlier_rmse: 0.3   # 重叠内点 RMSE(m)
+    max_translation: 5.0   # 相对匹配初值的最大平移修正(m)
+    max_rotation_deg: 30.0
+    max_samples: 2000      # 每候选最多验证多少点
+    min_inliers: 50
+    max_candidates: 3      # 每次最多执行多少次多分辨率 NDT
+    max_loop_chi2: 25.0    # 图中回环边误差门槛，独立于 Cauchy 核尺度
+    refine_iterations: 10  # 异常边剔除后的第二次优化迭代上限
 
 
 ### localization ================================================================================================

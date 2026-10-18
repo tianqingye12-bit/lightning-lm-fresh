@@ -118,10 +118,12 @@ class LaserMapping {
     /**
      * 计算全局地图
      * @param res negative uses configured export resolution; explicit positive overrides it
+     * @param exported_poses optional snapshot used to assemble this map
      * @param use_lio_pose
      * @return
      */
-    CloudPtr GetGlobalMap(bool use_lio_pose, bool use_voxel = true, float res = -1.0f);
+    CloudPtr GetGlobalMap(bool use_lio_pose, bool use_voxel = true, float res = -1.0f,
+                          std::vector<SE3>* exported_poses = nullptr);
 
    private:
     // sync lidar with imu

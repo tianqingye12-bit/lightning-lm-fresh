@@ -7,6 +7,10 @@
 #include "common/options.h"
 #include "common/std_types.h"
 #include "core/lightning_math.hpp"
+#include "core/lio/map_detail.h"
+#include <algorithm>
+#include <chrono>
+#include <cmath>
 #include "ui/pangolin_window_impl.h"
 
 namespace lightning::ui {
@@ -69,6 +73,75 @@ void PangolinWindowImpl::Reset(const std::vector<Keyframe::Ptr> &keyframes) {
 bool PangolinWindowImpl::DeInit() {
     ReleaseBuffer();
     return true;
+}
+
+void PangolinWindowImpl::StartLoopMapWorker() {
+    if (loop_display_options_.enabled) loop_map_thread_ = std::thread([this] { LoopMapWorker(); });
+}
+
+void PangolinWindowImpl::StopLoopMapWorker() {
+    loop_map_tasks_.Stop();
+    if (loop_map_thread_.joinable()) loop_map_thread_.join();
+}
+
+void PangolinWindowImpl::LoopMapWorker() {
+    using Clock = LatestTask<LoopSnapshot>::Clock;
+    auto earliest = Clock::now();
+    LoopSnapshot snapshot;
+    while (loop_map_tasks_.Wait(snapshot, earliest)) {
+        auto result = std::make_shared<LoopMapResult>();
+        result->cloud.reset(new PointCloudType());
+        result->map_from_odom = snapshot.map_from_odom;
+        size_t total = 0;
+        for (const auto& frame : snapshot.frames) {
+            total += frame.cloud ? frame.cloud->size() : 0;
+            result->trajectory.push_back(frame.pose);
+        }
+        const size_t budget = std::min(total, loop_display_options_.max_points);
+        result->cloud->reserve(budget);
+        size_t sample = 0, offset = 0;
+        for (const auto& frame : snapshot.frames) {
+            const size_t count = frame.cloud ? frame.cloud->size() : 0;
+            while (sample < budget) {
+                const size_t index = mapping::BudgetIndex(sample, total, budget);
+                if (index >= offset + count) break;
+                auto point = frame.cloud->points[index - offset];
+                const Vec3d xyz = frame.pose * point.getVector3fMap().cast<double>();
+                if (xyz.allFinite()) {
+                    point.x = xyz.x(); point.y = xyz.y(); point.z = xyz.z();
+                    if (!std::isfinite(point.intensity)) point.intensity = 0;
+                    result->cloud->push_back(point);
+                }
+                ++sample;
+            }
+            offset += count;
+        }
+        {
+            std::lock_guard<std::mutex> lock(mtx_loop_map_result_);
+            loop_map_result_ = std::move(result);
+        }
+        LOG(INFO) << "[loop_display] prepared keyframes=" << snapshot.frames.size()
+                  << " budget=" << budget;
+        earliest = Clock::now() + std::chrono::duration_cast<Clock::duration>(
+            std::chrono::duration<double>(loop_display_options_.min_interval));
+        snapshot = LoopSnapshot{};  // Release retained cloud references while idle.
+    }
+}
+
+void PangolinWindowImpl::UpdateLoopMap() {
+    std::shared_ptr<LoopMapResult> result;
+    {
+        std::lock_guard<std::mutex> lock(mtx_loop_map_result_);
+        result.swap(loop_map_result_);
+    }
+    if (!result) return;
+    auto map = std::make_shared<ui::UiCloud>();
+    map->SetCloud(result->cloud, SE3());
+    map->SetRenderColor(ui::UiCloud::UseColor::HEIGHT_COLOR);
+    optimized_map_ui_ = std::move(map);
+    optimized_trajectory_ = std::move(result->trajectory);
+    map_from_odom_ = result->map_from_odom;
+    LOG(INFO) << "[loop_display] applied points=" << result->cloud->size();
 }
 
 bool PangolinWindowImpl::UpdateGlobalMap() {
@@ -209,12 +282,18 @@ void PangolinWindowImpl::DrawAll() {
         pc.second->Render();
     }
 
+    if (optimized_map_ui_) optimized_map_ui_->Render();
+
+    // These layers remain in continuous odometry coordinates; transform only for display.
+    glPushMatrix();
+    const Mat4d correction = map_from_odom_.matrix();
+    glMultMatrixd(correction.data());
     /// 缓存的scans
     for (const auto &s : scans_) {
         s->Render();
     }
 
-    current_scan_ui_->Render();
+    if (current_scan_ui_) current_scan_ui_->Render();
 
     if (draw_frontend_traj_) {
         traj_newest_state_->Render();
@@ -230,6 +309,19 @@ void PangolinWindowImpl::DrawAll() {
         backend_car_.Render();
     }
 
+    glPopMatrix();
+
+    if (!optimized_trajectory_.empty()) {
+        glLineWidth(5.0);
+        glColor3f(0.5, 0.0, 0.5);
+        glBegin(GL_LINE_STRIP);
+        for (const auto& pose : optimized_trajectory_) {
+            const auto& t = pose.translation();
+            glVertex3d(t.x(), t.y(), t.z());
+        }
+        glEnd();
+    }
+
     // pred_car_.SetPose(predicted_pose_);
     // pred_car_.Render();
 
@@ -237,7 +329,7 @@ void PangolinWindowImpl::DrawAll() {
     {
         UL lock(mtx_current_scan_);
 
-        if (all_keyframes_.size() > 1) {
+        if (optimized_trajectory_.empty() && all_keyframes_.size() > 1) {
             /// 闭环后的轨迹
             glLineWidth(5.0);
             glBegin(GL_LINE_STRIP);
@@ -263,6 +355,7 @@ void PangolinWindowImpl::RenderClouds() {
     UL lock(mtx_reset_);
 
     // 更新各种推送过来的状态
+    UpdateLoopMap();
     UpdateGlobalMap();
     UpdateDynamicMap();
     UpdateState();
@@ -416,7 +509,7 @@ void PangolinWindowImpl::Render() {
 
         /// 处理相机跟随问题
         if (following_loc_) {
-            Eigen::Vector3d translation = newest_frontend_pose_.translation();
+            Eigen::Vector3d translation = (map_from_odom_ * newest_frontend_pose_).translation();
             Sophus::SE3d newest_frontend_pose_new(Eigen::Quaterniond::Identity(),
                                                   Eigen::Vector3d(translation.x(), translation.y(), 0.0));
             s_cam_main_.Follow(newest_frontend_pose_new.matrix());
