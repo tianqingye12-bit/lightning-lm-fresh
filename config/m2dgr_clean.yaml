@@ -45,3 +45,17 @@ cluster_voxel: 0.15
 cluster_min_observed: 20
 cluster_vehicle_ratio: 0.5
 cluster_max_extent: [7.0, 7.0, 3.0]          # 超过此尺寸的簇视为和墙柱连在一起，只做体素级删除
+
+
+# Round 4: time gate + translation OR rotation OR heartbeat. Zero motion thresholds restore time-only sampling.
+view_selection:
+  translation_m: 0.10
+  rotation_deg: 2.0
+  max_period_s: 1.0
+cache:
+  enabled: true
+  directory: ''  # default <map>/.vehicle_mask_cache; raw masks only
+rviz_max_points: 300000  # display only, exported PCD remains full resolution
+diagnostics:
+  every_views: 20
+  max_overlays: 20

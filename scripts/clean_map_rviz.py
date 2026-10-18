@@ -37,11 +37,12 @@ def mat_to_pose(T, header):
 
 
 class RvizPublisher:
-    def __init__(self, frame='map'):
+    def __init__(self, frame='map', max_points=300000):
         if not rclpy.ok():
             rclpy.init()
         self.node = rclpy.create_node('clean_map_viz')
         self.frame = frame
+        self.max_points = max(1, int(max_points))
         latched = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                              durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.clouds = {name: self.node.create_publisher(PointCloud2, f'/clean_map/{name}', latched)
@@ -54,11 +55,12 @@ class RvizPublisher:
     def header(self):
         return Header(frame_id=self.frame, stamp=self.node.get_clock().now().to_msg())
 
-    def publish_cloud(self, name, xyz, intensity=None, max_points=3000000):
+    def publish_cloud(self, name, xyz, intensity=None, max_points=None):
+        max_points = self.max_points if max_points is None else max(1, int(max_points))
         xyz = np.asarray(xyz, dtype=np.float32).reshape(-1, 3)
-        if len(xyz) > max_points:  # 大地图按 5cm 体素降采样，RViz 才显示得动
-            from clean_map_vehicles import voxel_keys
-            _, keep = np.unique(voxel_keys(xyz.astype(float), 0.05), axis=0, return_index=True)
+        if len(xyz) > max_points:
+            # Hard, deterministic display-only budget; no full-map voxel sort/allocation.
+            keep = np.linspace(0, len(xyz) - 1, max_points, dtype=np.intp)
             xyz = xyz[keep]
             intensity = None if intensity is None else np.asarray(intensity)[keep]
         fields = [PointField(name=n, offset=4 * i, datatype=PointField.FLOAT32, count=1)
@@ -83,15 +85,8 @@ class RvizPublisher:
         self.path_pub.publish(msg)
 
     def publish_view(self, t, T_world_lidar, voter, image):
-        u, v, visible, is_vehicle, mask = voter.last_view
-        vis = image.copy()
-        vis[mask] = (0.5 * vis[mask] + [127, 60, 0]).astype(np.uint8)
-        vis[v[visible & ~is_vehicle], u[visible & ~is_vehicle]] = (0, 255, 0)
-        hit = visible & is_vehicle
-        for x, y in zip(u[hit], v[hit]):
-            cv2.circle(vis, (int(x), int(y)), 2, (0, 0, 255), -1)
-        cv2.putText(vis, f'view {voter.views}  t={t:.1f}  vehicle votes={int(hit.sum())}', (10, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        from clean_map_vehicles import make_overlay
+        vis = make_overlay(voter, image, t)
         h = self.header()
         msg = Image(header=h, height=vis.shape[0], width=vis.shape[1], encoding='bgr8',
                     is_bigendian=0, step=vis.shape[1] * 3, data=vis.tobytes())
@@ -132,3 +127,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

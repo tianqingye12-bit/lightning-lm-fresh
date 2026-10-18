@@ -8,9 +8,12 @@ import unittest
 from unittest.mock import patch
 
 import numpy as np
+import scipy.sparse
+import scipy.spatial
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'scripts'))
 spec = importlib.util.spec_from_file_location('vehicle_removal', ROOT / 'scripts/clean_map_vehicles.py')
 vr = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(vr)
@@ -106,6 +109,8 @@ class VehicleRemovalTests(unittest.TestCase):
             vr.write_pcd(directory / 'global.pcd', header, cloud)
             np.savetxt(directory / 'keyframes.txt', [[0, 10, 0, 0, 0, 0, 0, 0, 1]])
             cfg = yaml.safe_load((ROOT / 'config/m2dgr_clean.yaml').read_text())
+            cfg['cache'] = {'enabled': False}
+            cfg['diagnostics'] = {'max_overlays': 0}
             config_path = directory / 'config.yaml'
             config_path.write_text(yaml.safe_dump(cfg))
             class FakeVoter:
@@ -114,6 +119,7 @@ class VehicleRemovalTests(unittest.TestCase):
                     self.visible = np.array([3])
                     self.vehicle = np.array([3])
                     self.views = 0
+                    self.last_stats = dict(projected=1, visible=1, occluded=0, vehicle_votes=1, objects=1)
                 def add_view(self, *args):
                     self.views += 1
                     return 1
@@ -129,6 +135,43 @@ class VehicleRemovalTests(unittest.TestCase):
             self.assertEqual(len(clean), 2)
             self.assertTrue(np.isnan(clean['x'][1]))
             self.assertEqual(len(removed), 0)
+
+    def test_cluster_growth_keeps_observed_background(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            cloud = np.array([(0., 0., 1.), (.11, 0., 1.), (.22, 0., 1.), (.33, 0., 1.)],
+                             dtype=[('x', '<f4'), ('y', '<f4'), ('z', '<f4')])
+            header = ['VERSION .7', 'FIELDS x y z', 'SIZE 4 4 4', 'TYPE F F F',
+                      'COUNT 1 1 1', 'WIDTH 4', 'HEIGHT 1', 'POINTS 4', 'DATA binary']
+            vr.write_pcd(directory / 'global.pcd', header, cloud)
+            np.savetxt(directory / 'keyframes.txt', [[0, 10, 0, 0, 0, 0, 0, 0, 1]])
+            cfg = yaml.safe_load((ROOT / 'config/m2dgr_clean.yaml').read_text())
+            cfg.update(cache={'enabled': False}, diagnostics={'max_overlays': 0},
+                       cluster_min_observed=3)
+            config = directory / 'config.yaml'
+            config.write_text(yaml.safe_dump(cfg))
+            class Voter:
+                def __init__(self, *args):
+                    self.visible = np.array([3, 3, 3, 0])
+                    self.vehicle = np.array([3, 3, 0, 0])
+                    self.views = 0
+                    self.last_stats = dict(projected=4, visible=3, occluded=1, vehicle_votes=2, objects=1)
+                def add_view(self, *args):
+                    self.views += 1
+                    return 1
+            yolo = types.SimpleNamespace(YOLO=lambda _: types.SimpleNamespace(task='segment'))
+            argv = ['clean', '--map', tmp, '--bag', 'unused', '--config', str(config)]
+            with patch.dict(sys.modules, {'ultralytics': yolo}), patch.object(sys, 'argv', argv), \
+                    patch.object(vr, 'VehicleVoter', Voter), \
+                    patch.object(vr, 'iterate_views', return_value=[(10, np.eye(4), None, None)]), \
+                    patch.object(vr, 'estimate_floor', return_value=np.full(4, -10.)):
+                vr.main()
+            _, clean = vr.read_pcd(directory / 'global_clean.pcd')
+            _, removed = vr.read_pcd(directory / 'global_vehicles.pcd')
+            # Two voted vehicle voxels plus one unseen connected voxel are removed;
+            # the well-observed background voxel in the SAME connected component survives.
+            self.assertEqual(len(removed), 3)
+            np.testing.assert_allclose(clean['x'], [.22])
 
 
 if __name__ == '__main__':

@@ -14,6 +14,7 @@
 #include "core/lio/eskf.hpp"
 #include "core/lio/feature_quality.h"
 #include "core/lio/map_detail.h"
+#include "core/lio/imu_prediction.h"
 #include "core/lio/imu_processing.hpp"
 #include "pointcloud_preprocess.h"
 
@@ -99,13 +100,19 @@ class LaserMapping {
     /// 获取IMU状态
     NavState GetIMUState() const {
         if (p_imu_->IsIMUInited()) {
-            return kf_imu_.GetX();
+            NavState s = kf_imu_.GetX();
+            s.pose_is_ok_ = s.pose_is_ok_ && !imu_prediction_suspended_;
+            return s;
         } else {
             NavState s;
             s.pose_is_ok_ = false;
             return s;
         }
     }
+
+    // T_imu_lidar maps raw/deskewed LiDAR points into the IMU body frame.
+    SE3 GetTImuLidar() const { return SE3(SO3(offset_R_lidar_fixed_), offset_t_lidar_fixed_); }
+    CloudPtr CloudInImuFrame(const CloudPtr& cloud) const;
 
     CloudPtr GetScanUndist() const { return scan_undistort_; }
     CloudPtr GetProjCloud();
@@ -130,6 +137,9 @@ class LaserMapping {
     bool SyncPackages();
 
     void ObsModel(NavState &s, ESKF::CustomObservationModel &obs);
+    bool AdvanceImuPrediction(const IMUPtr& imu, const char* source);
+    void RebaseImuPrediction(bool update_accepted);
+
 
     inline void PointBodyToWorld(const PointType &pi, PointType &po) {
         Vec3d p_global(state_point_.rot_ *
@@ -231,7 +241,13 @@ class LaserMapping {
     MeasureGroup measures_;  // sync IMU and lidar scan
 
     ESKF kf_;      // 点云时刻的IMU状态
-    ESKF kf_imu_;  // imu 最新时刻的eskf状态
+    ESKF kf_imu_;  // bounded high-frequency prediction; never feeds back into the registration ESKF
+    prediction::Options imu_prediction_options_;
+    bool imu_prediction_suspended_ = true;
+    double last_accepted_lio_time_ = 0.0;
+    double last_prediction_published_time_ = 0.0;
+    std::size_t prediction_rebases_ = 0;
+    std::size_t prediction_rejections_ = 0;
 
     NavState state_point_;  // ekf current state
 

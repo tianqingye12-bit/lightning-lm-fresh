@@ -109,10 +109,17 @@ bool SlamSystem::Init(const std::string& yaml_path) {
         livox_topic_ = yaml["common"]["livox_lidar_topic"].as<std::string>();
 
         rclcpp::QoS qos(10);
-        // qos.best_effort();
+        // A 200 Hz IMU history of 10 messages covers only 50 ms while this same executor maps a scan.
+        const int imu_queue_depth = yaml["common"]["imu_queue_depth"].as<int>(2000);
+        if (imu_queue_depth < 10 || imu_queue_depth > 100000) {
+            LOG(ERROR) << "common.imu_queue_depth must be between 10 and 100000";
+            return false;
+        }
+        rclcpp::QoS imu_qos{rclcpp::KeepLast(static_cast<size_t>(imu_queue_depth))};
+        LOG(INFO) << "[imu_clock] IMU subscription history=" << imu_queue_depth;
 
         imu_sub_ = node_->create_subscription<sensor_msgs::msg::Imu>(
-            imu_topic_, qos, [this](sensor_msgs::msg::Imu::SharedPtr msg) {
+            imu_topic_, imu_qos, [this](sensor_msgs::msg::Imu::SharedPtr msg) {
                 IMUPtr imu = std::make_shared<IMU>();
                 imu->timestamp = ToSec(msg->header.stamp);
                 imu->linear_acceleration =
@@ -228,6 +235,18 @@ void SlamSystem::SaveMap(const std::string& path) {
         kf_file << kf->GetID() << " " << kf->GetState().timestamp_ << " " << t.x() << " " << t.y() << " " << t.z()
                 << " " << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << "\n";
     }
+    // Version the coordinate contract; cleaning interpolates IMU poses first, then applies T_imu_lidar.
+    std::ofstream frame_file(save_path + "/map_frames.yaml");
+    frame_file << std::setprecision(18)
+               << "format_version: 2\nkeyframe_pose_frame: imu\nkeyframe_cloud_frame: imu\nT_imu_lidar: [";
+    const auto T_imu_lidar = lio_->GetTImuLidar().matrix();
+    for (int row = 0; row < 4; ++row) {
+        for (int col = 0; col < 4; ++col) {
+            if (row || col) frame_file << ", ";
+            frame_file << T_imu_lidar(row, col);
+        }
+    }
+    frame_file << "]\n";
     // pcl::io::savePCDFileBinaryCompressed(save_path + "/global_no_loop.pcd", *global_map_no_loop);
     // pcl::io::savePCDFileBinaryCompressed(save_path + "/global_raw.pcd", *global_map_raw);
 

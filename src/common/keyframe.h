@@ -19,8 +19,8 @@ class Keyframe {
     using Ptr = std::shared_ptr<Keyframe>;
 
     Keyframe() {}
-    Keyframe(unsigned long id, CloudPtr cloud, NavState state)
-        : id_(id), cloud_(cloud), state_(state), pose_lio_(state.GetPose()) {
+    Keyframe(unsigned long id, CloudPtr cloud, NavState state, const SE3& T_imu_lidar = SE3())
+        : id_(id), cloud_(cloud), T_imu_lidar_(T_imu_lidar), pose_lio_(state.GetPose()), state_(state) {
         timestamp_ = state_.timestamp_;
         pose_opt_ = pose_lio_;
     }
@@ -40,6 +40,18 @@ class Keyframe {
 
     unsigned long GetID() const { return id_; }
     CloudPtr GetCloud() const { return cloud_; }
+    const SE3& GetTImuLidar() const { return T_imu_lidar_; }
+
+    // Sensor-origin algorithms (G2P5 rays/ground heights) still require LiDAR coordinates.
+    CloudPtr GetLidarCloud() const {
+        CloudPtr lidar(new PointCloudType(*cloud_));
+        const SE3 T_lidar_imu = T_imu_lidar_.inverse();
+        for (auto& point : lidar->points) {
+            const Vec3d xyz = T_lidar_imu * point.getVector3fMap().cast<double>();
+            point.getVector3fMap() = xyz.cast<float>();
+        }
+        return lidar;
+    }
 
     SE3 GetLIOPose() {
         UL lock(data_mutex_);
@@ -78,7 +90,9 @@ class Keyframe {
     unsigned long id_ = 0;
 
     double timestamp_ = 0;
-    CloudPtr cloud_ = nullptr;  /// 降采样之后的点云
+    CloudPtr cloud_ = nullptr;  /// IMU-frame cloud; pose_lio_/pose_opt_ are T_world_imu
+
+    SE3 T_imu_lidar_;  // immutable calibration accompanying this IMU-frame cloud
 
     std::mutex data_mutex_;
     SE3 pose_lio_;  // 前端的pose

@@ -9,6 +9,7 @@
 #include <deque>
 #include <fstream>
 #include <iostream>
+#include <iomanip>
 #include <vector>
 
 #include "common/eigen_types.h"
@@ -17,6 +18,7 @@
 #include "common/options.h"
 #include "core/lio/eskf.hpp"
 #include "core/lio/imu_filter.h"
+#include "core/lio/imu_prediction.h"
 #include "core/lio/pose6d.h"
 #include "utils/timer.h"
 
@@ -39,6 +41,8 @@ class ImuProcess {
 
     void Process(const MeasureGroup &meas, ESKF &kf_state, CloudPtr &scan);
 
+    bool HasPropagationFault() const { return propagation_fault_; }
+    bool LastScanHadImuGap() const { return last_scan_had_gap_; }
     bool IsIMUInited() const { return imu_need_init_ == false; }
     void SetUseIMUFilter(bool b) { use_imu_filter_ = b; }
 
@@ -77,6 +81,8 @@ class ImuProcess {
     bool b_first_frame_ = true;
     bool imu_need_init_ = true;
 
+    bool propagation_fault_ = false;
+    bool last_scan_had_gap_ = false;
     bool use_imu_filter_ = true;
     IMUFilter filter_;
 };
@@ -103,6 +109,9 @@ inline void ImuProcess::Reset() {
     acc_scale_factor_ = 1.0;
 
     imu_need_init_ = true;
+    propagation_fault_ = false;
+    last_scan_had_gap_ = false;
+    last_lidar_end_time_ = 0;
     init_iter_num_ = 1;
     imu_queue_.clear();
     imu_pose_.clear();
@@ -174,92 +183,109 @@ inline void ImuProcess::IMUInit(const MeasureGroup &meas, ESKF &kf_state, int &N
 }
 
 inline void ImuProcess::UndistortPcl(const MeasureGroup &meas, ESKF &kf_state, CloudPtr &pcl_out) {
-    /*** add the imu_ of the last frame-tail to the of current frame-head ***/
     auto v_imu = meas.imu_;
     v_imu.push_front(last_imu_);
-    const double &imu_end_time = v_imu.back()->timestamp;
+    const double pcl_beg_time = meas.lidar_begin_time_;
+    const double pcl_end_time = meas.lidar_end_time_;
+    const ESKF before = kf_state;
+    const auto fail = [&](const char* reason) {
+        kf_state = before;
+        propagation_fault_ = true;
+        pcl_out.reset(new PointCloudType());
+        LOG(ERROR) << "[imu_clock] propagation stopped: " << reason
+                   << " state_time=" << std::setprecision(16) << before.GetX().timestamp_
+                   << " scan_end=" << pcl_end_time << "; restart SLAM and replay slower";
+    };
+    if (!std::isfinite(pcl_beg_time) || !std::isfinite(pcl_end_time) || pcl_beg_time > pcl_end_time ||
+        !prediction::PlanPropagation(kf_state.GetX().timestamp_, pcl_end_time).valid) {
+        fail("invalid frame interval or gap longer than 1 second");
+        return;
+    }
+    double previous_stamp = v_imu.front()->timestamp;
+    for (const auto& imu : v_imu) {
+        if (!std::isfinite(imu->timestamp) || imu->timestamp < previous_stamp ||
+            imu->timestamp > pcl_end_time + 1e-6 || !imu->angular_velocity.allFinite() ||
+            !imu->linear_acceleration.allFinite()) {
+            fail("invalid or unordered IMU samples");
+            return;
+        }
+        previous_stamp = imu->timestamp;
+    }
 
-    const double &pcl_beg_time = meas.lidar_begin_time_;
-    const double &pcl_end_time = meas.lidar_end_time_;
-
-    /*** Initialize IMU pose ***/
     auto imu_state = kf_state.GetX();
     imu_pose_.clear();
-    imu_pose_.emplace_back(0.0, acc_s_last_, angvel_last_, imu_state.vel_, imu_state.pos_, imu_state.rot_.matrix());
-
-    /*** forward propagation at each imu_ point ***/
+    imu_pose_.emplace_back(imu_state.timestamp_ - pcl_beg_time, acc_s_last_, angvel_last_,
+                           imu_state.vel_, imu_state.pos_, imu_state.rot_.matrix());
     Vec3d angvel_avr, acc_avr, acc_imu, vel_imu, pos_imu;
     Mat3d R_imu;
-
     double dt = 0;
-    Vec3d acc = Vec3d::Zero();
-    Vec3d gyro = Vec3d::Zero();
+    Vec3d acc = v_imu.back()->linear_acceleration * acc_scale_factor_;
+    Vec3d gyro = v_imu.back()->angular_velocity;
 
     if (use_imu_filter_) {
-        for (auto &imu : v_imu) {
-            auto imu_f = filter_.Filter(*imu);
-            *imu = imu_f;
+        // Never overwrite input samples shared with prediction replay or future scan groups.
+        for (auto& imu : v_imu) {
+            imu = std::make_shared<IMU>(filter_.Filter(*imu));
         }
     }
+    Q_.block<3, 3>(0, 0).diagonal() = cov_gyr_;
+    Q_.block<3, 3>(3, 3).diagonal() = cov_acc_;
+    Q_.block<3, 3>(6, 6).diagonal() = cov_bias_gyr_;
 
-    for (auto it_imu = v_imu.begin(); it_imu < (v_imu.end() - 1); it_imu++) {
-        auto &&head = *(it_imu);
-        auto &&tail = *(it_imu + 1);
-
-        if (tail->timestamp < last_lidar_end_time_) {
-            continue;
+    const auto propagate_to = [&](double target, const Vec3d& w, const Vec3d& a) {
+        const auto plan = prediction::PlanPropagation(kf_state.GetX().timestamp_, target);
+        if (!plan.valid) return false;
+        last_scan_had_gap_ = last_scan_had_gap_ || plan.gap;
+        const double step = plan.steps > 0 ? plan.duration / plan.steps : 0;
+        for (int n = 0; n < plan.steps; ++n) {
+            // Preserve the original interval's dt^2 noise scale across subdivisions;
+            // extra predict covariance inflation makes missing-data recovery conservative.
+            kf_state.Predict(step, Q_ * plan.steps, w, a);
         }
+        // Only normalize rounding AFTER the full physical interval was propagated.
+        kf_state.SetTime(target);
+        const auto& state = kf_state.GetX();
+        return state.pos_.allFinite() && state.vel_.allFinite() && state.rot_.matrix().allFinite() &&
+               kf_state.GetP().allFinite();
+    };
 
-        angvel_avr = .5 * (head->angular_velocity + tail->angular_velocity);
-        acc_avr = .5 * (head->linear_acceleration + tail->linear_acceleration);
-        acc_avr = acc_avr * acc_scale_factor_;
-
-        if (head->timestamp < last_lidar_end_time_) {
-            dt = tail->timestamp - last_lidar_end_time_;
-        } else {
-            dt = tail->timestamp - head->timestamp;
-        }
-
+    for (auto it = v_imu.begin(); it + 1 != v_imu.end(); ++it) {
+        const auto& head = *it;
+        const auto& tail = *(it + 1);
+        if (tail->timestamp <= kf_state.GetX().timestamp_) continue;
+        angvel_avr = 0.5 * (head->angular_velocity + tail->angular_velocity);
+        acc_avr = 0.5 * (head->linear_acceleration + tail->linear_acceleration) * acc_scale_factor_;
         acc = acc_avr;
         gyro = angvel_avr;
-
-        if (dt > 0.1) {
-            LOG(ERROR) << "get abnormal dt: " << dt;
-            kf_state.SetTime((*it_imu)->timestamp);
-            break;
+        // Check raw sample coverage too, even if the current frame starts inside the gap.
+        last_scan_had_gap_ = last_scan_had_gap_ || tail->timestamp - head->timestamp > 0.10 + 1e-6;
+        if (!propagate_to(tail->timestamp, gyro, acc)) {
+            fail("invalid IMU propagation interval or nonfinite state");
+            return;
         }
-
-        Q_.block<3, 3>(0, 0).diagonal() = cov_gyr_;
-        Q_.block<3, 3>(3, 3).diagonal() = cov_acc_;
-        Q_.block<3, 3>(6, 6).diagonal() = cov_bias_gyr_;
-        kf_state.Predict(dt, Q_, gyro, acc);
-
-        // LOG(INFO) << "gyro: " << gyro.transpose() << ", dt: " << dt;
-
-        // LOG(INFO) << "acc: " << acc.transpose() << " grav: " << kf_state.GetX().grav_.norm()
-        //           << ", vel: " << kf_state.GetX().vel_.transpose() << ", dt: " << dt;
-
-        /* save the poses at each IMU measurements */
         imu_state = kf_state.GetX();
         angvel_last_ = angvel_avr - imu_state.bg_;
-        acc_s_last_ = imu_state.rot_ * acc_avr;
-        for (int i = 0; i < 3; i++) {
-            acc_s_last_[i] += imu_state.grav_[i];
-        }
-
-        double &&offs_t = tail->timestamp - pcl_beg_time;
-        imu_pose_.emplace_back(
-            Pose6D(offs_t, acc_s_last_, angvel_last_, imu_state.vel_, imu_state.pos_, imu_state.rot_.matrix()));
+        acc_s_last_ = imu_state.rot_ * acc_avr + imu_state.grav_;
+        const double offset = tail->timestamp - pcl_beg_time;
+        imu_pose_.emplace_back(offset, acc_s_last_, angvel_last_, imu_state.vel_, imu_state.pos_,
+                               imu_state.rot_.matrix());
     }
 
-    /*** calculated the pos and attitude prediction at the frame-end ***/
-    double note = pcl_end_time > imu_end_time ? 1.0 : -1.0;
-    dt = note * (pcl_end_time - imu_end_time);
-    kf_state.Predict(dt, Q_, gyro, acc);
-
+    // Use the actual state time, not abs(scan_end - last_sample), which can hide an early break.
+    if (!propagate_to(pcl_end_time, gyro, acc)) {
+        fail("invalid frame-tail propagation interval or nonfinite state");
+        return;
+    }
     imu_state = kf_state.GetX();
     last_imu_ = meas.imu_.back();
     last_lidar_end_time_ = pcl_end_time;
+    if (last_scan_had_gap_) {
+        pcl_out.reset(new PointCloudType());
+        LOG(WARNING) << "[imu_clock] missing IMU coverage (>0.10s): held-input prediction only; "
+                     << "skip this scan's registration/map insertion; clock_error_s="
+                     << kf_state.GetX().timestamp_ - pcl_end_time;
+        return;
+    }
 
     /*** sort point clouds by offset time ***/
     pcl_out = meas.scan_;
@@ -321,7 +347,9 @@ inline void ImuProcess::UndistortPcl(const MeasureGroup &meas, ESKF &kf_state, C
 }
 
 inline void ImuProcess::Process(const MeasureGroup &meas, ESKF &kf_state, CloudPtr &scan) {
-    if (meas.imu_.empty()) {
+    scan.reset(new PointCloudType());
+    last_scan_had_gap_ = false;
+    if (propagation_fault_ || meas.imu_.empty()) {
         return;
     }
 

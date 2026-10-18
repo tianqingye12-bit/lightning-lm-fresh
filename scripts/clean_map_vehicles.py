@@ -14,6 +14,9 @@ SLAM 用完整点云建图，结束后用 SaveMap 导出的 global.pcd + keyfram
 输出: <map>/global_clean.pcd, <map>/global_vehicles.pcd (被删除的点, 用于检查)
 """
 import argparse
+import csv
+import json
+import importlib.metadata
 import subprocess
 import tempfile
 import time
@@ -23,6 +26,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 import yaml
+
+from clean_map_runtime import MaskCache, ViewSelector, file_digest, load_frame_contract, rigid_transform
 
 PCD_TYPES = {('F', 4): 'f4', ('F', 8): 'f8', ('U', 1): 'u1', ('U', 2): 'u2', ('U', 4): 'u4',
              ('I', 1): 'i1', ('I', 2): 'i2', ('I', 4): 'i4'}
@@ -64,22 +69,31 @@ def read_pcd(path):
     return header, cloud
 
 
-def write_pcd(path, header, cloud):
+def write_pcd(path, header, cloud, selection=None, chunk_points=250000):
+    if selection is not None:
+        selection = np.asarray(selection, dtype=bool)
+        if selection.shape != (len(cloud),):
+            raise ValueError('PCD selection must have one boolean per point')
+    count = len(cloud) if selection is None else int(selection.sum())
     lines = []
     for line in header:
         key = line.split()[0] if line else ''
         if key == 'WIDTH':
-            line = f'WIDTH {len(cloud)}'
+            line = f'WIDTH {count}'
         elif key == 'HEIGHT':
             line = 'HEIGHT 1'
         elif key == 'POINTS':
-            line = f'POINTS {len(cloud)}'
+            line = f'POINTS {count}'
         elif key == 'DATA':
             line = 'DATA binary'
         lines.append(line)
     with open(path, 'wb') as f:
         f.write(('\n'.join(lines) + '\n').encode('ascii'))
-        f.write(cloud.tobytes())
+        for begin in range(0, len(cloud), chunk_points):
+            block = cloud[begin:begin + chunk_points]
+            if selection is not None:
+                block = block[selection[begin:begin + chunk_points]]
+            f.write(block.tobytes())
 
 
 def quat_to_mat(q):
@@ -243,7 +257,7 @@ class VehicleVoter:
         self.spatial_index = cKDTree(centroids)
         self.K = np.array(cfg['K'], dtype=float).reshape(3, 3)
         self.dist = np.array(cfg['distortion'], dtype=float)
-        self.T_cam_lidar = np.array(cfg['T_cam_lidar'], dtype=float).reshape(4, 4)
+        self.T_cam_lidar = rigid_transform(cfg['T_cam_lidar'], 'T_cam_lidar')
         self.w, self.h = int(cfg['width']), int(cfg['height'])
         # 归一化坐标范围，防止畸变模型把视野外的点折回图像内
         self.x_lim = 1.2 * max(self.K[0, 2], self.w - self.K[0, 2]) / self.K[0, 0]
@@ -252,8 +266,21 @@ class VehicleVoter:
         self.vehicle = np.zeros(len(centroids), np.int32)
         self.kernel = np.ones((2 * cfg['mask_dilate_px'] + 1,) * 2, np.uint8)
         self.views = 0
+        self.cache = None
+        self.last_stats = {}
 
     def vehicle_mask(self, image):
+        key = self.cache.key(image) if self.cache is not None else None
+        if key is not None:
+            cached = self.cache.get(key, (self.h, self.w))
+            if cached is not None:
+                return cached
+        result = self.infer_mask(image)
+        if key is not None:
+            self.cache.put(key, *result)
+        return result
+
+    def infer_mask(self, image):
         r = self.model(image, conf=self.cfg['yolo_conf'], classes=self.cfg['vehicle_classes'],
                        retina_masks=True, verbose=False, device=self.device)[0]
         if r.masks is None:
@@ -266,10 +293,12 @@ class VehicleVoter:
     def add_view(self, T_world_lidar, image, depth):
         if image.shape[:2] != (self.h, self.w):
             raise RuntimeError(f'Image {image.shape[1]}x{image.shape[0]} != calibration {self.w}x{self.h}')
+        self.last_stats = dict(projected=0, visible=0, occluded=0, vehicle_votes=0, objects=0)
         T = self.T_cam_lidar @ np.linalg.inv(T_world_lidar)
         rng = self.cfg['max_range']
         near = np.asarray(self.spatial_index.query_ball_point(
-            T_world_lidar[:3, 3], rng, p=np.inf), dtype=np.intp)
+            (T_world_lidar @ np.linalg.inv(self.T_cam_lidar))[:3, 3],
+            rng * np.sqrt(1 + self.x_lim ** 2 + self.y_lim ** 2)), dtype=np.intp)
         cam = self.centroids[near] @ T[:3, :3].T + T[:3, 3]
         z = cam[:, 2]
         keep = (z > 0.3) & (z < rng)
@@ -283,6 +312,8 @@ class VehicleVoter:
         inside = (uv[:, 0] >= 0) & (uv[:, 0] < self.w) & (uv[:, 1] >= 0) & (uv[:, 1] < self.h)
         near, z, u, v = near[inside], z[inside], uv[inside, 0], uv[inside, 1]
 
+        if not len(near):
+            return None
         tol = self.cfg['occlusion_tol'] + 0.02 * z
         # 地图 z-buffer (4x4 像素块)，用于深度图无效处
         b = 4
@@ -310,14 +341,34 @@ class VehicleVoter:
         self.vehicle[near[visible & is_vehicle]] += 1
         self.views += 1
         self.last_view = (u, v, visible, is_vehicle, mask)
+        self.last_stats = dict(projected=len(near), visible=int(visible.sum()),
+                               occluded=int((~visible).sum()),
+                               vehicle_votes=int((visible & is_vehicle).sum()), objects=n_obj)
         return n_obj
 
 
-def iterate_views(bag, cfg, traj):
-    """按时间顺序产出 (pose, color, depth)，每 image_period 秒一张。"""
+def make_overlay(voter, image, timestamp):
+    """Blue mask; gray occluded; green visible background; red vehicle votes."""
+    u, v, visible, vehicle, mask = voter.last_view
+    output = image.copy()
+    output[mask] = (0.5 * output[mask] + [127, 60, 0]).astype(np.uint8)
+    output[v[~visible], u[~visible]] = (128, 128, 128)
+    background = visible & ~vehicle
+    output[v[background], u[background]] = (0, 255, 0)
+    hit = visible & vehicle
+    output[v[hit], u[hit]] = (0, 0, 255)
+    cv2.putText(output, f'view {voter.views} t={timestamp:.1f} visible={int(visible.sum())} '
+                f'vehicle={int(hit.sum())}', (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    return output
+
+
+def iterate_views(bag, cfg, traj, selector=None):
+    """Yield (timestamp, T_world_lidar, color, depth), selecting before image decoding."""
     from rosbags.highlevel import AnyReader
     from rosbags.typesys import Stores, get_typestore
     color_topic, depth_topic = cfg['color_topic'], cfg.get('depth_topic') or None
+    selector = selector or ViewSelector(cfg)
+    T_imu_lidar = np.asarray(cfg.get('_T_imu_lidar', np.eye(4)))
     with AnyReader([Path(bag)], default_typestore=get_typestore(Stores.ROS2_HUMBLE)) as reader:
         conns = {c.topic: c for c in reader.connections}
         if color_topic not in conns:
@@ -325,13 +376,15 @@ def iterate_views(bag, cfg, traj):
         if depth_topic and depth_topic not in conns:
             raise RuntimeError(f'{depth_topic} not in bag; set depth_topic empty to use z-buffer only')
         wanted = [conns[color_topic]] + ([conns[depth_topic]] if depth_topic else [])
-        depths, pending, last_t = deque(maxlen=60), deque(), -np.inf
+        depths, pending = deque(maxlen=60), deque()
 
         def flush(now):
             while pending and (depth_topic is None or now - pending[0][0] > 0.1):
                 t, msg = pending.popleft()
                 pose = traj.pose(t + cfg['time_offset'])
-                if pose is None:
+                if pose is not None:
+                    pose = pose @ T_imu_lidar
+                if not selector.accept(t, pose):
                     continue
                 depth = None
                 if depths:
@@ -340,15 +393,18 @@ def iterate_views(bag, cfg, traj):
                         depth = decode_image(dmsg, depth=True)
                 yield t, pose, decode_image(msg), depth
 
+        last_progress = time.monotonic()
         for conn, _, raw in reader.messages(connections=wanted):
             msg = reader.deserialize(raw, conn.msgtype)
             t = stamp(msg)
             if conn.topic == depth_topic:
                 depths.append((t, msg))
-            elif t - last_t >= cfg['image_period']:
+            else:
                 pending.append((t, msg))
-                last_t = t
             yield from flush(t)
+            if time.monotonic() - last_progress >= 10:
+                print(f'bag image stamp={t:.3f}; selection={selector.stats}', flush=True)
+                last_progress = time.monotonic()
         yield from flush(np.inf)
 
 
@@ -359,10 +415,15 @@ def main():
     parser.add_argument('--config', default='config/garage_clean.yaml')
     parser.add_argument('--device', default=None, help='YOLO 设备, 如 cpu / 0')
     parser.add_argument('--rviz', action='store_true', help='在 RViz 中实时显示 (见 config/clean_map.rviz)')
+    parser.add_argument('--no-cache', action='store_true', help='Disable segmentation cache')
     args = parser.parse_args()
     with open(args.config) as config_file:
         cfg = yaml.safe_load(config_file)
     map_dir = Path(args.map)
+    T_imu_lidar, frame_contract = load_frame_contract(map_dir)
+    cfg['_T_imu_lidar'] = T_imu_lidar.tolist()
+    selector = ViewSelector(cfg)
+    print(f'coordinate contract: {frame_contract}', flush=True)
 
     from ultralytics import YOLO
     model = YOLO(cfg['yolo_model'])
@@ -384,24 +445,69 @@ def main():
     print(f'map: {len(cloud)} points, {n_vox} voxels, {len(traj.t)} keyframes', flush=True)
 
     voter = VehicleVoter(cfg, centroids, model, args.device)
+    cache_options = cfg.get('cache', {})
+    if cache_options.get('enabled', False) and not args.no_cache:
+        weights = Path(getattr(model, 'ckpt_path', None) or cfg['yolo_model'])
+        if not weights.is_file():
+            raise RuntimeError('Cannot fingerprint model weights for cache; use --no-cache')
+        identity = dict(schema=1, weights=file_digest(weights),
+                        ultralytics=importlib.metadata.version('ultralytics'),
+                        torch=importlib.metadata.version('torch'), device=args.device,
+                        conf=cfg['yolo_conf'], classes=cfg['vehicle_classes'],
+                        width=cfg['width'], height=cfg['height'], retina_masks=True)
+        voter.cache = MaskCache(cache_options.get('directory') or map_dir / '.vehicle_mask_cache', identity)
     viz = None
     if args.rviz:
         from clean_map_rviz import RvizPublisher
-        viz = RvizPublisher()
+        viz = RvizPublisher(max_points=int(cfg.get('rviz_max_points', 300000)))
         viz.publish_trajectory(traj)
         viz.publish_cloud('raw', xyz[finite])
-    start, with_depth = time.time(), 0
-    for t, pose, image, depth in iterate_views(args.bag, cfg, traj):
-        n_obj = voter.add_view(pose, image, depth)
-        with_depth += depth is not None
-        if viz is not None and n_obj is not None:
-            viz.publish_view(t, pose, voter, image)
-        if voter.views % 50 == 0:
-            print(f'views={voter.views} (depth {with_depth}) t={t:.2f} vehicles={n_obj} '
-                  f'{(time.time() - start) / voter.views:.2f}s/view', flush=True)
+    start, with_depth, no_projection = time.monotonic(), 0, 0
+    diagnostics = cfg.get('diagnostics', {})
+    every = max(1, int(diagnostics.get('every_views', 20)))
+    max_overlays = max(0, int(diagnostics.get('max_overlays', 20)))
+    diagnostic_root = map_dir / 'clean_diagnostics'
+    diagnostic_root.mkdir(exist_ok=True)
+    diagnostic_dir = Path(tempfile.mkdtemp(prefix='run_', dir=diagnostic_root))
+    print(f'Diagnostics: {diagnostic_dir}', flush=True)
+    overlays = 0
+    last_log = start
+    print('Reading bag and selecting views; first CPU inference may take a while...', flush=True)
+    with open(diagnostic_dir / 'views.csv', 'w', newline='') as stream:
+        columns = ['timestamp', 'status', 'objects', 'projected', 'visible', 'occluded',
+                   'vehicle_votes', 'depth', 'seconds']
+        writer = csv.DictWriter(stream, fieldnames=columns)
+        writer.writeheader()
+        for t, pose, image, depth in iterate_views(args.bag, cfg, traj, selector):
+            before = time.monotonic()
+            n_obj = voter.add_view(pose, image, depth)
+            with_depth += depth is not None
+            no_projection += n_obj is None
+            stats = voter.last_stats
+            writer.writerow(dict(timestamp=f'{t:.9f}', status='no_projection' if n_obj is None else 'voted',
+                                 **stats, depth=int(depth is not None), seconds=time.monotonic()-before))
+            stream.flush()
+            if n_obj is not None:
+                if viz is not None:
+                    viz.publish_view(t, pose, voter, image)
+                if overlays < max_overlays and (voter.views == 1 or voter.views % every == 0):
+                    cv2.imwrite(str(diagnostic_dir / f'overlay_{overlays:03d}.jpg'), make_overlay(voter, image, t))
+                    overlays += 1
+            now = time.monotonic()
+            if voter.views == 1 or now - last_log >= 10:
+                cache = getattr(voter, 'cache', None)
+                progress = np.clip((t + cfg['time_offset'] - traj.t[0]) /
+                                   max(traj.t[-1] - traj.t[0], 1e-9), 0, 1)
+                print(f'progress={100*progress:.1f}% of trajectory time, views={voter.views} '
+                      f'no_projection={no_projection} objects={n_obj} '
+                      f'cache_hits={cache.hits if cache else 0} '
+                      f'{(now-start)/max(voter.views, 1):.2f}s/view; {selector.stats}', flush=True)
+                last_log = now
     if voter.views == 0:
-        raise RuntimeError('No image matched the keyframe time range; check topics and time_offset')
+        raise RuntimeError(f'No usable projected view: selection={selector.stats}, '
+                           f'no_projection={no_projection}; check time_offset, calibration and map frames')
 
+    print('Voting finished; estimating floor and growing vehicle components...', flush=True)
     observed = voter.visible >= cfg['min_views']
     ratio = voter.vehicle / np.maximum(voter.visible, 1)
     remove = observed & (ratio >= cfg['vehicle_ratio'])
@@ -424,15 +530,27 @@ def main():
     lim = np.concatenate([np.sort(lim[:2])[::-1], lim[2:]])
     car_comp = (obs_cnt >= cfg['cluster_min_observed']) & \
                (veh_cnt >= cfg['cluster_vehicle_ratio'] * obs_cnt) & (ext <= lim).all(axis=1)
-    remove[above[car_comp[label]]] = True
+    # Never grow into voxels with enough observations that explicitly voted for background.
+    growth = car_comp[label] & (~observed[above] | remove[above])
+    remove[above[growth]] = True
 
     drop = np.zeros(len(cloud), dtype=bool)
     drop[finite] = remove[point_voxel]
-    write_pcd(map_dir / 'global_clean.pcd', header, cloud[~drop])
-    write_pcd(map_dir / 'global_vehicles.pcd', header, cloud[drop])
+    write_pcd(map_dir / 'global_clean.pcd', header, cloud, ~drop)
+    write_pcd(map_dir / 'global_vehicles.pcd', header, cloud, drop)
     print(f'views={voter.views}, observed voxels={observed.sum()}/{n_vox}, '
           f'vehicle voxels: vote={by_voxel}, after clusters={remove.sum()} ({car_comp.sum()} vehicle clusters)')
     print(f'removed {drop.sum()}/{len(cloud)} points -> {map_dir / "global_clean.pcd"}')
+    cache = getattr(voter, 'cache', None)
+    summary = dict(coordinate_contract=frame_contract, views=voter.views,
+                   selection=selector.stats, no_projection=no_projection,
+                   cache_hits=cache.hits if cache else 0, cache_misses=cache.misses if cache else 0,
+                   cache_corrupt=cache.corrupt if cache else 0,
+                   removed_points=int(drop.sum()), total_points=len(cloud),
+                   observed_voxels=int(observed.sum()), total_voxels=int(n_vox),
+                   elapsed_seconds=time.monotonic()-start, overlays_written=overlays,
+                   config=cfg, with_depth=with_depth, invalid_points=int((~finite).sum()))
+    (diagnostic_dir / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
     if viz is not None:
         viz.publish_cloud('clean', xyz[finite & ~drop])
         viz.publish_cloud('vehicles', xyz[drop])
