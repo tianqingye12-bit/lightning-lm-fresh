@@ -50,6 +50,7 @@ class TiledMap {
         std::string map_path_ = "./data/maps/";                       // 地图存储路径
         float chunk_size_ = 100.0;                                    // 单个chunk大小
         float inv_chunk_size_ = 1.0 / 100.0;                          // 反向chunk size
+        bool preserve_observed_points_ = false;  // Match the LIO export sampling policy.
         float voxel_size_in_chunk_ = 0.1;                             // chunk内部的分辨率
         const int load_nearby_chunks_ = 8;                            // 载入邻近范围内的点云
         bool save_dynamic_layer_ = false;                             // 是否将动态图层也存入地图文件夹

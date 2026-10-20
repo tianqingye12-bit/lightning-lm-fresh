@@ -4,6 +4,7 @@
 
 #include "core/maps/tiled_map.h"
 #include "io/file_io.h"
+#include "core/lio/map_detail_cloud.h"
 
 #include <pcl/io/pcd_io.h>
 #include <stdexcept>
@@ -56,8 +57,10 @@ void TiledMap::SaveToBin(bool only_dynamic) {
             }
 
             std::string filename = options_.map_path_ + "/" + std::to_string(cp.second->id_) + ".pcd";
-            if (pcl::io::savePCDFileBinaryCompressed(filename,
-                    *math::VoxelGrid(cp.second->cloud_, options_.voxel_size_in_chunk_)) < 0)
+            const auto filtered = options_.preserve_observed_points_
+                ? mapping::ObservedVoxelCloud<PointType>(cp.second->cloud_, options_.voxel_size_in_chunk_)
+                : math::VoxelGrid(cp.second->cloud_, options_.voxel_size_in_chunk_);
+            if (pcl::io::savePCDFileBinaryCompressed(filename, *filtered) < 0)
                 throw std::runtime_error("failed to save map tile: " + filename);
             fout << cp.second->id_ << " " << cp.first[0] << " " << cp.first[1] << " "
                  << std::to_string(cp.second->id_) + ".pcd" << std::endl;
@@ -83,8 +86,10 @@ void TiledMap::SaveToBin(bool only_dynamic) {
         if (cp.second->cloud_ != nullptr && !cp.second->cloud_->empty()) {
             std::string filename = options_.map_path_ + "/" + std::to_string(cp.second->id_) + "_dyn.pcd";
             cp.second->cloud_->width = cp.second->cloud_->size();
-            if (pcl::io::savePCDFileBinaryCompressed(filename,
-                    *math::VoxelGrid(cp.second->cloud_, options_.voxel_size_in_chunk_)) < 0)
+            const auto filtered = options_.preserve_observed_points_
+                ? mapping::ObservedVoxelCloud<PointType>(cp.second->cloud_, options_.voxel_size_in_chunk_)
+                : math::VoxelGrid(cp.second->cloud_, options_.voxel_size_in_chunk_);
+            if (pcl::io::savePCDFileBinaryCompressed(filename, *filtered) < 0)
                 throw std::runtime_error("failed to save map tile: " + filename);
         }
     }
