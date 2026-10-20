@@ -13,6 +13,7 @@
 #include "core/ivox3d/ivox3d.h"
 #include "core/lio/eskf.hpp"
 #include "core/lio/feature_quality.h"
+#include "core/lio/registration_quality.h"
 #include "core/lio/surface_support.h"
 #include "core/lio/map_detail.h"
 #include "core/lio/imu_prediction.h"
@@ -46,6 +47,7 @@ class LaserMapping {
 
         features::PlaneQualityOptions plane_quality_;
         features::SurfaceSupportOptions surface_support_;
+        features::RegistrationQualityOptions registration_quality_;
         bool robust_plane_weight_ = true;
         double plane_huber_delta_ = 0.10;  // metres; point-to-plane residual
         int feature_stats_interval_ = 20;  // processed scans; 0 disables reporting
@@ -270,6 +272,9 @@ class LaserMapping {
     bool use_aa_ = false;  // use anderson acceleration?
 
     features::FeatureStats feature_stats_;  // last observation evaluation for this scan
+    features::RegistrationDiagnostic registration_diagnostic_;
+    std::size_t surface_candidates_ = 0, icp_candidates_ = 0;
+    std::size_t icp_used_ = 0;
     std::size_t feature_stats_scan_count_ = 0;
 
     std::list<Keyframe::Ptr> proj_kfs_;  // 投影到当前帧的关键帧
