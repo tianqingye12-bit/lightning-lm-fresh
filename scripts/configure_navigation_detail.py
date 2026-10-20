@@ -7,7 +7,7 @@ from pathlib import Path
 import yaml
 
 
-def configure(config, export_resolution=.05, keyframe_max_points=60000):
+def configure(config, export_resolution=.05, keyframe_max_points=60000, storage_profile='compact'):
     cfg = copy.deepcopy(config)
     for key in ('fasterlio', 'g2p5', 'system'):
         if not isinstance(cfg.get(key), dict):
@@ -34,7 +34,11 @@ def configure(config, export_resolution=.05, keyframe_max_points=60000):
     map_export = cfg['system'].setdefault('map_export', {})
     if not isinstance(map_export, dict):
         raise ValueError('system.map_export must be a mapping')
-    map_export['localization_resolution'] = .05
+    if storage_profile not in ('compact', 'full'):
+        raise ValueError('storage profile must be compact or full')
+    map_export.update(localization_resolution=.05, compress_keyframes=True,
+                      save_global_pcd=storage_profile == 'full',
+                      save_localization_tiles=storage_profile == 'full')
     return cfg
 
 
@@ -43,18 +47,21 @@ def main():
     parser.add_argument('--input', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--export-resolution', type=float, choices=[.03, .05], default=.05)
+    parser.add_argument('--storage-profile', choices=['compact','full'], default='compact')
     parser.add_argument('--keyframe-max-points', type=int, default=60000)
     args = parser.parse_args()
     if args.input.resolve() == args.output.resolve():
         parser.error('use a different output to preserve your validated sensor configuration')
     try:
-        cfg = configure(yaml.safe_load(args.input.read_text()), args.export_resolution, args.keyframe_max_points)
+        cfg = configure(yaml.safe_load(args.input.read_text()), args.export_resolution,
+                        args.keyframe_max_points, args.storage_profile)
     except (ValueError, TypeError) as error:
         parser.error(str(error))
     with args.output.open('x') as stream:
         yaml.safe_dump(cfg, stream, allow_unicode=True, sort_keys=False)
     print(f'Created {args.output}: keyframes=0.05m/{args.keyframe_max_points} points, '
           f'PCD={args.export_resolution}m, localization tiles=0.05m, navigation grid=0.05m')
+    print(f'Storage={args.storage_profile}: compressed keyframes; global PCD/tiles only in full profile.')
     print('Sensor calibration, prediction limits, registration/map filters and keyframe triggers preserved.')
 
 

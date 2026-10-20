@@ -39,6 +39,15 @@ bool SlamSystem::Init(const std::string& yaml_path) {
     export_keyframe_clouds_ = yaml["system"]["export_keyframe_clouds"].as<bool>(false);
     const auto map_export = yaml["system"]["map_export"];
     if (map_export && !map_export.IsMap()) return false;
+    if (map_export) {
+        save_global_pcd_ = map_export["save_global_pcd"].as<bool>(true);
+        save_localization_tiles_ = map_export["save_localization_tiles"].as<bool>(true);
+        compress_keyframes_ = map_export["compress_keyframes"].as<bool>(true);
+    }
+    if (!save_global_pcd_ && !save_localization_tiles_ && !export_keyframe_clouds_) {
+        LOG(ERROR) << "map export must retain global PCD, tiles or keyframes";
+        return false;
+    }
     localization_export_resolution_ = map_export ? map_export["localization_resolution"].as<float>(0.1f) : 0.1f;
     if (!std::isfinite(localization_export_resolution_) || localization_export_resolution_ <= 0) return false;
     options_.with_loop_closing_ = yaml["system"]["with_loop_closing"].as<bool>();
@@ -252,15 +261,14 @@ void SlamSystem::SaveMap(const std::string& path) {
         return;
     }
     std::vector<SE3> exported_poses;
-    auto global_map = lio_->GetGlobalMap(!options_.with_loop_closing_, true, -1.0f, &exported_poses);
-    if (exported_poses.size() != keyframes.size()) {
-        LOG(WARNING) << "save map rejected: keyframe snapshot changed";
-        return;
+    CloudPtr global_map;
+    if (save_global_pcd_ || save_localization_tiles_) {
+        global_map = lio_->GetGlobalMap(!options_.with_loop_closing_, true, -1.0f, &exported_poses);
+        if (!global_map || global_map->empty()) throw std::runtime_error("empty global map");
+    } else {
+        exported_poses = Keyframe::SnapshotPoses(keyframes, !options_.with_loop_closing_);
     }
-    if (!global_map || global_map->empty()) {
-        LOG(WARNING) << "save map rejected: empty point cloud";
-        return;
-    }
+    if (exported_poses.size() != keyframes.size()) throw std::runtime_error("keyframe snapshot changed");
     std::string save_path = path;
     if (save_path.empty()) {
         save_path = "./data/" + map_name_ + "/";
@@ -278,15 +286,15 @@ void SlamSystem::SaveMap(const std::string& path) {
     // auto global_map_no_loop = lio_->GetGlobalMap(true);
     // auto global_map_raw = lio_->GetGlobalMap(!options_.with_loop_closing_, false, 0.1);
 
-    TiledMap::Options tm_options;
-    tm_options.map_path_ = save_path;
-    tm_options.voxel_size_in_chunk_ = localization_export_resolution_;
-
-    TiledMap tm(tm_options);
-    SE3 start_pose = exported_poses.front();
-    tm.ConvertFromFullPCD(global_map, start_pose, save_path);
-
-    pcl::io::savePCDFileBinaryCompressed(save_path + "/global.pcd", *global_map);
+    if (save_localization_tiles_) {
+        TiledMap::Options tm_options;
+        tm_options.map_path_ = save_path;
+        tm_options.voxel_size_in_chunk_ = localization_export_resolution_;
+        TiledMap tm(tm_options);
+        tm.ConvertFromFullPCD(global_map, exported_poses.front(), save_path);
+    }
+    if (save_global_pcd_ && pcl::io::savePCDFileBinaryCompressed(save_path + "/global.pcd", *global_map) < 0)
+        throw std::runtime_error("failed to save global map");
 
     /// 保存关键帧时间戳和位姿（与 global.pcd 使用同一套位姿），供离线去除车辆等后处理使用
     /// 每行: id timestamp tx ty tz qx qy qz qw
@@ -306,7 +314,9 @@ void SlamSystem::SaveMap(const std::string& path) {
         if (export_keyframe_clouds_) {
             const auto cloud = kf->GetCloud();
             const auto filename = std::to_string(kf->GetID()) + ".pcd";
-            if (!cloud || pcl::io::savePCDFileBinary(save_path + "/keyframe_clouds/" + filename, *cloud) < 0)
+            const auto file_path = save_path + "/keyframe_clouds/" + filename;
+            if (!cloud || (compress_keyframes_ ? pcl::io::savePCDFileBinaryCompressed(file_path, *cloud)
+                                             : pcl::io::savePCDFileBinary(file_path, *cloud)) < 0)
                 throw std::runtime_error("failed to export keyframe " + filename);
             frame_index << kf->GetID() << "," << kf->GetState().timestamp_ << "," << filename << "\n";
         }
