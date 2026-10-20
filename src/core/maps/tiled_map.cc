@@ -6,6 +6,9 @@
 #include "io/file_io.h"
 
 #include <pcl/io/pcd_io.h>
+#include <stdexcept>
+#include <filesystem>
+#include <cmath>
 #include <opencv2/opencv.hpp>
 
 namespace lightning {
@@ -44,6 +47,7 @@ void TiledMap::SaveToBin(bool only_dynamic) {
     if (!only_dynamic) {
         /// 原点+索引
         std::ofstream fout(options_.map_path_ + "/index.txt");
+        fout.exceptions(std::ios::badbit | std::ios::failbit);
         fout << std::setprecision(18) << origin_[0] << " " << origin_[1] << " " << origin_[2] << std::endl;
 
         for (auto& cp : static_chunks_) {
@@ -52,9 +56,11 @@ void TiledMap::SaveToBin(bool only_dynamic) {
             }
 
             std::string filename = options_.map_path_ + "/" + std::to_string(cp.second->id_) + ".pcd";
-            pcl::io::savePCDFileBinaryCompressed(filename,
-                                                 *math::VoxelGrid(cp.second->cloud_, options_.voxel_size_in_chunk_));
-            fout << cp.second->id_ << " " << cp.first[0] << " " << cp.first[1] << " " << filename << std::endl;
+            if (pcl::io::savePCDFileBinaryCompressed(filename,
+                    *math::VoxelGrid(cp.second->cloud_, options_.voxel_size_in_chunk_)) < 0)
+                throw std::runtime_error("failed to save map tile: " + filename);
+            fout << cp.second->id_ << " " << cp.first[0] << " " << cp.first[1] << " "
+                 << std::to_string(cp.second->id_) + ".pcd" << std::endl;
         }
 
         /// functional points
@@ -66,6 +72,8 @@ void TiledMap::SaveToBin(bool only_dynamic) {
                  << q.z() << " " << q.w() << std::endl;
         }
 
+        fout.flush();
+        fout.close();
         return;
     }
 
@@ -75,8 +83,9 @@ void TiledMap::SaveToBin(bool only_dynamic) {
         if (cp.second->cloud_ != nullptr && !cp.second->cloud_->empty()) {
             std::string filename = options_.map_path_ + "/" + std::to_string(cp.second->id_) + "_dyn.pcd";
             cp.second->cloud_->width = cp.second->cloud_->size();
-            pcl::io::savePCDFileBinaryCompressed(filename,
-                                                 *math::VoxelGrid(cp.second->cloud_, options_.voxel_size_in_chunk_));
+            if (pcl::io::savePCDFileBinaryCompressed(filename,
+                    *math::VoxelGrid(cp.second->cloud_, options_.voxel_size_in_chunk_)) < 0)
+                throw std::runtime_error("failed to save map tile: " + filename);
         }
     }
 }
@@ -110,7 +119,7 @@ bool TiledMap::LoadMapIndex() {
 
         if (first_line) {
             // 读地图原点
-            ss >> origin_[0] >> origin_[1] >> origin_[2];
+            if (!(ss >> origin_[0] >> origin_[1] >> origin_[2]) || !origin_.allFinite()) return false;
             first_line = false;
             continue;
         }
@@ -123,26 +132,37 @@ bool TiledMap::LoadMapIndex() {
         if (reading_fp) {
             /// 读功能点
             std::string name;
-            double data[7];
+            double data[7] = {};
             ss >> name;
             for (int i = 0; i < 7; ++i) {
-                ss >> data[i];
+                if (!(ss >> data[i]) || !std::isfinite(data[i])) return false;
             }
 
-            func_points_.emplace_back(name,
-                                      SE3(Quatd(data[6], data[3], data[4], data[5]), Vec3d(data[0], data[1], data[2])));
+            Quatd q(data[6], data[3], data[4], data[5]);
+            if (!std::isfinite(q.norm()) || q.norm() < 1e-6) return false;
+            q.normalize();
+            func_points_.emplace_back(name, SE3(q, Vec3d(data[0], data[1], data[2])));
         } else {
             /// 读地图区块
             int id;
             Vec2i grid;
             std::string path;
-            ss >> id >> grid[0] >> grid[1] >> path;
+            if (!(ss >> id >> grid[0] >> grid[1] >> path) || id < 0 ||
+                id_to_grid_.count(id) || static_chunks_.count(grid)) return false;
 
             // 将path改为yaml中配置的路径
             path = options_.map_path_ + "/" + std::to_string(id) + ".pcd";
 
+            if (!std::filesystem::is_regular_file(path)) {
+                LOG(ERROR) << "missing map tile: " << path;
+                return false;
+            }
             auto ck = std::make_shared<MapChunk>(id, grid, path);
             ck->LoadCloud();
+            if (!ck->cloud_ || ck->cloud_->empty()) {
+                LOG(ERROR) << "empty or unreadable map tile: " << path;
+                return false;
+            }
             static_chunks_.emplace(grid, ck);
             id_to_grid_.emplace(id, grid);
 
@@ -171,6 +191,7 @@ bool TiledMap::LoadMapIndex() {
     LOG(INFO) << "loaded chunks: " << static_chunks_.size() << ", fps: " << func_points_.size();
 
     fin.close();
+    if (first_line || static_chunks_.empty()) return false;
 
     // 尝试载入动态区域文件
     if (!options_.enable_dynamic_polygon_) {

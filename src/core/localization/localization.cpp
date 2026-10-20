@@ -5,6 +5,8 @@
 #include "core/localization/localization.h"
 
 #include <opencv2/highgui.hpp>
+#include <yaml-cpp/yaml.h>
+#include <cmath>
 
 #include "core/localization/pose_graph/pgo.h"
 #include "io/yaml_io.h"
@@ -15,15 +17,27 @@ namespace lightning::loc {
 // ！ 构造函数
 Localization::Localization(Options options) { options_ = options; }
 
+Localization::~Localization() { Finish(); }
+
 // ！初始化函数
 bool Localization::Init(const std::string& yaml_path, const std::string& global_map_path) {
-    UL lock(global_mutex_);
     if (lidar_loc_ != nullptr) {
         // 若已经启动，则变为初始化
         Finish();
     }
 
+    UL lock(global_mutex_);
+    finishing_.store(false);
+    last_match_dispatch_ = -1;
+    last_match_result_stamp_ = -1;
     YAML_IO yaml(yaml_path);
+    const auto health = YAML::LoadFile(yaml_path)["system"]["localization_health"];
+    if (health) {
+        match_interval_s_ = health["match_interval_s"].as<double>(1.0);
+        min_match_score_ = health["min_match_score"].as<double>(1.0);
+    }
+    if (!std::isfinite(match_interval_s_) || match_interval_s_ <= 0 ||
+        !std::isfinite(min_match_score_) || min_match_score_ < 0) return false;
     options_.with_ui_ = yaml.GetValue<bool>("system", "with_ui");
 
     /// lidar odom前端
@@ -54,7 +68,7 @@ bool Localization::Init(const std::string& yaml_path, const std::string& global_
         // lio_->SetUI(ui_);
     }
 
-    lidar_loc_->Init(yaml_path);
+    if (!lidar_loc_->Init(yaml_path)) return false;
 
     /// pose graph
     pgo_ = std::make_shared<PGO>();
@@ -93,13 +107,17 @@ bool Localization::Init(const std::string& yaml_path, const std::string& global_
         //             // LOG_EVERY_N(INFO, 10) << "loc fps: " << loc_fps;
         //         }
 
+        if (finishing_.load()) return;
         loc_result_ = res;
+        loc_result_.valid_ = res.valid_ && res.status_ == LocalizationStatus::GOOD &&
+                             res.pose_.matrix().allFinite() && std::isfinite(res.timestamp_);
+        if (result_callback_) loc_result_.valid_ = result_callback_(loc_result_) && loc_result_.valid_;
 
         if (tf_callback_ && loc_result_.valid_) {
             tf_callback_(loc_result_.ToGeoMsg());
         }
 
-        if (ui_) {
+        if (ui_ && loc_result_.valid_) {
             ui_->UpdateNavState(loc_result_.ToNavState());
             ui_->UpdateRecentPose(loc_result_.pose_);
         }
@@ -174,9 +192,8 @@ void Localization::ProcessLivoxLidarMsg(const livox_ros_driver2::msg::CustomMsg:
 }
 
 void Localization::LidarOdomProcCloud(CloudPtr cloud) {
-    if (lio_ == nullptr) {
-        return;
-    }
+    std::lock_guard<std::mutex> lio_lock(lio_mutex_);
+    if (finishing_.load() || lio_ == nullptr) return;
 
     /// NOTE: 在NCLT这种数据集中，lio内部是有缓存的，它拿到的点云不一定是最新时刻的点云
     lio_->ProcessPointCloud2(cloud);
@@ -196,9 +213,11 @@ void Localization::LidarOdomProcCloud(CloudPtr cloud) {
 
     auto scan = lio_->GetProjCloud();
 
+    if (!scan || scan->empty()) return;
     if (options_.loc_on_kf_) {
         auto kf = lio_->GetKeyframe();
-        if (kf == lio_kf_) {
+        if (kf == lio_kf_ && last_match_dispatch_ >= 0 &&
+            lo_state.timestamp_ - last_match_dispatch_ < match_interval_s_) {
             /// 关键帧未更新，那就只更新IMU状态
 
             // auto dr_state = lio_->GetState();
@@ -215,6 +234,7 @@ void Localization::LidarOdomProcCloud(CloudPtr cloud) {
 
         // auto scan = lio_->GetScanUndist();
 
+        last_match_dispatch_ = lo_state.timestamp_;
         if (options_.online_mode_) {
             lidar_loc_proc_cloud_.AddMessage(scan);
         } else {
@@ -223,6 +243,7 @@ void Localization::LidarOdomProcCloud(CloudPtr cloud) {
     } else {
         // auto scan = cloud;   // 这个cloud应该差一个外参
 
+        last_match_dispatch_ = lo_state.timestamp_;
         if (options_.online_mode_) {
             lidar_loc_proc_cloud_.AddMessage(scan);
         } else {
@@ -232,9 +253,18 @@ void Localization::LidarOdomProcCloud(CloudPtr cloud) {
 }
 
 void Localization::LidarLocProcCloud(CloudPtr scan_undist) {
-    lidar_loc_->ProcessCloud(scan_undist);
-
-    auto res = lidar_loc_->GetLocalizationResult();
+    if (finishing_.load()) return;
+    const bool processed = scan_undist && lidar_loc_->ProcessCloud(scan_undist);
+    const auto res = lidar_loc_->GetLocalizationResult();
+    if (processed && !res.map_match_attempted_) return;  // Park hold: do not refresh absolute-match health.
+    const bool good = processed && res.timestamp_ > last_match_result_stamp_ && res.lidar_loc_valid_ &&
+                      res.status_ == LocalizationStatus::GOOD &&
+                      res.pose_.matrix().allFinite() && std::isfinite(res.confidence_) &&
+                      res.confidence_ >= min_match_score_;
+    last_match_result_stamp_ = std::max(last_match_result_stamp_, res.timestamp_);
+    if (match_callback_) match_callback_(res.timestamp_, good);
+    // A failed scan must never enqueue the previous scan's result into PGO.
+    if (!good) return;
     pgo_->ProcessLidarLoc(res);
 
     if (ui_) {
@@ -256,14 +286,14 @@ void Localization::LidarLocProcCloud(CloudPtr scan_undist) {
 
 void Localization::ProcessIMUMsg(IMUPtr imu) {
     UL lock(global_mutex_);
+    std::lock_guard<std::mutex> lio_lock(lio_mutex_);
 
-    if (lidar_loc_ == nullptr || lio_ == nullptr || pgo_ == nullptr) {
-        return;
-    }
+    if (finishing_.load() || lidar_loc_ == nullptr || lio_ == nullptr || pgo_ == nullptr) return;
 
     double this_imu_time = imu->timestamp;
     if (last_imu_time_ > 0 && this_imu_time < last_imu_time_) {
         LOG(WARNING) << "IMU 时间异常：" << this_imu_time << ", last: " << last_imu_time_;
+        return;
     }
     last_imu_time_ = this_imu_time;
 
@@ -329,13 +359,12 @@ void Localization::ProcessIMUMsg(IMUPtr imu) {
 // }
 
 void Localization::Finish() {
-    lidar_loc_->Finish();
-    if (ui_) {
-        ui_->Quit();
-    }
-
-    lidar_loc_proc_cloud_.Quit();
+    if (finishing_.exchange(true)) return;
+    // Stop upstream producers before the map worker and the resources they use.
     lidar_odom_proc_cloud_.Quit();
+    lidar_loc_proc_cloud_.Quit();
+    if (lidar_loc_) lidar_loc_->Finish();
+    if (ui_) ui_->Quit();
 }
 
 void Localization::SetExternalPose(const Eigen::Quaterniond& q, const Eigen::Vector3d& t) {

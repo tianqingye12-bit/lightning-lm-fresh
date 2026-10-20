@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+
 #include <pcl/registration/icp.h>
 #include <chrono>
 #include <deque>
@@ -255,7 +257,8 @@ class LidarLoc {
     std::vector<SE3> fp_init_fail_pose_vec_;
     double fp_last_tried_time_ = 0;
 
-    bool update_map_quit_ = false;
+    double last_registration_time_ = -1;
+    std::atomic_bool update_map_quit_{false};
     std::thread update_map_thread_;            // 地图更新
     std::shared_ptr<TiledMap> map_ = nullptr;  // 地图
     double map_height_ = 0;

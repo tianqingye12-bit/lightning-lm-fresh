@@ -25,8 +25,16 @@ int main(int argc, char** argv) {
     LocSystem::Options opt;
     LocSystem loc(opt);
 
-    if (!loc.Init(FLAGS_config)) {
+    bool initialized = false;
+    try {
+        initialized = loc.Init(FLAGS_config);
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "localization initialization failed: " << e.what();
+    }
+    if (!initialized) {
         LOG(ERROR) << "failed to init loc";
+        rclcpp::shutdown();
+        return 1;
     }
 
     /// 默认起点开始定位
