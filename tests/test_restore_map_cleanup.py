@@ -89,7 +89,7 @@ class RestoreTests(unittest.TestCase):
         self.assertEqual(removed.tolist(),[True,False,False,False])
 
     def test_real_map_pipeline_restores_seed_votes_and_historical_cluster_expansion(self):
-        for grow in (False,True):
+        for grow in (False,True,'local','local_occluded'):
             with self.subTest(grow=grow),tempfile.TemporaryDirectory() as tmp:
                 source=Path(tmp)/'map';fixture(source,keyframes=[[0,1,0,0,0,0,0,0,1]])
                 cloud=np.array([(0,0,2,7),(.5,0,2,9)],dtype=DTYPE)
@@ -98,9 +98,15 @@ class RestoreTests(unittest.TestCase):
                 cfg=config();cfg.update(depth_margin=2.,mask_dilate_px=0,cluster_voxel=1.,
                     cluster_min_observed=2 if grow else 999,cluster_vehicle_ratio=.5)
                 cfg=recovery_profile(cfg)
+                if isinstance(grow,str):
+                    cfg['seed_local_cleanup'] = dict(enabled=True, min_seeds=1, link_m=.6)
                 path=Path(tmp)/'config.yaml';path.write_text(yaml.safe_dump(cfg))
                 image=np.zeros((32,32,3),np.uint8)
-                views=[(t,np.eye(4),image,None) for t in (.8,1.,1.2)]
+                depth=None
+                if grow == 'local_occluded':
+                    depth=np.zeros((32,32),np.float32)
+                    depth[16,18]=1./cfg['depth_scale']  # second map point has no visible observations
+                views=[(t,np.eye(4),image,depth) for t in (.8,1.,1.2)]
                 mask=np.zeros((1,32,32),bool);mask[0,16,16]=True
                 predictions=[(mask,1),(mask,1),(np.empty((0,32,32),bool),0)]
                 with patch.dict(sys.modules,{'ultralytics':SimpleNamespace(YOLO=lambda _:SimpleNamespace(task='segment'))}), \
@@ -110,11 +116,17 @@ class RestoreTests(unittest.TestCase):
                     patch.object(sys,'argv',['clean','--map',str(source),'--bag','unused','--config',str(path)]):
                     vr.main()
                 removed=read_pcd(source/'global_vehicles.pcd')[1]
-                self.assertEqual(len(removed),2 if grow else 1)
-                self.assertEqual(set(removed['intensity']),{7.,9.} if grow else {7.})
+                expanded = grow is True or grow == 'local_occluded'
+                self.assertEqual(len(removed),2 if expanded else 1)
+                self.assertEqual(set(removed['intensity']),{7.,9.} if expanded else {7.})
                 self.assertEqual((source/'global.pcd').read_bytes(),original)
                 summary=json.loads(next((source/'clean_diagnostics').glob('*/summary.json')).read_text())
                 self.assertTrue(summary['legacy_map_cleanup'])
+                self.assertEqual(summary['removal_stages']['vote_voxels'], 1)
+                if isinstance(grow,str):
+                    self.assertTrue(summary['seed_local_cleanup']['enabled'])
+                    self.assertFalse(summary['cluster_growth_enabled'])
+                    self.assertEqual(summary['seed_local_cleanup']['added_voxels'],int(grow == 'local_occluded'))
 
 
 if __name__=='__main__':unittest.main()

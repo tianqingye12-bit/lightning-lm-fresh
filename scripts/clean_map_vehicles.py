@@ -40,6 +40,7 @@ from segmentation_quality import (ScoredInstances, quality_options, instance_cac
 from pose_trajectory import load_trajectory, trajectory_options
 from cross_keyframe_semantics import cross_frame_options
 from legacy_map_cleanup import legacy_enabled,associate_legacy,legacy_votes
+from seed_local_cleanup import options as seed_options, complete as complete_seeds
 
 PCD_TYPES = {('F', 4): 'f4', ('F', 8): 'f8', ('U', 1): 'u1', ('U', 2): 'u2', ('U', 4): 'u4',
              ('I', 1): 'i1', ('I', 2): 'i2', ('I', 4): 'i4'}
@@ -513,9 +514,14 @@ def main():
     trajectory_options(cfg)
     cross_options = cross_frame_options(cfg)
     mode = args.mode or cfg.get('clean_mode', 'map')
+    seed_cfg = seed_options(cfg)
+    if seed_cfg['enabled'] and mode != 'map':
+        parser.error('seed_local_cleanup requires map mode')
     if mode not in ('map', 'keyframes'):
         raise ValueError('clean_mode must be map or keyframes')
     legacy=legacy_enabled(cfg)
+    if seed_cfg['enabled'] and not legacy:
+        parser.error('seed_local_cleanup currently requires the explicit legacy_map_cleanup recovery profile')
     if legacy and (mode!='map' or evidence['enabled'] or quality['enabled'] or cross_options['enabled']):
         parser.error('legacy_map_cleanup requires map mode and disabled extra semantic/quality/cross-frame gates')
     if mode != 'keyframes' and cross_options['enabled']:
@@ -634,7 +640,12 @@ def main():
     by_voxel = int(remove.sum())
 
     car_comp = np.zeros(0, bool)
-    if not evidence['enabled'] and not quality['enabled']:
+    local_report = dict(enabled=False)
+    if seed_cfg['enabled']:
+        remove, local_report = complete_seeds(centroids, remove, voter.visible, voter.vehicle,
+                                             voter.background, floor, cfg, voter.spatial_index)
+        print(f'Seed local completion: {local_report}', flush=True)
+    elif not evidence['enabled'] and not quality['enabled']:
         above = np.nonzero(~floor)[0]
         label = components(centroids[above], cfg['cluster_voxel'])
         n_comp = int(label.max()) + 1 if len(label) else 0
@@ -665,12 +676,14 @@ def main():
         uncertain_points = np.zeros(len(cloud), bool)
         uncertain_points[finite] = uncertain[point_voxel]
         write_pcd(diagnostic_dir / 'global_uncertain.pcd', header, cloud, uncertain_points)
+    stage = 'after local completion' if seed_cfg['enabled'] else 'after clusters'
     print(f'views={voter.views}, observed voxels={observed.sum()}/{n_vox}, '
-          f'vehicle voxels: vote={by_voxel}, after clusters={remove.sum()} ({car_comp.sum()} vehicle clusters)')
+          f'vehicle voxels: vote={by_voxel}, {stage}={remove.sum()} '
+          f'(added={int(remove.sum())-by_voxel}, {car_comp.sum()} whole vehicle clusters)')
     print(f'removed {drop.sum()}/{len(cloud)} points -> {map_dir / "global_clean.pcd"}')
     cache = getattr(voter, 'cache', None)
     summary = dict(evidence=evidence_counts, evidence_units="voxels",
-                   semantics=report_semantics(), cluster_growth_enabled=not evidence["enabled"] and not quality['enabled'],
+                   semantics=report_semantics(), cluster_growth_enabled=not seed_cfg['enabled'] and not evidence["enabled"] and not quality['enabled'],
                    uncertain_cloud_written=evidence["write_uncertain"],
                    coordinate_contract=frame_contract, views=voter.views,
                    selection=selector.stats, no_projection=no_projection,
@@ -682,6 +695,14 @@ def main():
                    config=cfg, with_depth=with_depth, invalid_points=int((~finite).sum()))
     summary.update(trajectory=traj.description, pose_queries=traj.query_stats)
     summary['legacy_map_cleanup']=legacy
+    summary['seed_local_cleanup'] = local_report
+    summary['removal_stages'] = dict(vote_voxels=by_voxel, final_voxels=int(remove.sum()),
+                                   added_voxels=int(remove.sum())-by_voxel,
+                                   whole_vehicle_clusters=int(car_comp.sum()))
+    summary['coverage'] = dict(unobserved_voxels=int((voter.visible == 0).sum()),
+                              below_min_views_voxels=int((voter.visible < cfg['min_views']).sum()),
+                              positive_voxels=int((voter.vehicle > 0).sum()),
+                              positive_below_min_views_voxels=int(((voter.vehicle > 0) & (voter.visible < cfg['min_views'])).sum()))
     (diagnostic_dir / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
     if viz is not None:
         viz.publish_cloud('clean', xyz[finite & ~drop])
