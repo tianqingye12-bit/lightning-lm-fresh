@@ -38,6 +38,7 @@ from semantic_evidence import PositiveBaseline, decide, evidence_options, timing
 from segmentation_quality import (ScoredInstances, quality_options, instance_cache,
                                   associate_scored_instances, accepted_instances)
 from pose_trajectory import load_trajectory, trajectory_options
+from cross_keyframe_semantics import cross_frame_options
 
 PCD_TYPES = {('F', 4): 'f4', ('F', 8): 'f8', ('U', 1): 'u1', ('U', 2): 'u2', ('U', 4): 'u4',
              ('I', 1): 'i1', ('I', 2): 'i2', ('I', 4): 'i4'}
@@ -287,6 +288,7 @@ class VehicleVoter:
         self.views = 0
         self.cache = None
         self.last_stats = {}
+        self.collect_world_evidence = cross_frame_options(cfg)['enabled']
 
     def vehicle_mask(self, image):
         key = self.cache.key(image) if self.cache is not None else None
@@ -328,6 +330,7 @@ class VehicleVoter:
         self.last_stats = dict(projected=0, visible=0, occluded=0, vehicle_votes=0,
                                background_votes=0, unknown_votes=0, objects=0,
                                accepted_objects=0, positive_confidence_sum=0.)
+        self.last_association = None
         T = self.T_cam_lidar @ np.linalg.inv(T_world_lidar)
         rng = self.cfg['max_range']
         near = np.asarray(self.spatial_index.query_ball_point(
@@ -374,6 +377,7 @@ class VehicleVoter:
         else:
             is_vehicle, background, mask = associate_instances(masks, scene, u, v, z, visible, self.cfg)
             accepted_objects, confidence_sum = n_obj, 0.
+            scores = np.ones(len(near),float)
         self.visible[near[visible]] += 1
         self.vehicle[near[visible & is_vehicle]] += 1
         self.baseline.update(near[visible & is_vehicle], np.linalg.inv(T)[:3, 3])
@@ -381,6 +385,9 @@ class VehicleVoter:
         self.views += 1
         self.last_view = (u, v, visible, is_vehicle, mask)
         self.last_background = background
+        if self.collect_world_evidence:
+            self.last_association = dict(indices=near[visible],positive=is_vehicle[visible],
+                                         background=background[visible],scores=scores[visible])
         self.last_stats = dict(projected=len(near), visible=int(visible.sum()),
                                occluded=int((~visible).sum()),
                                vehicle_votes=int((visible & is_vehicle).sum()),
@@ -497,9 +504,12 @@ def main():
     evidence = evidence_options(cfg)
     quality = quality_options(cfg)
     trajectory_options(cfg)
+    cross_options = cross_frame_options(cfg)
     mode = args.mode or cfg.get('clean_mode', 'map')
     if mode not in ('map', 'keyframes'):
         raise ValueError('clean_mode must be map or keyframes')
+    if mode != 'keyframes' and cross_options['enabled']:
+        parser.error('cross_keyframe_semantics requires keyframes mode')
     if mode != 'keyframes' and (args.output is not None or args.export_global or args.compact_result or args.global_voxel_size):
         parser.error('Output layout/global export options require keyframes mode')
     map_dir = Path(args.map)

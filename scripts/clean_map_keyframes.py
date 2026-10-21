@@ -10,6 +10,7 @@ from pathlib import Path
 import shutil
 import tempfile
 import time
+from cross_keyframe_semantics import cross_frame_options, SemanticVoxelEvidence
 
 import numpy as np
 from segmentation_quality import instance_cache
@@ -87,6 +88,7 @@ def run_keyframe_clean(args, cfg, frame_contract):
     if frame_contract != 'imu_v2':
         raise ValueError('Keyframe rebuilding requires a version-2 IMU-frame map')
     evidence = evidence_options(cfg)
+    cross_options = cross_frame_options(cfg)
     storage = storage_options(cfg)
     compact_result = getattr(args, 'compact_result', False)
     global_voxel_size = getattr(args, 'global_voxel_size', 0.)
@@ -182,6 +184,7 @@ def run_keyframe_clean(args, cfg, frame_contract):
     stats = dict(frames=len(entries), frames_with_votes=0, frames_without_views=0,
                  floor_unknown_frames=0, retained_points=0, removed_points=0,
                  invalid_points=0, selected_images=0, point_view_votes=0)
+    stats['removed_points_without_local_views']=0
     started = time.monotonic()
     overlays = 0
     decision_counts = {}
@@ -204,6 +207,11 @@ def run_keyframe_clean(args, cfg, frame_contract):
     diagnostics = cfg.get('diagnostics', {})
     max_overlays = max(0, int(diagnostics.get('max_overlays', 20)))
     overlay_period = max(1, int(diagnostics.get('every_views', 20)))
+    collecting = True
+    frame_view_counts = {}
+    cross = SemanticVoxelEvidence(run_dir,cross_options['voxel_size']) if cross_options['enabled'] else None
+    if cross is not None:
+        print('Cross-keyframe semantics: phase 1/2, collecting unique-image world-voxel evidence',flush=True)
 
     def load(index):
         header, cloud = vr.read_pcd(entries[index][2])
@@ -212,13 +220,20 @@ def run_keyframe_clean(args, cfg, frame_contract):
         # Saved frame clouds always use their exact optimized keyframe poses.
         pose = traj.keyframes.pose(entries[index][1])
         world = xyz[finite] @ pose[:3, :3].T + pose[:3, 3]
-        voter = vr.VehicleVoter(cfg, world, model, args.device)
-        add_preview('raw', index, world)
+        if cross is not None and not collecting:
+            voter = cross.lookup(world,frame_view_counts.get(index,0))
+        else:
+            voter = vr.VehicleVoter(cfg, world, model, args.device)
+            add_preview('raw', index, world)
         return header, cloud, finite, world, voter
 
     def finish(index, state):
         nonlocal output
         header, cloud, finite, world, voter = state
+        if cross is not None and collecting:
+            frame_view_counts[index]=voter.views
+            finished.add(index)
+            return
         _, remove, _, _ = decide(voter.visible, voter.vehicle, voter.background, cfg, voter.baseline,
                                 positive_score=voter.score_sum)
         pre_floor_remove=remove.copy()
@@ -277,6 +292,8 @@ def run_keyframe_clean(args, cfg, frame_contract):
             add_preview('vehicles', index, world[remove])
         stats['retained_points'] += int((~remove).sum())
         stats['removed_points'] += int(remove.sum())
+        if cross is not None and voter.views==0:
+            stats['removed_points_without_local_views']+=int(remove.sum())
         stats['invalid_points'] += int((~finite).sum())
         finished.add(index)
 
@@ -287,6 +304,8 @@ def run_keyframe_clean(args, cfg, frame_contract):
             if aligned_t < previous:
                 raise ValueError('Image header timestamps must be nondecreasing in keyframe mode')
             previous = aligned_t
+            if cross is not None:
+                cross.begin_image(aligned_t,(pose @ np.linalg.inv(inference.T_cam_lidar))[:3,3])
             for i in list(active):
                 if entries[i][1] < aligned_t - window:
                     finish(i, active.pop(i))
@@ -312,6 +331,8 @@ def run_keyframe_clean(args, cfg, frame_contract):
                 voter.vehicle_mask = shared_masks
                 before = time.monotonic()
                 count = voter.add_view(pose, image, depth)
+                if cross is not None:
+                    cross.add(active[i][3],voter.last_association)
                 if count is not None and abs(aligned_t-entries[i][1]) < preview_dt:
                     preview_voter, preview_dt = voter, abs(aligned_t-entries[i][1])
                 view_writer.writerow(dict(timestamp=t, keyframe_id=entries[i][0],
@@ -326,6 +347,8 @@ def run_keyframe_clean(args, cfg, frame_contract):
                     cv2.imwrite(str(run_dir / f'overlay_{overlays:03d}.jpg'),
                                 vr.make_overlay(voter, image, t, traj))
                     overlays += 1
+            if cross is not None:
+                cross.end_image()
             now = time.monotonic()
             if viz is not None and preview_voter is not None and now-last_view_preview >= 1.0:
                 viz.publish_view(t, pose, preview_voter, image)
@@ -336,11 +359,23 @@ def run_keyframe_clean(args, cfg, frame_contract):
                 print(f'keyframe clean: images={stats["selected_images"]}, '
                       f'finished={len(finished)}/{len(entries)}, active={len(active)}, '
                       f'removed={stats["removed_points"]}', flush=True)
-        for i in range(len(entries)):
-            if i not in finished:
-                finish(i, active.pop(i) if i in active else load(i))
         if stats['selected_images'] == 0:
             raise RuntimeError('No usable temporally matched images; no final map published')
+        if cross is not None:
+            for i,state in active.items():frame_view_counts[i]=state[-1].views
+            active.clear()
+            collecting=False
+            finished.clear()
+            print('Cross-keyframe semantics: phase 2/2, applying shared evidence to every original keyframe',flush=True)
+            for i in range(len(entries)):
+                finish(i,load(i))
+                publish_preview()
+                if i==0 or (i+1)%20==0:
+                    print(f'cross-frame export: finished={i+1}/{len(entries)}, removed={stats["removed_points"]}',flush=True)
+        else:
+            for i in range(len(entries)):
+                if i not in finished:
+                    finish(i, active.pop(i) if i in active else load(i))
         for stream in output.values():
             stream.finish()
         # Copy the coordinate/pose contract for retained IMU-frame clouds.
@@ -362,6 +397,7 @@ def run_keyframe_clean(args, cfg, frame_contract):
                      selection=selector.stats, coordinate_contract=frame_contract,
                      source='retained_keyframes', overlapping_frame_points_retained=True)
         stats.update(trajectory=traj.description, pose_queries=traj.query_stats)
+        stats['cross_keyframe_semantics']=cross.summary() if cross is not None else dict(enabled=False)
         stats.update(vote_gates=gate_counts,result_layout='global_only' if compact_result else 'keyframes',
             global_export=dict(voxel_size_m=global_voxel_size,points=output['clean'].count,
                 input_points=getattr(output['clean'],'input_count',output['clean'].count),
@@ -388,3 +424,4 @@ def run_keyframe_clean(args, cfg, frame_contract):
         view_file.close()
         for stream in output.values():
             stream.close()
+        if cross is not None:cross.close()
