@@ -155,6 +155,15 @@ class TracksTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'mismatch'):LabelLookup(labels,source)
 
     def test_real_map_pipeline_tracks_masks_and_exports_transferable_labels(self):
+        self._map_pipeline(moving=True)
+
+    def test_rejected_track_preserves_already_confirmed_point_votes_and_labels(self):
+        self._map_pipeline(moving=False)
+
+    def test_duplicate_images_cannot_inflate_fallback_point_votes(self):
+        self._map_pipeline(moving=False,duplicate=True)
+
+    def _map_pipeline(self,moving,duplicate=False):
         with tempfile.TemporaryDirectory() as tmp:
             source=Path(tmp)/'map';fixture(source,keyframes=[[0,1,0,0,0,0,0,0,1]])
             points=[((u-16)*.2,(v-16)*.2,2.,7.) for v in (12,13,14) for u in (12,13,14,15)]
@@ -166,8 +175,8 @@ class TracksTests(unittest.TestCase):
             prediction=ScoredInstances(masks,[2],[.9])
             views=[]
             for i in range(3):
-                pose=np.eye(4);pose[0,3]=i*.2
-                views.append((.8+i*.2,pose,np.zeros((32,32,3),np.uint8),None))
+                pose=np.eye(4);pose[0,3]=i*.2 if moving else 0.
+                views.append((.8 if duplicate else .8+i*.2,pose,np.zeros((32,32,3),np.uint8),None))
             with patch.dict(sys.modules,{'ultralytics':SimpleNamespace(YOLO=lambda _:SimpleNamespace(task='segment'))}), \
                  patch.object(vr,'iterate_views',return_value=views), \
                  patch.object(vr.VehicleVoter,'infer_mask',return_value=(prediction,1)), \
@@ -175,13 +184,18 @@ class TracksTests(unittest.TestCase):
                  patch.object(sys,'argv',['clean','--map',str(source),'--bag','unused','--config',str(path)]):
                 vr.main()
             result=vr.read_pcd(source/'global_clean.pcd')[1]
-            self.assertEqual(result['intensity'].tolist(),[9.])
+            self.assertEqual(result['intensity'].tolist(),[7.]*12+[9.] if duplicate else [9.])
             self.assertEqual((source/'global.pcd').read_bytes(),original)
             self.assertTrue((source/'vehicle_labels.sqlite').is_file())
             report=json.loads(next((source/'clean_diagnostics').glob('*/summary.json')).read_text())
-            self.assertEqual(report['vehicle_instance_tracks']['accepted_tracks'],1)
+            self.assertEqual(report['vehicle_instance_tracks']['accepted_tracks'],int(moving and not duplicate))
+            self.assertEqual(report['vehicle_instance_tracks']['point_vote_voxels'],0 if duplicate else 12)
+            self.assertEqual(report['vehicle_instance_tracks']['combined_final_voxels'],0 if duplicate else 12)
+            self.assertGreaterEqual(report['removal_stages']['added_voxels'],0)
+            if not moving and not duplicate:
+                self.assertEqual(report['vehicle_instance_tracks']['instance_only_voxels'],0)
             lookup=LabelLookup(source/'vehicle_labels.sqlite',source)
-            try:self.assertEqual(lookup.lookup(np.array(points)[:,:3]).tolist(),[True]*12+[False])
+            try:self.assertEqual(lookup.lookup(np.array(points)[:,:3]).tolist(),[False]*13 if duplicate else [True]*12+[False])
             finally:lookup.close()
 
 
