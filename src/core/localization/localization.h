@@ -1,5 +1,8 @@
 #pragma once
 
+#include <atomic>
+#include <algorithm>
+
 #include "geometry_msgs/msg/transform_stamped.hpp"
 #include "std_msgs/msg/int32.hpp"
 
@@ -42,7 +45,7 @@ class Localization {
     };
 
     Localization(Options options = Options());
-    ~Localization() = default;
+    ~Localization();
 
     /**
      * 初始化，读配置参数
@@ -81,6 +84,11 @@ class Localization {
     using PointcloudWorldCallback = std::function<void(const sensor_msgs::msg::PointCloud2& pointcloud)>;
 
     void SetTFCallback(TFCallback&& callback);
+    // Install callbacks before Init; called on estimator worker threads.
+    using ResultCallback = std::function<bool(const LocalizationResult&)>;
+    using MatchCallback = std::function<void(double, bool)>;
+    void SetResultCallback(ResultCallback callback) { result_callback_ = std::move(callback); }
+    void SetMatchCallback(MatchCallback callback) { match_callback_ = std::move(callback); }
 
     // void SetPathCallback(std::function<void(const nav_msgs::msg::Path& path)>&& callback);
     // void SetPointcloudWorldCallback(std::function<void(const sensor_msgs::msg::PointCloud2& pointcloud)>&& callback);
@@ -92,6 +100,12 @@ class Localization {
     /// 模块  ========================================================================================================
     std::mutex global_mutex_;  // 防止处理过程中被重复init
     Options options_;
+    std::mutex lio_mutex_;  // IMU callback and cloud worker share the ESKF.
+    std::atomic_bool finishing_{false};
+    double last_match_dispatch_ = -1;
+    double last_match_result_stamp_ = -1;
+    double match_interval_s_ = 1.0;
+    double min_match_score_ = 1.0;
 
     /// 预处理
     std::shared_ptr<PointCloudPreprocess> preprocess_ = nullptr;  // point cloud preprocess
@@ -118,6 +132,8 @@ class Localization {
 
     /// 框架相关
     TFCallback tf_callback_;
+    ResultCallback result_callback_;
+    MatchCallback match_callback_;
     LocStateCallback loc_state_callback_;
     PointcloudBodyCallback pointcloud_body_callback_;
     PointcloudWorldCallback pointcloud_world_callback_;

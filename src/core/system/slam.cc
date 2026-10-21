@@ -8,6 +8,7 @@
 #include "core/loop_closing/loop_closing.h"
 #include "core/maps/tiled_map.h"
 #include "core/maps/navigation_grid.h"
+#include "core/maps/map_transaction.h"
 #include "ui/pangolin_window.h"
 #include "wrapper/ros_utils.h"
 
@@ -237,11 +238,19 @@ void SlamSystem::SaveMap(const SaveMapService::Request::SharedPtr request,
         response->response = 3;
         return;
     }
-    map_name_ = request->map_id;
-    std::string save_path = "./data/" + map_name_ + "/";
-
-    SaveMap(save_path);
-    response->response = 0;
+    if (!maps::ValidMapId(request->map_id)) {
+        LOG(ERROR) << "save map rejected: map_id must be a non-hidden directory basename";
+        response->response = 3;
+        return;
+    }
+    try {
+        SaveMap("./data/" + request->map_id);
+        map_name_ = request->map_id;
+        response->response = 0;
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "save map failed; previous map preserved: " << e.what();
+        response->response = 3;  // Existing wire contract: save failure.
+    }
 }
 
 void SlamSystem::SaveMap(const std::string& path) {
@@ -251,14 +260,12 @@ void SlamSystem::SaveMap(const std::string& path) {
     }
     // Validate before accessing front() or replacing an existing map directory.
     if (!lio_) {
-        LOG(WARNING) << "save map rejected: LIO is not initialized";
-        return;
+        throw std::runtime_error("LIO is not initialized");
     }
     RuntimeStats::Scope save_time(lio_->Stats(), RuntimeStats::save_map);
     const auto keyframes = lio_->GetAllKeyframes();
     if (keyframes.empty()) {
-        LOG(WARNING) << "save map rejected: no keyframes yet";
-        return;
+        throw std::runtime_error("no keyframes yet");
     }
     std::vector<SE3> exported_poses;
     CloudPtr global_map;
@@ -274,14 +281,10 @@ void SlamSystem::SaveMap(const std::string& path) {
         save_path = "./data/" + map_name_ + "/";
     }
 
-    LOG(INFO) << "slam map saving to " << save_path;
-
-    if (!std::filesystem::exists(save_path)) {
-        std::filesystem::create_directories(save_path);
-    } else {
-        std::filesystem::remove_all(save_path);
-        std::filesystem::create_directories(save_path);
-    }
+    const std::string destination = save_path;
+    maps::MapTransaction transaction(destination);
+    save_path = transaction.Staging().string();
+    LOG(INFO) << "staging map for " << destination << " in " << save_path;
 
     // auto global_map_no_loop = lio_->GetGlobalMap(true);
     // auto global_map_raw = lio_->GetGlobalMap(!options_.with_loop_closing_, false, 0.1);
@@ -299,12 +302,14 @@ void SlamSystem::SaveMap(const std::string& path) {
     /// 保存关键帧时间戳和位姿（与 global.pcd 使用同一套位姿），供离线去除车辆等后处理使用
     /// 每行: id timestamp tx ty tz qx qy qz qw
     std::ofstream kf_file(save_path + "/keyframes.txt");
+    kf_file.exceptions(std::ios::badbit | std::ios::failbit);
     kf_file << std::setprecision(18);
     // Publish the manifest only after all frame files have been saved successfully.
     std::ofstream frame_index;
     if (export_keyframe_clouds_) {
         std::filesystem::create_directories(save_path + "/keyframe_clouds");
         frame_index.open(save_path + "/keyframe_clouds/index.csv.tmp");
+        frame_index.exceptions(std::ios::badbit | std::ios::failbit);
         frame_index << "id,timestamp,file\n" << std::setprecision(18);
         if (!frame_index) throw std::runtime_error("cannot create keyframe cloud manifest");
     }
@@ -326,6 +331,8 @@ void SlamSystem::SaveMap(const std::string& path) {
         kf_file << kf->GetID() << " " << kf->GetState().timestamp_ << " " << t.x() << " " << t.y() << " " << t.z()
                 << " " << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << "\n";
     }
+    kf_file.flush();
+    kf_file.close();
     if (export_keyframe_clouds_) {
         frame_index.flush();
         if (!frame_index) throw std::runtime_error("failed to write keyframe cloud manifest");
@@ -336,6 +343,7 @@ void SlamSystem::SaveMap(const std::string& path) {
     }
     // Version the coordinate contract; cleaning interpolates IMU poses first, then applies T_imu_lidar.
     std::ofstream frame_file(save_path + "/map_frames.yaml");
+    frame_file.exceptions(std::ios::badbit | std::ios::failbit);
     frame_file << std::setprecision(18)
                << "format_version: 2\nkeyframe_pose_frame: imu\nkeyframe_cloud_frame: imu\nT_imu_lidar: [";
     const auto T_imu_lidar = lio_->GetTImuLidar().matrix();
@@ -346,6 +354,8 @@ void SlamSystem::SaveMap(const std::string& path) {
         }
     }
     frame_file << "]\n";
+    frame_file.flush();
+    frame_file.close();
     // pcl::io::savePCDFileBinaryCompressed(save_path + "/global_no_loop.pcd", *global_map_no_loop);
     // pcl::io::savePCDFileBinaryCompressed(save_path + "/global_raw.pcd", *global_map_raw);
 
@@ -364,7 +374,14 @@ void SlamSystem::SaveMap(const std::string& path) {
         navigation::SaveGrid(save_path, spec, map.data);
     }
 
-    LOG(INFO) << "map saved";
+    std::ofstream complete(save_path + "/save_complete.yaml");
+    complete.exceptions(std::ios::badbit | std::ios::failbit);
+    complete << "format_version: 1\nkeyframes: " << keyframes.size() << "\n";
+    complete.flush();
+    complete.close();
+    if (!transaction.Commit()) LOG(WARNING) << "map published but parent fsync failed; durability is unconfirmed";
+    LOG(INFO) << "map saved to " << destination;
+    if (!transaction.Previous().empty()) LOG(INFO) << "previous map retained at " << transaction.Previous();
 }
 
 void SlamSystem::Enqueue(SerialWorker::Kind kind, std::function<void()> task) {

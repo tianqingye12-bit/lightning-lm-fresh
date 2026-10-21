@@ -12,7 +12,9 @@
 #include <thread>
 #include <utility>
 
-#include <glog/logging.h>
+#include <algorithm>
+#include <stdexcept>
+#include <string>
 
 namespace lightning::sys {
 using UL = std::unique_lock<std::mutex>;
@@ -29,13 +31,15 @@ class AsyncMessageProcess {
    public:
     using ProcFunc = std::function<void(const T&)>;  // 消息回调函数
     AsyncMessageProcess() = default;
+    ~AsyncMessageProcess() { Quit(); }
     AsyncMessageProcess(ProcFunc proc_func, std::string name = "");
 
+    // Configure and call Start/Quit from one owner thread; AddMessage may run concurrently.
     /// 设置处理函数
     void SetProcFunc(ProcFunc proc_func) { custom_func_ = proc_func; }
 
     /// 设置队列最大长度
-    void SetMaxSize(size_t size) { max_size_ = size; }
+    void SetMaxSize(size_t size) { max_size_ = std::max(size_t(1), size); }
 
     /// 开始处理消息
     void Start();
@@ -48,9 +52,14 @@ class AsyncMessageProcess {
 
     /// 清空跳帧计数器，下一个数据会立即执行
     void CleanSkipCnt();
+    size_t Dropped() { UL lock(mutex_); return dropped_; }
+    bool Running() { UL lock(mutex_); return !exit_flag_; }
 
     void SetName(std::string name) { name_ = std::move(name); }
-    void SetSkipParam(bool enable_skip, int skip_num) { enable_skip_ = enable_skip, skip_num_ = skip_num; }
+    void SetSkipParam(bool enable_skip, int skip_num) {
+        if (enable_skip && skip_num < 1) throw std::invalid_argument("skip_num must be positive");
+        enable_skip_ = enable_skip; skip_num_ = skip_num;
+    }
 
     AsyncMessageProcess(const AsyncMessageProcess&) = delete;
     void operator=(const AsyncMessageProcess&) = delete;
@@ -62,8 +71,8 @@ class AsyncMessageProcess {
     std::mutex mutex_;
     std::condition_variable cv_msg_;
     std::deque<T> msg_buffer_;
-    bool update_flag_ = false;
-    bool exit_flag_ = false;
+    bool exit_flag_ = true;
+    size_t dropped_ = 0;
     size_t max_size_ = 100;  // 40
     std::string name_;
 
@@ -89,33 +98,31 @@ AsyncMessageProcess<T>::AsyncMessageProcess(AsyncMessageProcess::ProcFunc proc_f
 
 template <typename T>
 void AsyncMessageProcess<T>::Start() {
+    UL lock(mutex_);
+    if (proc_.joinable()) return;
     exit_flag_ = false;
-    update_flag_ = false;
+    skip_cnt_ = 0;
+    dropped_ = 0;
     proc_ = std::thread([this]() { ProcLoop(); });
 }
 
 template <typename T>
 void AsyncMessageProcess<T>::ProcLoop() {
-    while (!exit_flag_) {
+    for (;;) {
         UL lock(mutex_);
-        cv_msg_.wait(lock, [this]() { return update_flag_; });
-
-        // take the message and process it
-        auto buffer = msg_buffer_;
-        msg_buffer_.clear();
-        update_flag_ = false;
+        cv_msg_.wait(lock, [this]() { return exit_flag_ || !msg_buffer_.empty(); });
+        if (exit_flag_) return;
+        T msg = std::move(msg_buffer_.front());
+        msg_buffer_.pop_front();
         lock.unlock();
-
-        // 处理之
-        for (const auto& msg : buffer) {
-            custom_func_(msg);
-        }
+        custom_func_(msg);
     }
 }
 
 template <typename T>
 void AsyncMessageProcess<T>::AddMessage(const T& msg) {
     UL lock(mutex_);
+    if (exit_flag_) return;
     if (enable_skip_) {
         if (skip_cnt_ != 0) {
             skip_cnt_++;
@@ -129,18 +136,20 @@ void AsyncMessageProcess<T>::AddMessage(const T& msg) {
 
     msg_buffer_.push_back(msg);
     while (msg_buffer_.size() > max_size_) {
-        LOG(INFO) << name_ << " exceeds largest size: " << max_size_;
+        ++dropped_;
         msg_buffer_.pop_front();
     }
 
-    update_flag_ = true;
     cv_msg_.notify_one();
 }
 
 template <typename T>
 void AsyncMessageProcess<T>::Quit() {
-    update_flag_ = true;
-    exit_flag_ = true;
+    {
+        UL lock(mutex_);
+        exit_flag_ = true;
+        msg_buffer_.clear();
+    }
     cv_msg_.notify_one();
 
     if (proc_.joinable()) {

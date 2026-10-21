@@ -7,6 +7,9 @@
 
 #include <tf2_ros/transform_broadcaster.h>
 #include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/bool.hpp>
+#include <std_msgs/msg/string.hpp>
+#include "core/localization/localization_health.h"
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 
@@ -49,6 +52,13 @@ class LocSystem {
 
    private:
     Options options_;
+    loc::LocalizationHealth health_;
+    void PublishHealth();
+    static double SteadyNow();
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr health_pub_;
+    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr valid_pub_;
+    rclcpp::CallbackGroup::SharedPtr watchdog_group_;
+    rclcpp::TimerBase::SharedPtr watchdog_;
 
     std::shared_ptr<loc::Localization> loc_ = nullptr;  // 定位接口
 

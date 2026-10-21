@@ -30,6 +30,7 @@ struct LocalizationResult {
     LocalizationStatus status_ = LocalizationStatus::IDLE;  // 定位状态位
 
     /// 对内部分
+    bool map_match_attempted_ = false;  // Parked pose reuse is not a new absolute measurement.
     bool lidar_loc_valid_ = false;        // 该时刻lidarLoc是否有效
     bool lidar_loc_inlier_ = false;       // 该时刻lidarLoc在PGO中是否是内点
     double confidence_ = 1.0;             // lidarLoc的confidence(若有效)

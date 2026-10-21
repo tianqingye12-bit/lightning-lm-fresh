@@ -99,7 +99,7 @@ bool LidarLoc::Init(const std::string& config_path) {
     options_.map_option_.save_dyn_when_unload_ = yaml.GetValue<bool>("maps", "save_dyn_when_unload");
 
     map_ = std::make_shared<TiledMap>(options_.map_option_);
-    map_->LoadMapIndex();
+    if (!map_->LoadMapIndex()) return false;
 
     auto fps = map_->GetAllFP();
     if (!fps.empty()) {
@@ -457,7 +457,9 @@ void LidarLoc::Align(const CloudPtr& input) {
     }
 
     /// 1. 车辆静止处理
-    if (parking_ && loc_inited_) {
+    { UL lock(result_mutex_); localization_result_.map_match_attempted_ = false; }
+    if (parking_ && loc_inited_ && last_registration_time_ >= 0 &&
+        current_time - last_registration_time_ < 1.0) {
         LOG(INFO) << "车辆静止，不做匹配";
 
         UpdateState(input);
@@ -475,6 +477,8 @@ void LidarLoc::Align(const CloudPtr& input) {
         return;
     }
 
+    last_registration_time_ = current_time;
+    { UL lock(result_mutex_); localization_result_.map_match_attempted_ = true; }
     /// 2. 初始化处理
     if (!loc_inited_) {
         UL lock_init(initial_pose_mutex_);
@@ -713,7 +717,7 @@ void LidarLoc::Align(const CloudPtr& input) {
         localization_result_.timestamp_ = current_timestamp_;
         localization_result_.confidence_ = fitness_score;
         if (match_fail_count_ < 100) {
-            localization_result_.lidar_loc_valid_ = true;
+            localization_result_.lidar_loc_valid_ = loc_success;
             localization_result_.status_ = LocalizationStatus::GOOD;
         } else if (match_fail_count_ >= 100 && match_fail_count_ < 300) {
             localization_result_.lidar_loc_valid_ = false;
@@ -820,16 +824,12 @@ bool LidarLoc::CheckLidarOdomValid(const SE3& current_pose_esti, double& delta_p
 }
 
 bool LidarLoc::Localize(SE3& pose, double& confidence, CloudPtr input, CloudPtr output, bool use_rough_res) {
+    confidence = 0;
     Eigen::Matrix4f trans;
     bool loc_success = false;
     Eigen::Matrix4f guess_pose = pose.matrix().cast<float>();
 
     LOG(INFO) << "loc from: " << pose.translation().transpose();
-
-    if (pcl_ndt_->getInputTarget() == nullptr) {
-        LOG(INFO) << "lidar loc target is null, skip";
-        return false;
-    }
 
     UL lock(match_mutex_);
     NDTType::Ptr ndt = nullptr;
@@ -840,21 +840,19 @@ bool LidarLoc::Localize(SE3& pose, double& confidence, CloudPtr input, CloudPtr 
         ndt = pcl_ndt_;
     }
 
+    if (!ndt || !ndt->getInputTarget() || ndt->getInputTarget()->empty()) {
+        LOG(WARNING) << "lidar loc target is empty, skip";
+        return false;
+    }
     ndt->setInputSource(input);
     ndt->align(*output, guess_pose);
     trans = ndt->getFinalTransformation();
     confidence = ndt->getTransformationProbability();
 
-    auto tgt = ndt->getInputTarget();
-    if (!tgt->empty()) {
-        pcl::io::savePCDFile("./data/tgt.pcd", *tgt);
-    }
-
-    if (loc_inited_ == false && confidence > options_.min_init_confidence_) {
-        loc_success = true;
-    } else {
-        loc_success = true;
-    }
+    if (!ndt->hasConverged() || !trans.allFinite() || !std::isfinite(confidence)) return false;
+    // Transformation probability is an NDT score, not a calibrated probability.
+    loc_success = loc_inited_ || confidence > options_.min_init_confidence_;
+    if (!loc_success) return false;
 
     if (options_.enable_icp_adjust_ && loc_inited_) {
         Eigen::Matrix4f adjust_trans;
@@ -875,7 +873,7 @@ bool LidarLoc::Localize(SE3& pose, double& confidence, CloudPtr input, CloudPtr 
         float d = (trans.block<3, 1>(0, 3) - adjust_trans.block<3, 1>(0, 3)).norm();
         LOG(INFO) << "icp adjust d: " << d << ", a: " << a;
 
-        if (pcl_icp_->hasConverged() && std::fabs(d) <= 0.05 && std::fabs(a) <= 0.05) {
+        if (pcl_icp_->hasConverged() && adjust_trans.allFinite() && std::fabs(d) <= 0.05 && std::fabs(a) <= 0.05) {
             LOG(INFO) << "icp ajust trans set success";
             trans = adjust_trans;
         }
@@ -984,13 +982,17 @@ void LidarLoc::Finish() {
     if (map_) {
         LOG(INFO) << "saving maps";
         update_map_quit_ = true;
-        update_map_thread_.join();
+        if (update_map_thread_.joinable()) update_map_thread_.join();
 
         /// 永久保存时，再存储地图
         if (options_.map_option_.policy_ == TiledMap::DynamicCloudPolicy::PERSISTENT &&
             options_.map_option_.save_dyn_when_quit_ && !has_set_pose_) {
-            map_->SaveToBin(true);
-            LOG(INFO) << "dynamic maps saved";
+            try {
+                map_->SaveToBin(true);
+                LOG(INFO) << "dynamic maps saved";
+            } catch (const std::exception& e) {
+                LOG(ERROR) << "failed to save dynamic layer during shutdown: " << e.what();
+            }
         }
     }
 }

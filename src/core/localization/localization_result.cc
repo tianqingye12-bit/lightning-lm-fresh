@@ -31,7 +31,7 @@ NavState LocalizationResult::ToNavState() const {
     ret.confidence_ = confidence_;
     ret.pos_ = pose_.translation();
     ret.rot_ = pose_.so3();
-    ret.pose_is_ok_ = status_ == LocalizationStatus::GOOD;
+    ret.pose_is_ok_ = valid_ && status_ == LocalizationStatus::GOOD && pose_.matrix().allFinite();
 
     ret.vel_ = (pose_.so3() * vel_b_);
 
