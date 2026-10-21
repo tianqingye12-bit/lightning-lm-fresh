@@ -401,8 +401,7 @@ class VehicleVoter:
             is_vehicle,background,mask,scores,observations=extract_vehicle_instances(
                 masks,scene,cam,u,v,z,visible,self.floor_mask[near],self.cfg)
             self.score_sum[near[visible&is_vehicle]]+=scores[visible&is_vehicle]
-            for obs in observations:
-                obs['track_id']=self.instance_tracks.add(near[obs['indices']],obs['class_id'],obs['score'])
+            self.instance_tracks.add_observations([dict(obs,indices=near[obs['indices']]) for obs in observations])
             accepted_objects=len(observations)
             confidence_sum=float(scores[visible&is_vehicle].sum())
         elif self.legacy:
