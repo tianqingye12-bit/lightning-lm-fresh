@@ -12,7 +12,8 @@ import tempfile
 import time
 
 import numpy as np
-from clean_map_instances import InstanceMaskCache, removal_votes
+from clean_map_instances import InstanceMaskCache
+from semantic_evidence import decide, evidence_options, timing_stats, report_semantics
 from clean_map_runtime import ViewSelector, file_digest
 from map_storage import storage_options, compress_pcd, require_compressor
 
@@ -81,6 +82,7 @@ def run_keyframe_clean(args, cfg, frame_contract):
     import clean_map_vehicles as vr
     if frame_contract != 'imu_v2':
         raise ValueError('Keyframe rebuilding requires a version-2 IMU-frame map')
+    evidence = evidence_options(cfg)
     storage = storage_options(cfg)
     if storage['compress_keyframes']:
         require_compressor()
@@ -131,6 +133,20 @@ def run_keyframe_clean(args, cfg, frame_contract):
                  invalid_points=0, selected_images=0, point_view_votes=0)
     started = time.monotonic()
     overlays = 0
+    decision_counts = {}
+    frame_file = (run_dir / 'frames.csv').open('w', newline='')
+    frame_columns = ['keyframe_id', 'timestamp', 'views', 'invalid_points', 'floor_unknown',
+                     'total', 'removed', 'protected', 'background', 'uncertain', 'unobserved',
+                     'blocked_coverage', 'blocked_baseline']
+    frame_writer = csv.DictWriter(frame_file, fieldnames=frame_columns)
+    frame_writer.writeheader()
+    view_file = (run_dir / 'views.csv').open('w', newline='')
+    view_columns = ['timestamp', 'keyframe_id', 'keyframe_dt_s', 'aligned_timestamp',
+                    'nearest_keyframe_dt_s', 'pose_bracket_gap_s', 'status', 'objects',
+                    'projected', 'visible', 'occluded', 'vehicle_votes', 'background_votes',
+                    'unknown_votes', 'depth', 'seconds']
+    view_writer = csv.DictWriter(view_file, fieldnames=view_columns)
+    view_writer.writeheader()
     diagnostics = cfg.get('diagnostics', {})
     max_overlays = max(0, int(diagnostics.get('max_overlays', 20)))
     overlay_period = max(1, int(diagnostics.get('every_views', 20)))
@@ -147,7 +163,9 @@ def run_keyframe_clean(args, cfg, frame_contract):
     def finish(index, state):
         nonlocal output
         header, cloud, finite, world, voter = state
-        _, remove = removal_votes(voter.visible, voter.vehicle, voter.background, cfg)
+        _, remove, _, _ = decide(voter.visible, voter.vehicle, voter.background, cfg, voter.baseline)
+        protected = np.zeros(len(world), bool)
+        floor_unknown = False
         stats['frames_with_votes'] += int(voter.views > 0)
         stats['frames_without_views'] += int(voter.views == 0)
         stats['point_view_votes'] += int(voter.vehicle.sum())
@@ -157,10 +175,19 @@ def run_keyframe_clean(args, cfg, frame_contract):
                                                      'p': traj.p[index:index+1]})()
             try:
                 floor = vr.estimate_floor(world, local_traj)
-                remove &= world[:, 2] >= floor + cfg['floor_keep']
+                protected = world[:, 2] < floor + cfg['floor_keep']
             except RuntimeError:
-                remove[:] = False  # Insufficient floor evidence: preserve all, report abstention.
+                protected[:] = True  # Insufficient floor evidence: preserve all, report abstention.
+                floor_unknown = True
                 stats['floor_unknown_frames'] += 1
+        _, remove, uncertain, counts = decide(voter.visible, voter.vehicle, voter.background,
+                                               cfg, voter.baseline, protected)
+        for key, value in counts.items():
+            decision_counts[key] = decision_counts.get(key, 0) + value
+        frame_writer.writerow(dict(keyframe_id=entries[index][0], timestamp=entries[index][1],
+                                   views=voter.views, invalid_points=int((~finite).sum()),
+                                   floor_unknown=int(floor_unknown), **counts))
+        frame_file.flush()
         drop = np.zeros(len(cloud), bool)
         drop[finite] = remove
         frame_path = clean_dir / f'{entries[index][0]}.pcd'
@@ -169,19 +196,21 @@ def run_keyframe_clean(args, cfg, frame_contract):
             compress_pcd(frame_path)
         # Frame files remain in IMU coordinates; only rebuilt visualization clouds are world-frame.
         world_cloud = None
-        if storage['write_global_clean'] or storage['write_removed_points']:
+        if storage['write_global_clean'] or storage['write_removed_points'] or evidence['write_uncertain']:
             world_cloud = cloud[finite].copy()
             for axis, value in zip(('x', 'y', 'z'), world.T):
                 world_cloud[axis] = value
         for name, enabled, selection in (
                 ('clean', storage['write_global_clean'], ~remove),
-                ('vehicles', storage['write_removed_points'], remove)):
+                ('vehicles', storage['write_removed_points'], remove),
+                ('uncertain', evidence['write_uncertain'], uncertain)):
             if enabled:
                 if name not in output:
-                    filename = 'global_clean.pcd' if name == 'clean' else 'global_vehicles.pcd'
+                    filename = {'clean': 'global_clean.pcd', 'vehicles': 'global_vehicles.pcd',
+                                'uncertain': 'global_uncertain.pcd'}[name]
                     output[name] = PcdStream(run_dir / filename, header)
                 output[name].append(world_cloud[selection])
-            elif args.rviz and index % frame_stride == 0:
+            elif name in previews and args.rviz and index % frame_stride == 0:
                 selected = world[selection]
                 if len(selected):
                     sample = np.linspace(0, len(selected)-1, min(len(selected), frame_budget), dtype=np.intp)
@@ -220,13 +249,19 @@ def run_keyframe_clean(args, cfg, frame_contract):
                     active[i] = load(i)
                 voter = active[i][-1]
                 voter.vehicle_mask = shared_masks
+                before = time.monotonic()
                 count = voter.add_view(pose, image, depth)
+                view_writer.writerow(dict(timestamp=t, keyframe_id=entries[i][0],
+                    keyframe_dt_s=aligned_t-entries[i][1], **timing_stats(traj, t, cfg),
+                    status='no_projection' if count is None else 'voted',
+                    **voter.last_stats, depth=int(depth is not None), seconds=time.monotonic()-before))
+                view_file.flush()
                 voter.vehicle_mask = None  # Do not retain masks from old images in inactive frames.
                 if (count is not None and overlays < max_overlays and
                         stats['selected_images'] % overlay_period == 0):
                     import cv2
                     cv2.imwrite(str(run_dir / f'overlay_{overlays:03d}.jpg'),
-                                vr.make_overlay(voter, image, t))
+                                vr.make_overlay(voter, image, t, traj))
                     overlays += 1
             stats['selected_images'] += 1
             if stats['selected_images'] == 1 or stats['selected_images'] % 20 == 0:
@@ -244,7 +279,12 @@ def run_keyframe_clean(args, cfg, frame_contract):
         shutil.copy2(directory / 'keyframe_clouds/index.csv', clean_dir / 'index.csv')
         shutil.copy2(directory / 'keyframes.txt', run_dir / 'keyframes.txt')
         shutil.copy2(directory / 'map_frames.yaml', run_dir / 'map_frames.yaml')
-        stats.update(storage=storage, global_clean_written=storage['write_global_clean'],
+        cache = inference.cache
+        stats.update(evidence=decision_counts, evidence_units='finite keyframe points (overlap retained)',
+                     semantics=report_semantics(), uncertain_cloud_written=evidence['write_uncertain'],
+                     cache_hits=cache.hits if cache else 0, cache_misses=cache.misses if cache else 0,
+                     cache_corrupt=cache.corrupt if cache else 0,
+                     storage=storage, global_clean_written=storage['write_global_clean'],
                      removed_cloud_written=storage['write_removed_points'], overlays_written=overlays,
                      elapsed_seconds=time.monotonic()-started, config=cfg,
                      selection=selector.stats, coordinate_contract=frame_contract,
@@ -289,5 +329,7 @@ def run_keyframe_clean(args, cfg, frame_contract):
             print('RViz final clouds ready; Ctrl+C to exit', flush=True)
             viz.spin()
     finally:
+        frame_file.close()
+        view_file.close()
         for stream in output.values():
             stream.close()

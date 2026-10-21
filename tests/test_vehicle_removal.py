@@ -120,6 +120,7 @@ class VehicleRemovalTests(unittest.TestCase):
                     self.visible = np.array([3])
                     self.vehicle = np.array([3])
                     self.background = np.array([0])
+                    self.baseline = vr.PositiveBaseline(len(self.visible), cfg)
                     self.views = 0
                     self.last_stats = dict(projected=1, visible=1, occluded=0, vehicle_votes=1, objects=1)
                 def add_view(self, *args):
@@ -157,6 +158,7 @@ class VehicleRemovalTests(unittest.TestCase):
                     self.visible = np.array([3, 3, 3, 0])
                     self.vehicle = np.array([3, 3, 0, 0])
                     self.background = np.array([0, 0, 3, 0])
+                    self.baseline = vr.PositiveBaseline(len(self.visible), cfg)
                     self.views = 0
                     self.last_stats = dict(projected=4, visible=3, occluded=1, vehicle_votes=2, objects=1)
                 def add_view(self, *args):

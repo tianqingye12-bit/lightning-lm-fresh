@@ -32,6 +32,7 @@ import yaml
 
 from clean_map_runtime import ViewSelector, file_digest, load_frame_contract, rigid_transform
 from clean_map_instances import InstanceMaskCache, associate_instances, association_options, removal_votes
+from semantic_evidence import PositiveBaseline, decide, evidence_options, timing_stats, report_semantics
 
 PCD_TYPES = {('F', 4): 'f4', ('F', 8): 'f8', ('U', 1): 'u1', ('U', 2): 'u2', ('U', 4): 'u4',
              ('I', 1): 'i1', ('I', 2): 'i2', ('I', 4): 'i4'}
@@ -275,6 +276,7 @@ class VehicleVoter:
         self.vehicle = np.zeros(len(centroids), np.int32)
         self.background = np.zeros(len(centroids), np.int32)
         association_options(cfg)
+        self.baseline = PositiveBaseline(len(centroids), cfg)
         self.views = 0
         self.cache = None
         self.last_stats = {}
@@ -309,7 +311,8 @@ class VehicleVoter:
     def add_view(self, T_world_lidar, image, depth):
         if image.shape[:2] != (self.h, self.w):
             raise RuntimeError(f'Image {image.shape[1]}x{image.shape[0]} != calibration {self.w}x{self.h}')
-        self.last_stats = dict(projected=0, visible=0, occluded=0, vehicle_votes=0, objects=0)
+        self.last_stats = dict(projected=0, visible=0, occluded=0, vehicle_votes=0,
+                               background_votes=0, unknown_votes=0, objects=0)
         T = self.T_cam_lidar @ np.linalg.inv(T_world_lidar)
         rng = self.cfg['max_range']
         near = np.asarray(self.spatial_index.query_ball_point(
@@ -351,17 +354,20 @@ class VehicleVoter:
         is_vehicle, background, mask = associate_instances(masks, scene, u, v, z, visible, self.cfg)
         self.visible[near[visible]] += 1
         self.vehicle[near[visible & is_vehicle]] += 1
+        self.baseline.update(near[visible & is_vehicle], np.linalg.inv(T)[:3, 3])
         self.background[near[visible & background]] += 1
         self.views += 1
         self.last_view = (u, v, visible, is_vehicle, mask)
         self.last_background = background
         self.last_stats = dict(projected=len(near), visible=int(visible.sum()),
                                occluded=int((~visible).sum()),
-                               vehicle_votes=int((visible & is_vehicle).sum()), objects=n_obj)
+                               vehicle_votes=int((visible & is_vehicle).sum()),
+                               background_votes=int((visible & background).sum()),
+                               unknown_votes=int((visible & ~is_vehicle & ~background).sum()), objects=n_obj)
         return n_obj
 
 
-def make_overlay(voter, image, timestamp):
+def make_overlay(voter, image, timestamp, traj=None):
     """Blue mask; gray occluded; yellow unknown; green background; red vehicle votes."""
     u, v, visible, vehicle, mask = voter.last_view
     output = image.copy()
@@ -375,6 +381,12 @@ def make_overlay(voter, image, timestamp):
     output[v[hit], u[hit]] = (0, 0, 255)
     cv2.putText(output, f'view {voter.views} t={timestamp:.1f} visible={int(visible.sum())} '
                 f'vehicle={int(hit.sum())}', (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    if traj is not None:
+        timing = timing_stats(traj, timestamp, voter.cfg)
+        cv2.putText(output, f"offset={voter.cfg['time_offset']:+.3f}s "
+                    f"nearest_kf_dt={timing['nearest_keyframe_dt_s']} "
+                    f"pose_gap={timing['pose_bracket_gap_s']}", (10, 45),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
     return output
 
 
@@ -447,6 +459,7 @@ def main():
     with open(args.config) as config_file:
         cfg = yaml.safe_load(config_file)
     association_options(cfg)
+    evidence = evidence_options(cfg)
     mode = args.mode or cfg.get('clean_mode', 'map')
     if mode not in ('map', 'keyframes'):
         raise ValueError('clean_mode must be map or keyframes')
@@ -512,7 +525,8 @@ def main():
     print('Reading bag and selecting views; first CPU inference may take a while...', flush=True)
     with open(diagnostic_dir / 'views.csv', 'w', newline='') as stream:
         columns = ['timestamp', 'status', 'objects', 'projected', 'visible', 'occluded',
-                   'vehicle_votes', 'depth', 'seconds']
+                   'vehicle_votes', 'background_votes', 'unknown_votes', 'depth', 'seconds',
+                   'aligned_timestamp', 'nearest_keyframe_dt_s', 'pose_bracket_gap_s']
         writer = csv.DictWriter(stream, fieldnames=columns)
         writer.writeheader()
         for t, pose, image, depth in iterate_views(args.bag, cfg, traj, selector):
@@ -522,13 +536,14 @@ def main():
             no_projection += n_obj is None
             stats = voter.last_stats
             writer.writerow(dict(timestamp=f'{t:.9f}', status='no_projection' if n_obj is None else 'voted',
-                                 **stats, depth=int(depth is not None), seconds=time.monotonic()-before))
+                                 **stats, depth=int(depth is not None), seconds=time.monotonic()-before,
+                                 **timing_stats(traj, t, cfg)))
             stream.flush()
             if n_obj is not None:
                 if viz is not None:
                     viz.publish_view(t, pose, voter, image)
                 if overlays < max_overlays and (voter.views == 1 or voter.views % every == 0):
-                    cv2.imwrite(str(diagnostic_dir / f'overlay_{overlays:03d}.jpg'), make_overlay(voter, image, t))
+                    cv2.imwrite(str(diagnostic_dir / f'overlay_{overlays:03d}.jpg'), make_overlay(voter, image, t, traj))
                     overlays += 1
             now = time.monotonic()
             if voter.views == 1 or now - last_log >= 10:
@@ -545,40 +560,51 @@ def main():
                            f'no_projection={no_projection}; check time_offset, calibration and map frames')
 
     print('Voting finished; estimating floor and growing vehicle components...', flush=True)
-    observed, remove = removal_votes(voter.visible, voter.vehicle,
-                                     voter.background, cfg)
     floor = centroids[:, 2] < estimate_floor(centroids, traj) + cfg['floor_keep']
-    remove &= ~floor
+    observed, remove, uncertain, evidence_counts = decide(
+        voter.visible, voter.vehicle, voter.background, cfg, voter.baseline, floor)
     by_voxel = int(remove.sum())
 
-    above = np.nonzero(~floor)[0]
-    label = components(centroids[above], cfg['cluster_voxel'])
-    n_comp = int(label.max()) + 1 if len(label) else 0
-    obs_cnt = np.bincount(label, weights=observed[above], minlength=n_comp)
-    veh_cnt = np.bincount(label, weights=remove[above], minlength=n_comp)
-    lo = np.full((n_comp, 3), np.inf)
-    hi = np.full((n_comp, 3), -np.inf)
-    np.minimum.at(lo, label, centroids[above])
-    np.maximum.at(hi, label, centroids[above])
-    ext = hi - lo
-    ext = np.column_stack([np.sort(ext[:, :2], axis=1)[:, ::-1], ext[:, 2]])
-    lim = np.array(cfg['cluster_max_extent'], dtype=float)
-    lim = np.concatenate([np.sort(lim[:2])[::-1], lim[2:]])
-    car_comp = (obs_cnt >= cfg['cluster_min_observed']) & \
-               (veh_cnt >= cfg['cluster_vehicle_ratio'] * obs_cnt) & (ext <= lim).all(axis=1)
-    # Never grow into voxels with enough observations that explicitly voted for background.
-    growth = car_comp[label] & (~observed[above] | remove[above]) & (voter.background[above] == 0)
-    remove[above[growth]] = True
+    car_comp = np.zeros(0, bool)
+    if not evidence['enabled']:
+        above = np.nonzero(~floor)[0]
+        label = components(centroids[above], cfg['cluster_voxel'])
+        n_comp = int(label.max()) + 1 if len(label) else 0
+        obs_cnt = np.bincount(label, weights=observed[above], minlength=n_comp)
+        veh_cnt = np.bincount(label, weights=remove[above], minlength=n_comp)
+        lo = np.full((n_comp, 3), np.inf)
+        hi = np.full((n_comp, 3), -np.inf)
+        np.minimum.at(lo, label, centroids[above])
+        np.maximum.at(hi, label, centroids[above])
+        ext = hi - lo
+        ext = np.column_stack([np.sort(ext[:, :2], axis=1)[:, ::-1], ext[:, 2]])
+        lim = np.array(cfg['cluster_max_extent'], dtype=float)
+        lim = np.concatenate([np.sort(lim[:2])[::-1], lim[2:]])
+        car_comp = (obs_cnt >= cfg['cluster_min_observed']) & \
+                   (veh_cnt >= cfg['cluster_vehicle_ratio'] * obs_cnt) & (ext <= lim).all(axis=1)
+        # Never grow into voxels with enough observations that explicitly voted for background.
+        growth = car_comp[label] & (~observed[above] | remove[above]) & (voter.background[above] == 0)
+        remove[above[growth]] = True
+    uncertain &= ~remove
+    evidence_counts['removed'] = int(remove.sum())
+    evidence_counts['uncertain'] = int(uncertain.sum())
 
     drop = np.zeros(len(cloud), dtype=bool)
     drop[finite] = remove[point_voxel]
     write_pcd(map_dir / 'global_clean.pcd', header, cloud, ~drop)
     write_pcd(map_dir / 'global_vehicles.pcd', header, cloud, drop)
+    if evidence['write_uncertain']:
+        uncertain_points = np.zeros(len(cloud), bool)
+        uncertain_points[finite] = uncertain[point_voxel]
+        write_pcd(diagnostic_dir / 'global_uncertain.pcd', header, cloud, uncertain_points)
     print(f'views={voter.views}, observed voxels={observed.sum()}/{n_vox}, '
           f'vehicle voxels: vote={by_voxel}, after clusters={remove.sum()} ({car_comp.sum()} vehicle clusters)')
     print(f'removed {drop.sum()}/{len(cloud)} points -> {map_dir / "global_clean.pcd"}')
     cache = getattr(voter, 'cache', None)
-    summary = dict(coordinate_contract=frame_contract, views=voter.views,
+    summary = dict(evidence=evidence_counts, evidence_units="voxels",
+                   semantics=report_semantics(), cluster_growth_enabled=not evidence["enabled"],
+                   uncertain_cloud_written=evidence["write_uncertain"],
+                   coordinate_contract=frame_contract, views=voter.views,
                    selection=selector.stats, no_projection=no_projection,
                    cache_hits=cache.hits if cache else 0, cache_misses=cache.misses if cache else 0,
                    cache_corrupt=cache.corrupt if cache else 0,
