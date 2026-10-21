@@ -1,6 +1,7 @@
 """Dense pose selection, invalid-scan barriers and actual cleaning export integration."""
 import csv
 import json
+import itertools
 from pathlib import Path
 import shutil
 import sys
@@ -166,7 +167,7 @@ class AlignmentTests(unittest.TestCase):
         for value in (0,True,float('nan')):
             with self.assertRaises(ValueError):trajectory_options({'pose_trajectory':{'max_gap_s':value}})
 
-    def exercise_clean(self,mode):
+    def exercise_clean(self,mode,preview=False,compact_preview=False):
         with tempfile.TemporaryDirectory() as tmp:
             d=Path(tmp);frames=d/'keyframe_clouds';frames.mkdir()
             times=[.8,1.,1.2];poses=[[t,x,0,0,0,0,0,1] for t,x in zip(times,[0,.06,.12])]
@@ -179,26 +180,63 @@ class AlignmentTests(unittest.TestCase):
             world=cloud.copy();world['x']+=.06;vr.write_pcd(d/'global.pcd',header,world)
             (frames/'index.csv').write_text('id,timestamp,file\n0,1,0.pcd\n')
             originals={name:(d/name).read_bytes() for name in (*DENSE_FILES,'keyframes.txt','global.pcd','keyframe_clouds/0.pcd')}
-            cfg=config();cfg['clean_mode']=mode;path=d/'cfg.yaml';path.write_text(yaml.safe_dump(cfg))
+            cfg=config();cfg['clean_mode']=mode
+            if preview:cfg['rviz_max_points']=1
+            if compact_preview:
+                cfg['storage'].update(write_global_clean=False,write_removed_points=False)
+                cfg['semantic_evidence']['write_uncertain']=False
+            path=d/'cfg.yaml';path.write_text(yaml.safe_dump(cfg))
             tr=load_trajectory(d,cfg,vr.Trajectory)
             views=[(t,tr.pose(t),np.zeros((32,32,3),np.uint8),None) for t in times]
             masks=np.zeros((1,32,32),bool);masks[0,14:19,14:19]=True
             pred=ScoredInstances(masks,[2],[.9])
+            events=[]
+            def published(name,xyz):
+                xyz=np.asarray(xyz)
+                self.assertLessEqual(len(xyz),cfg['rviz_max_points'])
+                self.assertTrue(np.isfinite(xyz).all())
+                running=not any((d/'clean_diagnostics').glob('*/summary.json'))
+                events.append((name,len(xyz),running))
+            def published_view(t,pose,voter,image):
+                self.assertFalse(any((d/'clean_diagnostics').glob('*/summary.json')))
+                self.assertGreater(voter.views,0)
+                self.assertEqual(image.shape,(32,32,3))
+                events.append(('overlay',0,True))
+            publisher=SimpleNamespace(publish_trajectory=lambda _:events.append(('trajectory',0,True)),
+                publish_cloud=published,publish_view=published_view,
+                spin=lambda:events.append(('spin',0,False)))
+            clock=itertools.count(step=1.2)
             with patch.dict(sys.modules,{'ultralytics':SimpleNamespace(YOLO=lambda _:SimpleNamespace(task='segment'))}), \
+                 patch.dict(sys.modules,{'clean_map_rviz':SimpleNamespace(RvizPublisher=lambda **kwargs:publisher)}), \
                  patch.object(vr,'iterate_views',return_value=views), \
                  patch.object(vr.VehicleVoter,'infer_mask',return_value=(pred,1)), \
-                 patch.object(vr,'estimate_floor',return_value=np.full(2,-1.)):
-                if mode=='keyframes':run_keyframe_clean(SimpleNamespace(map=tmp,bag='unused',device='cpu',no_cache=True,rviz=False),cfg,'imu_v2')
+                 patch.object(vr,'estimate_floor',return_value=np.full(2,-1.)), \
+                 patch('clean_map_keyframes.time.monotonic',side_effect=lambda:next(clock)):
+                if mode=='keyframes':run_keyframe_clean(SimpleNamespace(map=tmp,bag='unused',device='cpu',no_cache=True,rviz=preview),cfg,'imu_v2')
                 else:
                     with patch.object(sys,'argv',['clean','--map',tmp,'--bag','unused','--config',str(path)]):vr.main()
             run=next((d/'clean_diagnostics').iterdir());output=run if mode=='keyframes' else d
-            removed=vr.read_pcd(output/'global_vehicles.pcd')[1]
-            self.assertEqual(len(removed),1);self.assertEqual(float(removed['intensity'][0]),7)
-            self.assertAlmostEqual(float(removed['x'][0]),.06,places=6)
+            if compact_preview:
+                for name in ('global_clean.pcd','global_vehicles.pcd','global_uncertain.pcd'):
+                    self.assertFalse((output/name).exists())
+                cleaned=vr.read_pcd(output/'keyframe_clouds/0.pcd')[1]
+                self.assertEqual(len(cleaned),2)
+                self.assertEqual(float(cleaned['intensity'][0]),9)
+            else:
+                removed=vr.read_pcd(output/'global_vehicles.pcd')[1]
+                self.assertEqual(len(removed),1);self.assertEqual(float(removed['intensity'][0]),7)
+                self.assertAlmostEqual(float(removed['x'][0]),.06,places=6)
             report=json.loads((run/'summary.json').read_text());self.assertEqual(report['trajectory']['source'],'dense')
+            self.assertEqual(report['removed_points'],1)
             rows=list(csv.DictReader((run/'views.csv').read_text().splitlines()))
             self.assertEqual({r['pose_source'] for r in rows},{'dense'})
             self.assertEqual({name:(d/name).read_bytes() for name in originals},originals)
+            if preview:
+                self.assertIn(('raw',1,True),events)
+                self.assertIn(('overlay',0,True),events)
+                self.assertIn(('clean',1,False),events)
+                self.assertIn(('vehicles',1,False),events)
+                self.assertEqual(events[-1][0],'spin')
             if mode=='keyframes':
                 reloaded=load_trajectory(run,cfg,vr.Trajectory);self.assertEqual(reloaded.source,'dense')
                 copied=d.parent/(d.name+'_copy')
@@ -210,6 +248,12 @@ class AlignmentTests(unittest.TestCase):
     def test_map_and_keyframe_clean_keep_dense_contract_and_originals(self):
         for mode in ('map','keyframes'):
             with self.subTest(mode=mode):self.exercise_clean(mode)
+
+    def test_keyframe_rviz_publishes_before_completion_with_bounded_clouds(self):
+        self.exercise_clean('keyframes',preview=True)
+
+    def test_compact_keyframe_rviz_does_not_need_global_output_files(self):
+        self.exercise_clean('keyframes',preview=True,compact_preview=True)
 
     def test_static_projection_known_offset_and_fair_common_coverage(self):
         with tempfile.TemporaryDirectory() as tmp:

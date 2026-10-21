@@ -126,10 +126,39 @@ def run_keyframe_clean(args, cfg, frame_contract):
     print(f'Keyframe mode: {len(entries)} frames; image window=±{window:.2f}s; '
           f'active limit={max_active}; output={run_dir}', flush=True)
     active, finished, output = {}, set(), {}
-    previews = {'clean': [], 'vehicles': []}
+    previews = {'raw': [], 'clean': [], 'vehicles': []}
     preview_budget = max(1, int(cfg.get('rviz_max_points', 300000)))
     frame_stride = max(1, int(np.ceil(len(entries)/preview_budget)))
     frame_budget = max(1, preview_budget//max(1, int(np.ceil(len(entries)/frame_stride))))
+    viz = None
+    if args.rviz:
+        from clean_map_rviz import RvizPublisher
+        viz = RvizPublisher(max_points=preview_budget)
+        viz.publish_trajectory(traj)
+        print('RViz live preview enabled: raw=visited frames; clean/vehicles=finished frames; '
+              'overlay=current projected view', flush=True)
+    last_preview = last_view_preview = -np.inf
+
+    def add_preview(name, index, xyz):
+        if viz is None or index % frame_stride or not len(xyz):
+            return
+        sample = np.linspace(0, len(xyz)-1, min(len(xyz), frame_budget), dtype=np.intp)
+        # Own a small array; do not retain an entire active frame through a slice.
+        previews[name].append(np.asarray(xyz[sample], dtype=np.float32))
+
+    def publish_preview(force=False):
+        nonlocal last_preview
+        if viz is None:
+            return
+        now = time.monotonic()
+        if not force and now-last_preview < 2.0:
+            return
+        for name, chunks in previews.items():
+            sample = np.concatenate(chunks) if chunks else np.empty((0, 3), np.float32)
+            viz.publish_cloud(name, sample)
+        last_preview = now
+
+    publish_preview(force=True)
     stats = dict(frames=len(entries), frames_with_votes=0, frames_without_views=0,
                  floor_unknown_frames=0, retained_points=0, removed_points=0,
                  invalid_points=0, selected_images=0, point_view_votes=0)
@@ -162,6 +191,7 @@ def run_keyframe_clean(args, cfg, frame_contract):
         pose = traj.keyframes.pose(entries[index][1])
         world = xyz[finite] @ pose[:3, :3].T + pose[:3, 3]
         voter = vr.VehicleVoter(cfg, world, model, args.device)
+        add_preview('raw', index, world)
         return header, cloud, finite, world, voter
 
     def finish(index, state):
@@ -215,11 +245,9 @@ def run_keyframe_clean(args, cfg, frame_contract):
                                 'uncertain': 'global_uncertain.pcd'}[name]
                     output[name] = PcdStream(run_dir / filename, header)
                 output[name].append(world_cloud[selection])
-            elif name in previews and args.rviz and index % frame_stride == 0:
-                selected = world[selection]
-                if len(selected):
-                    sample = np.linspace(0, len(selected)-1, min(len(selected), frame_budget), dtype=np.intp)
-                    previews[name].append(selected[sample])
+        if viz is not None:
+            add_preview('clean', index, world[~remove])
+            add_preview('vehicles', index, world[remove])
         stats['retained_points'] += int((~remove).sum())
         stats['removed_points'] += int(remove.sum())
         stats['invalid_points'] += int((~finite).sum())
@@ -242,6 +270,7 @@ def run_keyframe_clean(args, cfg, frame_contract):
                 raise RuntimeError('Too many simultaneous keyframes. Reduce max_image_dt_s or '
                                    'increase max_active_frames only if memory permits.')
             masks = None
+            preview_voter, preview_dt = None, np.inf
             def shared_masks(image):
                 nonlocal masks
                 if masks is None:
@@ -256,6 +285,8 @@ def run_keyframe_clean(args, cfg, frame_contract):
                 voter.vehicle_mask = shared_masks
                 before = time.monotonic()
                 count = voter.add_view(pose, image, depth)
+                if count is not None and abs(aligned_t-entries[i][1]) < preview_dt:
+                    preview_voter, preview_dt = voter, abs(aligned_t-entries[i][1])
                 view_writer.writerow(dict(timestamp=t, keyframe_id=entries[i][0],
                     keyframe_dt_s=aligned_t-entries[i][1], **timing_stats(traj, t, cfg),
                     status='no_projection' if count is None else 'voted',
@@ -268,6 +299,11 @@ def run_keyframe_clean(args, cfg, frame_contract):
                     cv2.imwrite(str(run_dir / f'overlay_{overlays:03d}.jpg'),
                                 vr.make_overlay(voter, image, t, traj))
                     overlays += 1
+            now = time.monotonic()
+            if viz is not None and preview_voter is not None and now-last_view_preview >= 1.0:
+                viz.publish_view(t, pose, preview_voter, image)
+                last_view_preview = now
+            publish_preview()
             stats['selected_images'] += 1
             if stats['selected_images'] == 1 or stats['selected_images'] % 20 == 0:
                 print(f'keyframe clean: images={stats["selected_images"]}, '
@@ -304,37 +340,7 @@ def run_keyframe_clean(args, cfg, frame_contract):
               f'{stats["removed_points"]}/'
               f'{stats["retained_points"] + stats["removed_points"]} points removed', flush=True)
         if args.rviz:
-            # Display each final cloud sequentially; publisher bounds message size.
-            from clean_map_rviz import RvizPublisher
-            viz = RvizPublisher(max_points=int(cfg.get('rviz_max_points', 300000)))
-            viz.publish_trajectory(traj)
-            for topic, name in [('clean', 'global_clean.pcd'), ('vehicles', 'global_vehicles.pcd')]:
-                # Our rebuilt files are uncompressed binary. Sample through mmap; do not
-                # load a potentially huge concatenated map just for an RViz preview.
-                path = run_dir / name
-                if topic not in output:
-                    sample = np.concatenate(previews[topic]) if previews[topic] else np.empty((0,3))
-                    viz.publish_cloud(topic, sample[:preview_budget])
-                    continue
-                with path.open('rb') as stream:
-                    while True:
-                        line = stream.readline()
-                        if not line:
-                            raise ValueError('Missing rebuilt PCD header')
-                        if line.startswith(b'DATA '):
-                            offset = stream.tell()
-                            break
-                count = output[topic].count
-                if count:
-                    points = np.memmap(path, mode='r', dtype=output[topic].dtype,
-                                       offset=offset, shape=(count,))
-                    stride = max(1, int(np.ceil(count / int(cfg.get('rviz_max_points', 300000)))))
-                    sample = points[::stride]
-                    xyz = np.column_stack([sample['x'], sample['y'], sample['z']])
-                    viz.publish_cloud(topic, xyz)
-                    del sample, points
-                else:
-                    viz.publish_cloud(topic, np.empty((0, 3)))
+            publish_preview(force=True)
             print('RViz final clouds ready; Ctrl+C to exit', flush=True)
             viz.spin()
     finally:
