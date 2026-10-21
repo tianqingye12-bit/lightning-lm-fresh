@@ -8,7 +8,8 @@ from scipy.sparse.csgraph import connected_components
 DEFAULTS = dict(enabled=False, link_m=0.25, seed_link_m=0.35,
                 padding_m=0.60, max_seed_distance_m=0.60,
                 min_seeds=6, max_candidates=20000, max_groups=2000,
-                max_extent_m=[7.0, 7.0, 3.0], background_ratio=0.20)
+                max_extent_m=[7.0, 7.0, 3.0], background_ratio=0.20,
+                visible_negative_veto=True)
 
 
 def options(cfg):
@@ -20,6 +21,8 @@ def options(cfg):
     result = dict(DEFAULTS, **supplied)
     if not isinstance(result['enabled'], bool):
         raise ValueError('seed_local_cleanup.enabled must be boolean')
+    if not isinstance(result['visible_negative_veto'], bool):
+        raise ValueError('visible_negative_veto must be boolean')
     for key in ('link_m', 'seed_link_m', 'padding_m', 'max_seed_distance_m'):
         value = result[key]
         if isinstance(value, bool) or not isinstance(value, (float, int)) or not np.isfinite(value) or not 0 < value <= 1:
@@ -60,8 +63,10 @@ def complete(xyz, seeds, visible, positive, background, floor, cfg, spatial_inde
         return output, report
     # In legacy mode background[] is absent evidence (all zero). Repeated visible
     # non-vehicle observations provide a conservative veto as well.
-    veto = (np.asarray(background) > 0) | ((visible >= cfg['min_views']) &
-            (positive / np.maximum(visible, 1) <= opts['background_ratio']))
+    veto = np.asarray(background) > 0
+    if opts['visible_negative_veto']:
+        veto |= ((visible >= cfg['min_views']) &
+                 (positive / np.maximum(visible, 1) <= opts['background_ratio']))
     report['background_veto_voxels'] = int(veto.sum())
     seed_ids = np.flatnonzero(output & ~floor & ~veto)
     if not len(seed_ids):
