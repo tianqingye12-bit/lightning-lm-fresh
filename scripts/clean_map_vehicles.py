@@ -39,6 +39,7 @@ from segmentation_quality import (ScoredInstances, quality_options, instance_cac
                                   associate_scored_instances, accepted_instances)
 from pose_trajectory import load_trajectory, trajectory_options
 from cross_keyframe_semantics import cross_frame_options
+from legacy_map_cleanup import legacy_enabled,associate_legacy,legacy_votes
 
 PCD_TYPES = {('F', 4): 'f4', ('F', 8): 'f8', ('U', 1): 'u1', ('U', 2): 'u2', ('U', 4): 'u4',
              ('I', 1): 'i1', ('I', 2): 'i2', ('I', 4): 'i4'}
@@ -289,6 +290,7 @@ class VehicleVoter:
         self.cache = None
         self.last_stats = {}
         self.collect_world_evidence = cross_frame_options(cfg)['enabled']
+        self.legacy = legacy_enabled(cfg)
 
     def vehicle_mask(self, image):
         key = self.cache.key(image) if self.cache is not None else None
@@ -369,7 +371,12 @@ class VehicleVoter:
             scene = np.where(np.isfinite(dimg), dimg, scene)
 
         masks, n_obj = self.vehicle_mask(image)
-        if self.quality['enabled']:
+        if self.legacy:
+            is_vehicle,mask=associate_legacy(masks,scene,u,v,z,self.cfg)
+            background=np.zeros(len(z),bool)
+            scores=np.zeros(len(z),float)
+            accepted_objects,confidence_sum=n_obj,0.
+        elif self.quality['enabled']:
             is_vehicle, background, mask, scores = associate_scored_instances(masks, scene, u, v, z, visible, self.cfg)
             self.score_sum[near[visible & is_vehicle]] += scores[visible & is_vehicle]
             accepted_objects = int(accepted_instances(masks, self.cfg).sum())
@@ -508,6 +515,9 @@ def main():
     mode = args.mode or cfg.get('clean_mode', 'map')
     if mode not in ('map', 'keyframes'):
         raise ValueError('clean_mode must be map or keyframes')
+    legacy=legacy_enabled(cfg)
+    if legacy and (mode!='map' or evidence['enabled'] or quality['enabled'] or cross_options['enabled']):
+        parser.error('legacy_map_cleanup requires map mode and disabled extra semantic/quality/cross-frame gates')
     if mode != 'keyframes' and cross_options['enabled']:
         parser.error('cross_keyframe_semantics requires keyframes mode')
     if mode != 'keyframes' and (args.output is not None or args.export_global or args.compact_result or args.global_voxel_size):
@@ -615,9 +625,12 @@ def main():
 
     print('Voting finished; estimating floor and growing vehicle components...', flush=True)
     floor = centroids[:, 2] < estimate_floor(centroids, traj) + cfg['floor_keep']
-    observed, remove, uncertain, evidence_counts = decide(
-        voter.visible, voter.vehicle, voter.background, cfg, voter.baseline, floor,
-        positive_score=getattr(voter, 'score_sum', None))
+    if legacy:
+        observed,remove,uncertain,evidence_counts=legacy_votes(voter.visible,voter.vehicle,floor,cfg)
+    else:
+        observed, remove, uncertain, evidence_counts = decide(
+            voter.visible, voter.vehicle, voter.background, cfg, voter.baseline, floor,
+            positive_score=getattr(voter, 'score_sum', None))
     by_voxel = int(remove.sum())
 
     car_comp = np.zeros(0, bool)
@@ -637,8 +650,8 @@ def main():
         lim = np.concatenate([np.sort(lim[:2])[::-1], lim[2:]])
         car_comp = (obs_cnt >= cfg['cluster_min_observed']) & \
                    (veh_cnt >= cfg['cluster_vehicle_ratio'] * obs_cnt) & (ext <= lim).all(axis=1)
-        # Never grow into voxels with enough observations that explicitly voted for background.
-        growth = car_comp[label] & (~observed[above] | remove[above]) & (voter.background[above] == 0)
+        # Historical mode grows the whole bounded component; modern mode vetoes background.
+        growth = car_comp[label] if legacy else car_comp[label] & (~observed[above] | remove[above]) & (voter.background[above] == 0)
         remove[above[growth]] = True
     uncertain &= ~remove
     evidence_counts['removed'] = int(remove.sum())
@@ -668,6 +681,7 @@ def main():
                    elapsed_seconds=time.monotonic()-start, overlays_written=overlays,
                    config=cfg, with_depth=with_depth, invalid_points=int((~finite).sum()))
     summary.update(trajectory=traj.description, pose_queries=traj.query_stats)
+    summary['legacy_map_cleanup']=legacy
     (diagnostic_dir / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
     if viz is not None:
         viz.publish_cloud('clean', xyz[finite & ~drop])
