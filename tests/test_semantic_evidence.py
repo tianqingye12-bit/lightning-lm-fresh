@@ -111,6 +111,7 @@ class EvidenceTests(unittest.TestCase):
             masks=np.zeros((1,32,32),bool);masks[0,16,16]=True
             model=SimpleNamespace(task='segment')
             args=SimpleNamespace(map=tmp,bag='unused',device='cpu',no_cache=True,rviz=False)
+            args.output=d/'clean_diagnostics'/'keyframes_result'
             floor_kw={'side_effect':RuntimeError('floor')} if floor_unknown else {'return_value':np.array([-1.,-1.])}
             with patch.dict(sys.modules,{'ultralytics':SimpleNamespace(YOLO=lambda _:model)}), \
                  patch.object(vr,'iterate_views',return_value=views), \

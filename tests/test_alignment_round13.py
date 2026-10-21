@@ -167,7 +167,7 @@ class AlignmentTests(unittest.TestCase):
         for value in (0,True,float('nan')):
             with self.assertRaises(ValueError):trajectory_options({'pose_trajectory':{'max_gap_s':value}})
 
-    def exercise_clean(self,mode,preview=False,compact_preview=False):
+    def exercise_clean(self,mode,preview=False,compact_preview=False,export_global=False):
         with tempfile.TemporaryDirectory() as tmp:
             d=Path(tmp);frames=d/'keyframe_clouds';frames.mkdir()
             times=[.8,1.,1.2];poses=[[t,x,0,0,0,0,0,1] for t,x in zip(times,[0,.06,.12])]
@@ -212,13 +212,26 @@ class AlignmentTests(unittest.TestCase):
                  patch.object(vr.VehicleVoter,'infer_mask',return_value=(pred,1)), \
                  patch.object(vr,'estimate_floor',return_value=np.full(2,-1.)), \
                  patch('clean_map_keyframes.time.monotonic',side_effect=lambda:next(clock)):
-                if mode=='keyframes':run_keyframe_clean(SimpleNamespace(map=tmp,bag='unused',device='cpu',no_cache=True,rviz=preview),cfg,'imu_v2')
+                if mode=='keyframes':
+                    result_path=d/'clean_diagnostics'/'keyframes_result'
+                    if export_global:
+                        with patch.object(sys,'argv',['clean','--map',tmp,'--bag','unused','--config',str(path),
+                            '--output',str(result_path),'--export-global','--rviz']):vr.main()
+                    else:
+                        run_keyframe_clean(SimpleNamespace(map=tmp,bag='unused',device='cpu',no_cache=True,
+                            rviz=preview,output=result_path),cfg,'imu_v2')
                 else:
                     with patch.object(sys,'argv',['clean','--map',tmp,'--bag','unused','--config',str(path)]):vr.main()
             run=next((d/'clean_diagnostics').iterdir());output=run if mode=='keyframes' else d
             if compact_preview:
-                for name in ('global_clean.pcd','global_vehicles.pcd','global_uncertain.pcd'):
+                for name in ('global_vehicles.pcd','global_uncertain.pcd'):
                     self.assertFalse((output/name).exists())
+                self.assertEqual((output/'global_clean.pcd').exists(),export_global)
+                if export_global:
+                    complete_cloud=vr.read_pcd(output/'global_clean.pcd')[1]
+                    self.assertEqual(len(complete_cloud),1)
+                    self.assertAlmostEqual(float(complete_cloud['x'][0]),1.06,places=6)
+                    self.assertEqual(float(complete_cloud['intensity'][0]),9)
                 cleaned=vr.read_pcd(output/'keyframe_clouds/0.pcd')[1]
                 self.assertEqual(len(cleaned),2)
                 self.assertEqual(float(cleaned['intensity'][0]),9)
@@ -228,6 +241,9 @@ class AlignmentTests(unittest.TestCase):
                 self.assertAlmostEqual(float(removed['x'][0]),.06,places=6)
             report=json.loads((run/'summary.json').read_text());self.assertEqual(report['trajectory']['source'],'dense')
             self.assertEqual(report['removed_points'],1)
+            if mode=='keyframes':
+                self.assertFalse((run/'INCOMPLETE').exists())
+                self.assertEqual(Path(report['output_directory']),run.resolve())
             rows=list(csv.DictReader((run/'views.csv').read_text().splitlines()))
             self.assertEqual({r['pose_source'] for r in rows},{'dense'})
             self.assertEqual({name:(d/name).read_bytes() for name in originals},originals)
@@ -254,6 +270,9 @@ class AlignmentTests(unittest.TestCase):
 
     def test_compact_keyframe_rviz_does_not_need_global_output_files(self):
         self.exercise_clean('keyframes',preview=True,compact_preview=True)
+
+    def test_cli_output_and_global_export_override_compact_without_changing_cleaning(self):
+        self.exercise_clean('keyframes',preview=True,compact_preview=True,export_global=True)
 
     def test_static_projection_known_offset_and_fair_common_coverage(self):
         with tempfile.TemporaryDirectory() as tmp:

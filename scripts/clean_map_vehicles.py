@@ -2,7 +2,8 @@
 """离线实例分割去车：累计地图投票或逐关键帧清理重建。
 
 --mode keyframes 使用 keyframe_clouds/index.csv 和版本2坐标约定；
-输出路径及限制见 doc/INSTANCE_CLEANUP_ROUND6.md。
+结果默认保存在输入地图旁的 <map>_clean 目录；--output 可指定目录，
+--export-global 可额外导出完整 global_clean.pcd。见 doc/CLEAN_MAP_OUTPUT.md。
 
 SLAM 用完整点云建图，结束后用 SaveMap 导出的 global.pcd + keyframes.txt，
 回放 bag 中的彩色图 (和对齐深度图)，YOLO 分割车辆，把地图体素投影到每个视角投票：
@@ -14,7 +15,8 @@ SLAM 用完整点云建图，结束后用 SaveMap 导出的 global.pcd + keyfram
 用法:
   python3 scripts/clean_map_vehicles.py --map data/garage --bag <bag目录或.bag> \
       --config config/garage_clean.yaml [--rviz]
-输出: <map>/global_clean.pcd, <map>/global_vehicles.pcd (被删除的点, 用于检查)
+map 模式输出: <map>/global_clean.pcd, <map>/global_vehicles.pcd。
+keyframes 模式输出: <map>_clean/keyframe_clouds/ 和配套位姿，完整 PCD 按配置/参数导出。
 """
 import argparse
 import csv
@@ -476,10 +478,14 @@ def main():
     parser.add_argument('--config', default='config/garage_clean.yaml')
     parser.add_argument('--device', default=None, help='YOLO 设备, 如 cpu / 0')
     parser.add_argument('--rviz', action='store_true',
-                        help='RViz preview: map mode live; keyframe mode final sampled clouds')
+                        help='Live RViz preview with bounded sampled clouds')
     parser.add_argument('--mode', choices=['map', 'keyframes'], default=None,
                         help='map: existing map voting; keyframes: clean saved frames and rebuild')
     parser.add_argument('--no-cache', action='store_true', help='Disable segmentation cache')
+    parser.add_argument('--output', type=Path,
+                        help='Keyframe result directory; default: next to input as <map>_clean (numbered if present)')
+    parser.add_argument('--export-global', action='store_true',
+                        help='Keyframe mode: also write a complete global_clean.pcd, overriding compact storage')
     args = parser.parse_args()
     with open(args.config) as config_file:
         cfg = yaml.safe_load(config_file)
@@ -490,6 +496,8 @@ def main():
     mode = args.mode or cfg.get('clean_mode', 'map')
     if mode not in ('map', 'keyframes'):
         raise ValueError('clean_mode must be map or keyframes')
+    if mode != 'keyframes' and (args.output is not None or args.export_global):
+        parser.error('--output and --export-global require --mode keyframes or clean_mode: keyframes')
     map_dir = Path(args.map)
     T_imu_lidar, frame_contract = load_frame_contract(map_dir)
     cfg['_T_imu_lidar'] = T_imu_lidar.tolist()

@@ -17,6 +17,7 @@ from semantic_evidence import decide, evidence_options, timing_stats, report_sem
 from clean_map_runtime import ViewSelector, file_digest
 from map_storage import storage_options, compress_pcd, require_compressor
 from pose_trajectory import load_trajectory, DENSE_FILES
+from clean_map_output import create_output_directory
 
 
 def load_manifest(directory, traj):
@@ -85,6 +86,8 @@ def run_keyframe_clean(args, cfg, frame_contract):
         raise ValueError('Keyframe rebuilding requires a version-2 IMU-frame map')
     evidence = evidence_options(cfg)
     storage = storage_options(cfg)
+    if getattr(args, 'export_global', False):
+        storage['write_global_clean'] = True
     if storage['compress_keyframes']:
         require_compressor()
     directory = Path(args.map)
@@ -118,13 +121,16 @@ def run_keyframe_clean(args, cfg, frame_contract):
                         width=cfg['width'], height=cfg['height'], retina_masks=True)
         inference.cache = instance_cache(cfg.get('cache', {}).get('directory') or
                                          directory / '.vehicle_mask_cache', identity, cfg)
-    diagnostic_root = directory / 'clean_diagnostics'
-    diagnostic_root.mkdir(exist_ok=True)
-    run_dir = Path(tempfile.mkdtemp(prefix='keyframes_', dir=diagnostic_root))
+    run_dir = create_output_directory(directory, getattr(args, 'output', None))
     clean_dir = run_dir / 'keyframe_clouds'
     clean_dir.mkdir()
     print(f'Keyframe mode: {len(entries)} frames; image window=±{window:.2f}s; '
           f'active limit={max_active}; output={run_dir}', flush=True)
+    print(f'Clean map output directory: {run_dir}', flush=True)
+    if storage['write_global_clean']:
+        print(f'Full cleaned map after completion: {run_dir / "global_clean.pcd"}', flush=True)
+    else:
+        print('Compact map: all cleaned keyframes and poses; add --export-global for one full PCD.', flush=True)
     active, finished, output = {}, set(), {}
     previews = {'raw': [], 'clean': [], 'vehicles': []}
     preview_budget = max(1, int(cfg.get('rviz_max_points', 300000)))
@@ -334,11 +340,17 @@ def run_keyframe_clean(args, cfg, frame_contract):
                      selection=selector.stats, coordinate_contract=frame_contract,
                      source='retained_keyframes', overlapping_frame_points_retained=True)
         stats.update(trajectory=traj.description, pose_queries=traj.query_stats)
+        stats.update(output_directory=str(run_dir), input_map=str(directory.resolve()))
+        (run_dir/'pose_failures.json').write_text(json.dumps(traj.failure_samples,indent=2,allow_nan=False)+'\n')
         (run_dir / 'summary.json').write_text(json.dumps(stats, indent=2) + '\n')
+        (run_dir / 'INCOMPLETE').unlink()
         print(f'Finished: cleaned frames={clean_dir}; world_cloud={storage["write_global_clean"]}; '
               f'removed_debug={storage["write_removed_points"]}; '
               f'{stats["removed_points"]}/'
               f'{stats["retained_points"] + stats["removed_points"]} points removed', flush=True)
+        print(f'Clean map saved to: {run_dir}', flush=True)
+        if storage['write_global_clean']:
+            print(f'Full cleaned map: {run_dir / "global_clean.pcd"}', flush=True)
         if args.rviz:
             publish_preview(force=True)
             print('RViz final clouds ready; Ctrl+C to exit', flush=True)

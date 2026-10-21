@@ -142,7 +142,8 @@ class QualityTests(unittest.TestCase):
                  patch.object(vr,'components',side_effect=AssertionError('must not grow')), \
                  patch.object(vr,'load_frame_contract',return_value=(np.eye(4),'imu_v2')):
                 if mode=='keyframes':
-                    run_keyframe_clean(SimpleNamespace(map=tmp,bag='unused',device='cpu',no_cache=True,rviz=False),cfg,'imu_v2')
+                    run_keyframe_clean(SimpleNamespace(map=tmp,bag='unused',device='cpu',no_cache=True,rviz=False,
+                        output=d/'clean_diagnostics'/'keyframes_result'),cfg,'imu_v2')
                 else:
                     with patch.object(sys,'argv',['clean','--map',tmp,'--bag','unused','--config',str(file)]):vr.main()
             run=next((d/'clean_diagnostics').iterdir());output=run if mode=='keyframes' else d

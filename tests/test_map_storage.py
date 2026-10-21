@@ -51,6 +51,7 @@ class StorageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp); source,original=self.source(root)
             cfg=self.config(); args=SimpleNamespace(map=str(source),bag='unused',device='cpu',no_cache=True,rviz=True)
+            args.output=source/'clean_diagnostics'/'keyframes_result'
             image=np.zeros((32,32,3),np.uint8)
             views=[(t,np.eye(4),image,None) for t in [.8,1,1.2]]
             clouds={}
