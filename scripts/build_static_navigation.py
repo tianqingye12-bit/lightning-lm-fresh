@@ -5,6 +5,7 @@ Use a NEW output directory. The source is never modified. Disk-backed voxel aggr
 bounds point-buffer memory; the compiled grid renderer processes one cleaned frame at a time.
 """
 import argparse
+from contextlib import ExitStack
 import json
 import math
 from pathlib import Path
@@ -19,7 +20,8 @@ import yaml
 
 from clean_map_runtime import load_frame_contract
 from clean_map_keyframes import load_manifest
-from clean_map_vehicles import PCD_TYPES, Trajectory
+from clean_map_vehicles import PCD_TYPES, Trajectory, read_pcd
+from map_storage import compress_pcd
 
 TILE_SIZE = 100.0  # Must match TiledMap::Options and Pos2Grid in the existing loader.
 OUTPUT_DTYPE = np.dtype([('x', '<f4'), ('y', '<f4'), ('z', '<f4'), ('intensity', '<f4'), ('time', '<f8')])
@@ -67,7 +69,7 @@ def binary_blocks(path, block_points=100000):
         yield points[begin:begin + block_points]
 
 
-def aggregate_tiles(source, database, resolution):
+def aggregate_tiles(source, database, resolution, blocks=None):
     if not math.isfinite(resolution) or not .02 <= resolution <= .2:
         raise ValueError('localization resolution must be in [0.02, 0.2] metres')
     database.execute('PRAGMA cache_size=-16384')  # 16 MiB SQLite page cache; temp tables use disk.
@@ -81,7 +83,7 @@ def aggregate_tiles(source, database, resolution):
         n=n+excluded.n, sx=sx+excluded.sx, sy=sy+excluded.sy,
         sz=sz+excluded.sz, si=si+excluded.si, st=st+excluded.st'''
     total, invalid = 0, 0
-    for block in binary_blocks(source):
+    for block in (binary_blocks(source) if blocks is None else blocks):
         xyz = np.column_stack([block[axis] for axis in ('x', 'y', 'z')]).astype(float)
         finite = np.isfinite(xyz).all(axis=1)
         invalid += int((~finite).sum())
@@ -112,12 +114,16 @@ def aggregate_tiles(source, database, resolution):
     return dict(input_points=total, invalid_points=invalid)
 
 
-def export_tiles(database, output, start):
+def export_tiles(database, output, start, keep_global=True, compress_tiles=False):
     count = database.execute('SELECT count(*) FROM voxels').fetchone()[0]
     tiles = list(database.execute('SELECT tx,ty,count(*) FROM voxels GROUP BY tx,ty ORDER BY tx,ty'))
-    with (output / 'index.txt').open('x') as index, (output / 'global.pcd').open('xb') as full:
+    compressed, compression_skipped = 0, 0
+    with ExitStack() as stack:
+        index = stack.enter_context((output / 'index.txt').open('x'))
+        full = stack.enter_context((output / 'global.pcd').open('xb')) if keep_global else None
         index.write('0 0 0\n')
-        full.write(pcd_header(count))
+        if full is not None:
+            full.write(pcd_header(count))
         for tile_id, (tx, ty, size) in enumerate(tiles):
             filename = f'{tile_id}.pcd'
             index.write(f'{tile_id} {tx} {ty} {filename}\n')
@@ -131,9 +137,32 @@ def export_tiles(database, output, start):
                     points = np.array([tuple(row) for row in rows], dtype=OUTPUT_DTYPE)
                     body = points.tobytes()
                     tile.write(body)
-                    full.write(body)
+                    if full is not None:
+                        full.write(body)
+            if compress_tiles:
+                result = compress_pcd(output / filename)
+                compressed += result['status'] == 'compressed'
+                compression_skipped += result['status'] == 'over_budget'
         index.write('# functional points\nstart ' + ' '.join(f'{float(x):.17g}' for x in start) + '\n')
-    return dict(output_points=count, tiles=len(tiles), tile_size=TILE_SIZE)
+    return dict(output_points=count, tiles=len(tiles), tile_size=TILE_SIZE,
+                global_pcd_written=keep_global, compressed_tiles=compressed,
+                compression_over_budget_tiles=compression_skipped)
+
+
+def world_keyframe_blocks(entries, traj):
+    """Transform one retained frame at a time; no concatenated global_clean PCD required."""
+    for i, (_, timestamp, path) in enumerate(entries):
+        _, cloud = read_pcd(path)
+        pose = traj.pose(timestamp)
+        xyz = np.column_stack([cloud[axis] for axis in ('x','y','z')]).astype(float)
+        world = xyz @ pose[:3,:3].T + pose[:3,3]
+        block = np.zeros(len(cloud), dtype=OUTPUT_DTYPE)
+        for axis, values in zip(('x','y','z'), world.T):
+            block[axis] = values
+        for name in ('intensity','time'):
+            if name in cloud.dtype.names:
+                block[name] = cloud[name]
+        yield block
 
 
 def validate_navigation_config(config):
@@ -156,7 +185,7 @@ def validate_navigation_config(config):
         raise ValueError('g2p5.max_grid_cells must be a nonnegative integer')
 
 
-def build(source, config_path, output, grid_tool):
+def build(source, config_path, output, grid_tool, keep_global=True, compress_tiles=False):
     source, output = Path(source).resolve(), Path(output).resolve()
     config_path, grid_tool = Path(config_path).resolve(), Path(grid_tool).resolve()
     if output == source or source in output.parents or output in source.parents:
@@ -219,8 +248,14 @@ def build(source, config_path, output, grid_tool):
                 cell_counts['free_cells'] += int((pixels == 255).sum())
                 cell_counts['unknown_cells'] += int(((pixels != 0) & (pixels != 255)).sum())
         with sqlite3.connect(work / 'voxels.sqlite3') as database:
-            stats = aggregate_tiles(source / 'global_clean.pcd', database, resolution)
-            stats.update(export_tiles(database, output, [*traj.p[0], *traj.q[0]]))
+            use_frames = not (source / 'global_clean.pcd').is_file()
+            if use_frames and summary.get('global_clean_written', True):
+                raise ValueError('Source reports a global cloud but the file is missing')
+            blocks = world_keyframe_blocks(entries, traj) if use_frames else None
+            stats = aggregate_tiles(source / 'global_clean.pcd', database, resolution, blocks=blocks)
+            stats.update(export_tiles(database, output, [*traj.p[0], *traj.q[0]],
+                                      keep_global=keep_global, compress_tiles=compress_tiles))
+            stats['aggregation_source'] = 'cleaned_keyframes' if use_frames else 'global_clean.pcd'
     for name in ('keyframes.txt', 'map_frames.yaml'):
         shutil.copy2(source / name, output / name)
     local_config = yaml.safe_load(config_path.read_text())
@@ -247,9 +282,12 @@ def main():
     parser.add_argument('--source', required=True, type=Path, help='Round-6 clean_diagnostics/keyframes_* directory')
     parser.add_argument('--config', required=True, type=Path, help='Your validated sensor/G2P5 configuration')
     parser.add_argument('--output', required=True, type=Path, help='A NEW separate navigation-map directory')
+    parser.add_argument('--keep-global', action='store_true', help='Also write duplicated global.pcd for viewing')
+    parser.add_argument('--no-compress', action='store_true', help='Skip PCL lossless tile compression')
     parser.add_argument('--grid-tool', type=Path, default=Path(__file__).resolve().parents[1] / 'bin/build_navigation_grid')
     args = parser.parse_args()
-    build(args.source, args.config, args.output, args.grid_tool)
+    build(args.source, args.config, args.output, args.grid_tool,
+          keep_global=args.keep_global, compress_tiles=not args.no_compress)
 
 
 if __name__ == '__main__':

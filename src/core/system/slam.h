@@ -87,6 +87,7 @@ class SlamSystem {
     size_t runtime_frames_ = 0;
     std::atomic<bool> input_fault_{false};
 
+    bool save_global_pcd_ = true, save_localization_tiles_ = true, compress_keyframes_ = true;
     float localization_export_resolution_ = 0.1f;
     bool export_keyframe_clouds_ = false;  // opt-in disk export for offline frame cleaning
     Options options_;

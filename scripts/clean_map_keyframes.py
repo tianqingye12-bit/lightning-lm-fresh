@@ -14,6 +14,7 @@ import time
 import numpy as np
 from clean_map_instances import InstanceMaskCache, removal_votes
 from clean_map_runtime import ViewSelector, file_digest
+from map_storage import storage_options, compress_pcd, require_compressor
 
 
 def load_manifest(directory, traj):
@@ -80,6 +81,9 @@ def run_keyframe_clean(args, cfg, frame_contract):
     import clean_map_vehicles as vr
     if frame_contract != 'imu_v2':
         raise ValueError('Keyframe rebuilding requires a version-2 IMU-frame map')
+    storage = storage_options(cfg)
+    if storage['compress_keyframes']:
+        require_compressor()
     directory = Path(args.map)
     traj = vr.Trajectory(directory / 'keyframes.txt', cfg['max_kf_gap'])
     entries = load_manifest(directory, traj)  # Fail before loading/downloading any model.
@@ -117,7 +121,11 @@ def run_keyframe_clean(args, cfg, frame_contract):
     clean_dir.mkdir()
     print(f'Keyframe mode: {len(entries)} frames; image window=±{window:.2f}s; '
           f'active limit={max_active}; output={run_dir}', flush=True)
-    active, finished, output = {}, set(), None
+    active, finished, output = {}, set(), {}
+    previews = {'clean': [], 'vehicles': []}
+    preview_budget = max(1, int(cfg.get('rviz_max_points', 300000)))
+    frame_stride = max(1, int(np.ceil(len(entries)/preview_budget)))
+    frame_budget = max(1, preview_budget//max(1, int(np.ceil(len(entries)/frame_stride))))
     stats = dict(frames=len(entries), frames_with_votes=0, frames_without_views=0,
                  floor_unknown_frames=0, retained_points=0, removed_points=0,
                  invalid_points=0, selected_images=0, point_view_votes=0)
@@ -155,16 +163,29 @@ def run_keyframe_clean(args, cfg, frame_contract):
                 stats['floor_unknown_frames'] += 1
         drop = np.zeros(len(cloud), bool)
         drop[finite] = remove
-        vr.write_pcd(clean_dir / f'{entries[index][0]}.pcd', header, cloud, ~drop)
+        frame_path = clean_dir / f'{entries[index][0]}.pcd'
+        vr.write_pcd(frame_path, header, cloud, ~drop)
+        if storage['compress_keyframes']:
+            compress_pcd(frame_path)
         # Frame files remain in IMU coordinates; only rebuilt visualization clouds are world-frame.
-        world_cloud = cloud[finite].copy()
-        for axis, value in zip(('x', 'y', 'z'), world.T):
-            world_cloud[axis] = value
-        if output is None:
-            output = (PcdStream(run_dir / 'global_clean.pcd', header),
-                      PcdStream(run_dir / 'global_vehicles.pcd', header))
-        output[0].append(world_cloud[~remove])
-        output[1].append(world_cloud[remove])
+        world_cloud = None
+        if storage['write_global_clean'] or storage['write_removed_points']:
+            world_cloud = cloud[finite].copy()
+            for axis, value in zip(('x', 'y', 'z'), world.T):
+                world_cloud[axis] = value
+        for name, enabled, selection in (
+                ('clean', storage['write_global_clean'], ~remove),
+                ('vehicles', storage['write_removed_points'], remove)):
+            if enabled:
+                if name not in output:
+                    filename = 'global_clean.pcd' if name == 'clean' else 'global_vehicles.pcd'
+                    output[name] = PcdStream(run_dir / filename, header)
+                output[name].append(world_cloud[selection])
+            elif args.rviz and index % frame_stride == 0:
+                selected = world[selection]
+                if len(selected):
+                    sample = np.linspace(0, len(selected)-1, min(len(selected), frame_budget), dtype=np.intp)
+                    previews[name].append(selected[sample])
         stats['retained_points'] += int((~remove).sum())
         stats['removed_points'] += int(remove.sum())
         stats['invalid_points'] += int((~finite).sum())
@@ -217,18 +238,21 @@ def run_keyframe_clean(args, cfg, frame_contract):
                 finish(i, active.pop(i) if i in active else load(i))
         if stats['selected_images'] == 0:
             raise RuntimeError('No usable temporally matched images; no final map published')
-        for stream in output:
+        for stream in output.values():
             stream.finish()
         # Copy the coordinate/pose contract for retained IMU-frame clouds.
         shutil.copy2(directory / 'keyframe_clouds/index.csv', clean_dir / 'index.csv')
         shutil.copy2(directory / 'keyframes.txt', run_dir / 'keyframes.txt')
         shutil.copy2(directory / 'map_frames.yaml', run_dir / 'map_frames.yaml')
-        stats.update(overlays_written=overlays, elapsed_seconds=time.monotonic()-started, config=cfg,
+        stats.update(storage=storage, global_clean_written=storage['write_global_clean'],
+                     removed_cloud_written=storage['write_removed_points'], overlays_written=overlays,
+                     elapsed_seconds=time.monotonic()-started, config=cfg,
                      selection=selector.stats, coordinate_contract=frame_contract,
                      source='retained_keyframes', overlapping_frame_points_retained=True)
         (run_dir / 'summary.json').write_text(json.dumps(stats, indent=2) + '\n')
-        print(f'Finished: clean={run_dir / "global_clean.pcd"}; '
-              f'removed={run_dir / "global_vehicles.pcd"}; stats={stats["removed_points"]}/'
+        print(f'Finished: cleaned frames={clean_dir}; world_cloud={storage["write_global_clean"]}; '
+              f'removed_debug={storage["write_removed_points"]}; '
+              f'{stats["removed_points"]}/'
               f'{stats["retained_points"] + stats["removed_points"]} points removed', flush=True)
         if args.rviz:
             # Display each final cloud sequentially; publisher bounds message size.
@@ -239,6 +263,10 @@ def run_keyframe_clean(args, cfg, frame_contract):
                 # Our rebuilt files are uncompressed binary. Sample through mmap; do not
                 # load a potentially huge concatenated map just for an RViz preview.
                 path = run_dir / name
+                if topic not in output:
+                    sample = np.concatenate(previews[topic]) if previews[topic] else np.empty((0,3))
+                    viz.publish_cloud(topic, sample[:preview_budget])
+                    continue
                 with path.open('rb') as stream:
                     while True:
                         line = stream.readline()
@@ -247,9 +275,9 @@ def run_keyframe_clean(args, cfg, frame_contract):
                         if line.startswith(b'DATA '):
                             offset = stream.tell()
                             break
-                count = output[0].count if topic == 'clean' else output[1].count
+                count = output[topic].count
                 if count:
-                    points = np.memmap(path, mode='r', dtype=output[0].dtype,
+                    points = np.memmap(path, mode='r', dtype=output[topic].dtype,
                                        offset=offset, shape=(count,))
                     stride = max(1, int(np.ceil(count / int(cfg.get('rviz_max_points', 300000)))))
                     sample = points[::stride]
@@ -261,6 +289,5 @@ def run_keyframe_clean(args, cfg, frame_contract):
             print('RViz final clouds ready; Ctrl+C to exit', flush=True)
             viz.spin()
     finally:
-        if output is not None:
-            for stream in output:
-                stream.close()
+        for stream in output.values():
+            stream.close()

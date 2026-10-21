@@ -2,6 +2,8 @@
 
 基线：master `fd2a721`，已包含前六轮。分支 `codex/navigation-detail-round7`。本轮不改变已验证的 IMU 预测限时、配准算法或相机标定；没有承诺厘米级实际定位精度。
 
+> 第八轮存储更新：新生成配置默认采用精简保存，导航转换默认省略重复global.pcd。需要完整文件时使用 `--storage-profile full` 和 `--keep-global`。最新步骤见 `MAP_STORAGE_ROUND8.md`；旧配置不自动改变。
+
 ## 改动
 
 1. 原 SaveMap 的 `map.yaml` 分辨率固定写成 0.05，现改为写入实际 OccupancyGrid 分辨率和原点/yaw，PGM 按 ROS→图像的上下方向转换。共享保存函数同时用于在线导出和新的离线转换。若旧地图实际为 0.20 m/格却被写成 0.05，则旧 YAML 的尺度有误；不能通过缩放点云修复。应从原地图重新导出，并确认当时实际生成分辨率。
