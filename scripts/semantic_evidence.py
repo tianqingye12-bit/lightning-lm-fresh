@@ -43,9 +43,11 @@ class PositiveBaseline:
         self.maximum[indices] = np.maximum(self.maximum[indices], distance)
 
 
-def decide(visible, positive, background, cfg, baseline, protected=None):
+def decide(visible, positive, background, cfg, baseline, protected=None, positive_score=None):
     from clean_map_instances import association_options, removal_votes
+    from segmentation_quality import quality_options
     options = evidence_options(cfg)
+    quality = quality_options(cfg)
     observed, candidate = removal_votes(visible, positive, background, cfg)
     coverage = (positive + background) / np.maximum(visible, 1)
     coverage_ok = coverage >= options['min_classified_ratio']
@@ -57,6 +59,16 @@ def decide(visible, positive, background, cfg, baseline, protected=None):
     remove = candidate.copy()
     if options['enabled']:
         remove &= coverage_ok & baseline_ok
+    confidence_ok = np.ones(len(visible), bool)
+    if quality['enabled']:
+        score = np.asarray(positive_score, dtype=float)
+        if score.shape != positive.shape or not np.isfinite(score).all() or np.any(score < 0) or np.any(score > positive + 1e-4*np.maximum(positive, 1)):
+            raise ValueError('Confidence sums must be finite, nonnegative, and <= positive view counts')
+        mean_confidence = score / np.maximum(positive, 1)
+        weighted_ratio = score / np.maximum(score + background, 1e-12)
+        confidence_ok = ((mean_confidence >= quality['min_mean_confidence']) &
+                         (weighted_ratio >= cfg['vehicle_ratio']))
+        remove &= confidence_ok  # Minimum view count and the raw background veto still apply.
     protected = np.zeros(len(visible), bool) if protected is None else np.asarray(protected, bool)
     remove &= ~protected
     assoc = association_options(cfg)
@@ -68,7 +80,8 @@ def decide(visible, positive, background, cfg, baseline, protected=None):
                   background=int((confirmed_background & ~protected & ~remove).sum()),
                   uncertain=int(unknown.sum()), unobserved=int((visible == 0).sum()),
                   blocked_coverage=int((candidate & ~coverage_ok).sum()) if options['enabled'] else 0,
-                  blocked_baseline=int((candidate & ~baseline_ok).sum()) if options['enabled'] else 0)
+                  blocked_baseline=int((candidate & ~baseline_ok).sum()) if options['enabled'] else 0,
+                  blocked_confidence=int((candidate & ~confidence_ok).sum()) if quality['enabled'] else 0)
     return observed, remove, unknown, counts
 
 
@@ -85,4 +98,5 @@ def timing_stats(traj, timestamp, cfg):
 def report_semantics():
     return dict(uncertain_retained=True, classes_are_not_motion_labels=True,
                 baseline_definition='max camera translation from first positive observation',
+                confidence_is_not_calibrated_probability=True,
                 point_counts_are_not_accuracy_metrics=True)

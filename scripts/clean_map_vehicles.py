@@ -31,8 +31,10 @@ import numpy as np
 import yaml
 
 from clean_map_runtime import ViewSelector, file_digest, load_frame_contract, rigid_transform
-from clean_map_instances import InstanceMaskCache, associate_instances, association_options, removal_votes
+from clean_map_instances import associate_instances, association_options
 from semantic_evidence import PositiveBaseline, decide, evidence_options, timing_stats, report_semantics
+from segmentation_quality import (ScoredInstances, quality_options, instance_cache,
+                                  associate_scored_instances, accepted_instances)
 
 PCD_TYPES = {('F', 4): 'f4', ('F', 8): 'f8', ('U', 1): 'u1', ('U', 2): 'u2', ('U', 4): 'u4',
              ('I', 1): 'i1', ('I', 2): 'i2', ('I', 4): 'i4'}
@@ -275,6 +277,8 @@ class VehicleVoter:
         self.visible = np.zeros(len(centroids), np.int32)
         self.vehicle = np.zeros(len(centroids), np.int32)
         self.background = np.zeros(len(centroids), np.int32)
+        self.quality = quality_options(cfg)
+        self.score_sum = np.zeros(len(centroids), np.float32) if self.quality['enabled'] else None
         association_options(cfg)
         self.baseline = PositiveBaseline(len(centroids), cfg)
         self.views = 0
@@ -299,20 +303,28 @@ class VehicleVoter:
         if r.masks is None:
             if r.boxes is not None and len(r.boxes):
                 raise RuntimeError('Detections have no segmentation masks; use a compatible -seg model')
-            return np.empty((0, self.h, self.w), bool), 0
+            empty = np.empty((0, self.h, self.w), bool)
+            return (ScoredInstances(empty, [], []) if self.quality['enabled'] else empty), 0
         masks = r.masks.data.cpu().numpy()
         if masks.ndim != 3:
             raise RuntimeError('YOLO masks must be NxHxW')
-        if masks.shape[1:] != (self.h, self.w):
+        if len(masks) and masks.shape[1:] != (self.h, self.w):
             masks = np.stack([cv2.resize(mask, (self.w, self.h),
                                         interpolation=cv2.INTER_NEAREST) for mask in masks])
+        if not len(masks):
+            masks = np.empty((0, self.h, self.w), bool)
+        if self.quality['enabled']:
+            if r.boxes is None or not hasattr(r.boxes, 'cls') or not hasattr(r.boxes, 'conf'):
+                raise RuntimeError('Scored segmentation requires aligned boxes.cls and boxes.conf')
+            return ScoredInstances(masks > .5, r.boxes.cls.cpu().numpy(), r.boxes.conf.cpu().numpy()), len(masks)
         return masks > 0.5, len(masks)
 
     def add_view(self, T_world_lidar, image, depth):
         if image.shape[:2] != (self.h, self.w):
             raise RuntimeError(f'Image {image.shape[1]}x{image.shape[0]} != calibration {self.w}x{self.h}')
         self.last_stats = dict(projected=0, visible=0, occluded=0, vehicle_votes=0,
-                               background_votes=0, unknown_votes=0, objects=0)
+                               background_votes=0, unknown_votes=0, objects=0,
+                               accepted_objects=0, positive_confidence_sum=0.)
         T = self.T_cam_lidar @ np.linalg.inv(T_world_lidar)
         rng = self.cfg['max_range']
         near = np.asarray(self.spatial_index.query_ball_point(
@@ -351,7 +363,14 @@ class VehicleVoter:
             scene = np.where(np.isfinite(dimg), dimg, scene)
 
         masks, n_obj = self.vehicle_mask(image)
-        is_vehicle, background, mask = associate_instances(masks, scene, u, v, z, visible, self.cfg)
+        if self.quality['enabled']:
+            is_vehicle, background, mask, scores = associate_scored_instances(masks, scene, u, v, z, visible, self.cfg)
+            self.score_sum[near[visible & is_vehicle]] += scores[visible & is_vehicle]
+            accepted_objects = int(accepted_instances(masks, self.cfg).sum())
+            confidence_sum = float(scores[visible & is_vehicle].sum())
+        else:
+            is_vehicle, background, mask = associate_instances(masks, scene, u, v, z, visible, self.cfg)
+            accepted_objects, confidence_sum = n_obj, 0.
         self.visible[near[visible]] += 1
         self.vehicle[near[visible & is_vehicle]] += 1
         self.baseline.update(near[visible & is_vehicle], np.linalg.inv(T)[:3, 3])
@@ -363,7 +382,8 @@ class VehicleVoter:
                                occluded=int((~visible).sum()),
                                vehicle_votes=int((visible & is_vehicle).sum()),
                                background_votes=int((visible & background).sum()),
-                               unknown_votes=int((visible & ~is_vehicle & ~background).sum()), objects=n_obj)
+                               unknown_votes=int((visible & ~is_vehicle & ~background).sum()), objects=n_obj,
+                               accepted_objects=accepted_objects, positive_confidence_sum=confidence_sum)
         return n_obj
 
 
@@ -460,6 +480,7 @@ def main():
         cfg = yaml.safe_load(config_file)
     association_options(cfg)
     evidence = evidence_options(cfg)
+    quality = quality_options(cfg)
     mode = args.mode or cfg.get('clean_mode', 'map')
     if mode not in ('map', 'keyframes'):
         raise ValueError('clean_mode must be map or keyframes')
@@ -505,7 +526,7 @@ def main():
                         torch=importlib.metadata.version('torch'), device=args.device,
                         conf=cfg['yolo_conf'], classes=cfg['vehicle_classes'],
                         width=cfg['width'], height=cfg['height'], retina_masks=True)
-        voter.cache = InstanceMaskCache(cache_options.get('directory') or map_dir / '.vehicle_mask_cache', identity)
+        voter.cache = instance_cache(cache_options.get('directory') or map_dir / '.vehicle_mask_cache', identity, cfg)
     viz = None
     if args.rviz:
         from clean_map_rviz import RvizPublisher
@@ -526,7 +547,8 @@ def main():
     with open(diagnostic_dir / 'views.csv', 'w', newline='') as stream:
         columns = ['timestamp', 'status', 'objects', 'projected', 'visible', 'occluded',
                    'vehicle_votes', 'background_votes', 'unknown_votes', 'depth', 'seconds',
-                   'aligned_timestamp', 'nearest_keyframe_dt_s', 'pose_bracket_gap_s']
+                   'aligned_timestamp', 'nearest_keyframe_dt_s', 'pose_bracket_gap_s',
+                   'accepted_objects', 'positive_confidence_sum']
         writer = csv.DictWriter(stream, fieldnames=columns)
         writer.writeheader()
         for t, pose, image, depth in iterate_views(args.bag, cfg, traj, selector):
@@ -562,11 +584,12 @@ def main():
     print('Voting finished; estimating floor and growing vehicle components...', flush=True)
     floor = centroids[:, 2] < estimate_floor(centroids, traj) + cfg['floor_keep']
     observed, remove, uncertain, evidence_counts = decide(
-        voter.visible, voter.vehicle, voter.background, cfg, voter.baseline, floor)
+        voter.visible, voter.vehicle, voter.background, cfg, voter.baseline, floor,
+        positive_score=getattr(voter, 'score_sum', None))
     by_voxel = int(remove.sum())
 
     car_comp = np.zeros(0, bool)
-    if not evidence['enabled']:
+    if not evidence['enabled'] and not quality['enabled']:
         above = np.nonzero(~floor)[0]
         label = components(centroids[above], cfg['cluster_voxel'])
         n_comp = int(label.max()) + 1 if len(label) else 0
@@ -602,7 +625,7 @@ def main():
     print(f'removed {drop.sum()}/{len(cloud)} points -> {map_dir / "global_clean.pcd"}')
     cache = getattr(voter, 'cache', None)
     summary = dict(evidence=evidence_counts, evidence_units="voxels",
-                   semantics=report_semantics(), cluster_growth_enabled=not evidence["enabled"],
+                   semantics=report_semantics(), cluster_growth_enabled=not evidence["enabled"] and not quality['enabled'],
                    uncertain_cloud_written=evidence["write_uncertain"],
                    coordinate_contract=frame_contract, views=voter.views,
                    selection=selector.stats, no_projection=no_projection,

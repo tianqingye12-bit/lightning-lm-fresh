@@ -12,7 +12,7 @@ import tempfile
 import time
 
 import numpy as np
-from clean_map_instances import InstanceMaskCache
+from segmentation_quality import instance_cache
 from semantic_evidence import decide, evidence_options, timing_stats, report_semantics
 from clean_map_runtime import ViewSelector, file_digest
 from map_storage import storage_options, compress_pcd, require_compressor
@@ -114,8 +114,8 @@ def run_keyframe_clean(args, cfg, frame_contract):
                         conf=cfg['yolo_conf'], classes=cfg['vehicle_classes'],
                         imgsz=int(cfg.get('yolo_imgsz', 640)), max_det=100,
                         width=cfg['width'], height=cfg['height'], retina_masks=True)
-        inference.cache = InstanceMaskCache(cfg.get('cache', {}).get('directory') or
-                                            directory / '.vehicle_mask_cache', identity)
+        inference.cache = instance_cache(cfg.get('cache', {}).get('directory') or
+                                         directory / '.vehicle_mask_cache', identity, cfg)
     diagnostic_root = directory / 'clean_diagnostics'
     diagnostic_root.mkdir(exist_ok=True)
     run_dir = Path(tempfile.mkdtemp(prefix='keyframes_', dir=diagnostic_root))
@@ -137,14 +137,14 @@ def run_keyframe_clean(args, cfg, frame_contract):
     frame_file = (run_dir / 'frames.csv').open('w', newline='')
     frame_columns = ['keyframe_id', 'timestamp', 'views', 'invalid_points', 'floor_unknown',
                      'total', 'removed', 'protected', 'background', 'uncertain', 'unobserved',
-                     'blocked_coverage', 'blocked_baseline']
+                     'blocked_coverage', 'blocked_baseline', 'blocked_confidence']
     frame_writer = csv.DictWriter(frame_file, fieldnames=frame_columns)
     frame_writer.writeheader()
     view_file = (run_dir / 'views.csv').open('w', newline='')
     view_columns = ['timestamp', 'keyframe_id', 'keyframe_dt_s', 'aligned_timestamp',
                     'nearest_keyframe_dt_s', 'pose_bracket_gap_s', 'status', 'objects',
                     'projected', 'visible', 'occluded', 'vehicle_votes', 'background_votes',
-                    'unknown_votes', 'depth', 'seconds']
+                    'unknown_votes', 'depth', 'seconds', 'accepted_objects', 'positive_confidence_sum']
     view_writer = csv.DictWriter(view_file, fieldnames=view_columns)
     view_writer.writeheader()
     diagnostics = cfg.get('diagnostics', {})
@@ -163,7 +163,8 @@ def run_keyframe_clean(args, cfg, frame_contract):
     def finish(index, state):
         nonlocal output
         header, cloud, finite, world, voter = state
-        _, remove, _, _ = decide(voter.visible, voter.vehicle, voter.background, cfg, voter.baseline)
+        _, remove, _, _ = decide(voter.visible, voter.vehicle, voter.background, cfg, voter.baseline,
+                                positive_score=voter.score_sum)
         protected = np.zeros(len(world), bool)
         floor_unknown = False
         stats['frames_with_votes'] += int(voter.views > 0)
@@ -181,7 +182,7 @@ def run_keyframe_clean(args, cfg, frame_contract):
                 floor_unknown = True
                 stats['floor_unknown_frames'] += 1
         _, remove, uncertain, counts = decide(voter.visible, voter.vehicle, voter.background,
-                                               cfg, voter.baseline, protected)
+                                               cfg, voter.baseline, protected, positive_score=voter.score_sum)
         for key, value in counts.items():
             decision_counts[key] = decision_counts.get(key, 0) + value
         frame_writer.writerow(dict(keyframe_id=entries[index][0], timestamp=entries[index][1],

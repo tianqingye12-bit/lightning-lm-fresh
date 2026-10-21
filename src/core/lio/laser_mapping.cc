@@ -130,6 +130,18 @@ bool LaserMapping::LoadParamsFromYAML(const std::string &yaml_file) {
             return false;
         }
 
+        const auto registration = yaml["fasterlio"]["registration_quality"];
+        if (registration && !registration.IsMap()) throw std::invalid_argument("registration_quality must be a map");
+        if (registration) {
+            auto& quality = options_.registration_quality_;
+            quality.balance = registration["balance"].as<bool>(false);
+            quality.max_constraints = registration["max_constraints"].as<int>(3000);
+            quality.diagnostics = registration["diagnostics"].as<bool>(false);
+            quality.rotation_scale_m = registration["rotation_scale_m"].as<double>(5.0);
+            quality.relative_eigenvalue = registration["relative_eigenvalue"].as<double>(1e-3);
+        }
+        if (!options_.registration_quality_.Valid()) throw std::invalid_argument("invalid registration_quality options");
+
         const auto detail = yaml["fasterlio"]["map_detail"];
         if (detail && !detail.IsMap()) {
             LOG(ERROR) << "fasterlio.map_detail must be a map";
@@ -192,6 +204,10 @@ bool LaserMapping::LoadParamsFromYAML(const std::string &yaml_file) {
               << " neighbor_m=" << options_.surface_support_.max_neighbor_distance
               << " residual_m=" << options_.surface_support_.max_plane_residual
               << " tangent_gap_m=" << options_.surface_support_.max_tangent_gap;
+    LOG(INFO) << "[registration_quality] balance=" << options_.registration_quality_.balance
+              << " max_constraints_per_term=" << options_.registration_quality_.max_constraints
+              << " diagnostics=" << options_.registration_quality_.diagnostics
+              << " rotation_scale_m=" << options_.registration_quality_.rotation_scale_m;
     LOG(INFO) << "feature quality: pca=" << options_.plane_quality_.enabled
               << " min_spread=" << options_.plane_quality_.min_spread
               << " tangent_ratio=" << options_.plane_quality_.min_tangent_ratio
@@ -488,6 +504,9 @@ bool LaserMapping::Run() {
     // kf_.ChangeX(pred_state);
 
     feature_stats_ = features::FeatureStats{};
+    registration_diagnostic_ = features::RegistrationDiagnostic{};
+    surface_candidates_ = icp_candidates_ = 0;
+    icp_used_ = 0;
     const bool update_accepted = Measure(runtime_stats_, RuntimeStats::registration,
         [&] { return kf_.Update(ESKF::ObsType::LIDAR, 1.0); });
 
@@ -496,6 +515,15 @@ bool LaserMapping::Run() {
         feature_stats_scan_count_ % options_.feature_stats_interval_ == 0) {
         LOG(INFO) << "[features] scan=" << feature_stats_scan_count_ << " update_accepted=" << update_accepted
                   << " " << feature_stats_.Summary();
+        if (options_.registration_quality_.balance || options_.registration_quality_.diagnostics) {
+            LOG(INFO) << "[registration_quality] scan=" << feature_stats_scan_count_
+                      << " plane=" << effect_feat_surf_ << "/" << surface_candidates_
+                      << " point_icp=" << icp_used_ << "/" << icp_candidates_
+                      << " plane_info_valid=" << registration_diagnostic_.valid
+                      << " plane_rank=" << registration_diagnostic_.rank
+                      << " min_max=" << registration_diagnostic_.min_max_ratio
+                      << " weak_t_world_Lrot_body=" << registration_diagnostic_.weakest.transpose();
+        }
     }
 
     state_point_ = kf_.GetX();
@@ -894,6 +922,8 @@ void LaserMapping::ObsModel(NavState &s, ESKF::CustomObservationModel &obs) {
     // Each worker writes one enum element; aggregate only after the parallel loop.
     std::vector<features::PlaneStatus> match_status(cnt_pts, features::PlaneStatus::InsufficientNeighbors);
     feature_stats_ = features::FeatureStats{};
+    registration_diagnostic_ = features::RegistrationDiagnostic{};
+    icp_used_ = 0;
 
     std::vector<size_t> index(cnt_pts);
     for (size_t i = 0; i < index.size(); ++i) {
@@ -977,13 +1007,48 @@ void LaserMapping::ObsModel(NavState &s, ESKF::CustomObservationModel &obs) {
         },
         "    ObsModel (Lidar Match)");
 
+    // Preserve geometric rejection statistics before applying the optional budget.
+    std::vector<std::size_t> surface_ids, icp_ids;
+    std::vector<int> surface_bins, icp_bins;
+    surface_candidates_ = icp_candidates_ = 0;
+    const Eigen::Matrix3d R_lw = (s.rot_.matrix() * offset_R_lidar_fixed_).transpose();
+    for (int i = 0; i < cnt_pts; ++i) {
+        feature_stats_.Record(match_status[i]);
+        if (point_selected_surf_[i]) {
+            ++surface_candidates_;
+            if (options_.registration_quality_.balance) {
+                surface_ids.push_back(i);
+                surface_bins.push_back(features::PlaneBin(scan_down_body_->points[i].getVector3fMap().cast<double>(),
+                    R_lw * plane_coef_[i].head<3>().cast<double>()));
+            }
+        }
+        if (options_.enable_icp_part_ && point_selected_icp_[i]) {
+            ++icp_candidates_;
+            if (options_.registration_quality_.balance) {
+                icp_ids.push_back(i);
+                const Eigen::Vector3d point = scan_down_body_->points[i].getVector3fMap().cast<double>();
+                icp_bins.push_back(point_selected_surf_[i]
+                    ? features::PlaneBin(point, R_lw * plane_coef_[i].head<3>().cast<double>())
+                    : 24 + features::AzimuthBin(point));
+            }
+        }
+    }
+    if (options_.registration_quality_.balance) {
+        // Point ICP has a separate budget; non-planar edge matches use azimuth-only buckets.
+        std::fill(point_selected_surf_.begin(), point_selected_surf_.end(), false);
+        std::fill(point_selected_icp_.begin(), point_selected_icp_.end(), false);
+        for (const auto j : features::BalancedIndices(surface_bins, options_.registration_quality_.max_constraints))
+            point_selected_surf_[surface_ids[j]] = true;
+        for (const auto j : features::BalancedIndices(icp_bins, options_.registration_quality_.max_constraints))
+            point_selected_icp_[icp_ids[j]] = true;
+    }
+
     effect_feat_surf_ = 0;
     effect_feat_icp_ = 0;
 
     corr_pts_.resize(cnt_pts);
     corr_norm_.resize(cnt_pts);
     for (int i = 0; i < cnt_pts; i++) {
-        feature_stats_.Record(match_status[i]);
         if (point_selected_surf_[i]) {
             corr_norm_[effect_feat_surf_] = plane_coef_[i];
             corr_pts_[effect_feat_surf_] = scan_down_body_->points[i].getVector4fMap();
@@ -1060,6 +1125,14 @@ void LaserMapping::ObsModel(NavState &s, ESKF::CustomObservationModel &obs) {
         obs.HTr_ += JTr[i] * options_.plane_icp_weight_;
     }
 
+    if (options_.registration_quality_.diagnostics) {
+        // Exclude the IMU prior and point-to-point ICP, which can hide plane degeneracy.
+        Mat6d plane_information = Mat6d::Zero();
+        for (const auto& term : JTJ) plane_information += term;
+        registration_diagnostic_ = features::AnalyzePlaneInformation(
+            plane_information, feature_stats_.weight_sum, options_.registration_quality_);
+    }
+
     if (!res_sq.empty()) {
         std::sort(res_sq.begin(), res_sq.end());
         obs.lidar_residual_mean_ = res_sq[res_sq.size() / 2];
@@ -1114,6 +1187,7 @@ void LaserMapping::ObsModel(NavState &s, ESKF::CustomObservationModel &obs) {
             }
             obs.HTH_ += JTJ[i] * options_.icp_weight_;
             obs.HTr_ += JTr[i] * options_.icp_weight_;
+            ++icp_used_;
         }
     }
 }
