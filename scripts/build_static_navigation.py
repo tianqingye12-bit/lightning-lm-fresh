@@ -193,6 +193,8 @@ def build(source, config_path, output, grid_tool, keep_global=True, compress_til
     if output.exists():
         raise FileExistsError(f'Refusing to overwrite existing output: {output}')
     summary = json.loads((source / 'summary.json').read_text())
+    if summary.get('result_layout') == 'global_only':
+        raise ValueError('Frame-based navigation rebuilding needs saved keyframes; use a result created without --compact-result')
     if summary.get('source') != 'retained_keyframes':
         raise ValueError('Expected a completed round-6 keyframe-cleaning run, not an old map-mode result')
     if not grid_tool.is_file():

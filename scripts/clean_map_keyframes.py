@@ -16,6 +16,10 @@ from segmentation_quality import instance_cache
 from semantic_evidence import decide, evidence_options, timing_stats, report_semantics
 from clean_map_runtime import ViewSelector, file_digest
 from map_storage import storage_options, compress_pcd, require_compressor
+from pose_trajectory import load_trajectory, DENSE_FILES
+from clean_map_output import create_output_directory
+from audit_clean_map import vote_diagnostics
+from voxel_pcd_stream import VoxelPcdStream
 
 
 def load_manifest(directory, traj):
@@ -84,10 +88,24 @@ def run_keyframe_clean(args, cfg, frame_contract):
         raise ValueError('Keyframe rebuilding requires a version-2 IMU-frame map')
     evidence = evidence_options(cfg)
     storage = storage_options(cfg)
-    if storage['compress_keyframes']:
+    compact_result = getattr(args, 'compact_result', False)
+    global_voxel_size = getattr(args, 'global_voxel_size', 0.)
+    if compact_result and global_voxel_size == 0:
+        global_voxel_size = .1
+    if not np.isfinite(global_voxel_size) or (global_voxel_size != 0 and not .02 <= global_voxel_size <= .3):
+        raise ValueError('global_voxel_size must be zero or in [0.02, 0.3] metres')
+    if compact_result:
+        storage.update(write_global_clean=True,write_removed_points=False)
+        evidence['write_uncertain']=False
+    if global_voxel_size:
+        storage['write_global_clean']=True
+    if getattr(args, 'export_global', False):
+        storage['write_global_clean'] = True
+    if storage['compress_keyframes'] and not compact_result:
         require_compressor()
     directory = Path(args.map)
-    traj = vr.Trajectory(directory / 'keyframes.txt', cfg['max_kf_gap'])
+    traj = load_trajectory(directory, cfg, vr.Trajectory)
+    print(f'Image pose trajectory: {traj.source}; max gap={traj.max_gap}s', flush=True)
     entries = load_manifest(directory, traj)  # Fail before loading/downloading any model.
     options = cfg.get('keyframe_clean', {})
     window = float(options.get('max_image_dt_s', .35))
@@ -116,35 +134,71 @@ def run_keyframe_clean(args, cfg, frame_contract):
                         width=cfg['width'], height=cfg['height'], retina_masks=True)
         inference.cache = instance_cache(cfg.get('cache', {}).get('directory') or
                                          directory / '.vehicle_mask_cache', identity, cfg)
-    diagnostic_root = directory / 'clean_diagnostics'
-    diagnostic_root.mkdir(exist_ok=True)
-    run_dir = Path(tempfile.mkdtemp(prefix='keyframes_', dir=diagnostic_root))
+    run_dir = create_output_directory(directory, getattr(args, 'output', None))
     clean_dir = run_dir / 'keyframe_clouds'
-    clean_dir.mkdir()
+    if not compact_result:
+        clean_dir.mkdir()
     print(f'Keyframe mode: {len(entries)} frames; image window=±{window:.2f}s; '
           f'active limit={max_active}; output={run_dir}', flush=True)
+    print(f'Clean map output directory: {run_dir}', flush=True)
+    if storage['write_global_clean']:
+        print(f'Full cleaned map after completion: {run_dir / "global_clean.pcd"}', flush=True)
+    else:
+        print('Compact map: all cleaned keyframes and poses; add --export-global for one full PCD.', flush=True)
     active, finished, output = {}, set(), {}
-    previews = {'clean': [], 'vehicles': []}
+    previews = {'raw': [], 'clean': [], 'vehicles': []}
     preview_budget = max(1, int(cfg.get('rviz_max_points', 300000)))
     frame_stride = max(1, int(np.ceil(len(entries)/preview_budget)))
     frame_budget = max(1, preview_budget//max(1, int(np.ceil(len(entries)/frame_stride))))
+    viz = None
+    if args.rviz:
+        from clean_map_rviz import RvizPublisher
+        viz = RvizPublisher(max_points=preview_budget)
+        viz.publish_trajectory(traj)
+        print('RViz live preview enabled: raw=visited frames; clean/vehicles=finished frames; '
+              'overlay=current projected view', flush=True)
+    last_preview = last_view_preview = -np.inf
+
+    def add_preview(name, index, xyz):
+        if viz is None or index % frame_stride or not len(xyz):
+            return
+        sample = np.linspace(0, len(xyz)-1, min(len(xyz), frame_budget), dtype=np.intp)
+        # Own a small array; do not retain an entire active frame through a slice.
+        previews[name].append(np.asarray(xyz[sample], dtype=np.float32))
+
+    def publish_preview(force=False):
+        nonlocal last_preview
+        if viz is None:
+            return
+        now = time.monotonic()
+        if not force and now-last_preview < 2.0:
+            return
+        for name, chunks in previews.items():
+            sample = np.concatenate(chunks) if chunks else np.empty((0, 3), np.float32)
+            viz.publish_cloud(name, sample)
+        last_preview = now
+
+    publish_preview(force=True)
     stats = dict(frames=len(entries), frames_with_votes=0, frames_without_views=0,
                  floor_unknown_frames=0, retained_points=0, removed_points=0,
                  invalid_points=0, selected_images=0, point_view_votes=0)
     started = time.monotonic()
     overlays = 0
     decision_counts = {}
+    gate_counts = {}
     frame_file = (run_dir / 'frames.csv').open('w', newline='')
     frame_columns = ['keyframe_id', 'timestamp', 'views', 'invalid_points', 'floor_unknown',
                      'total', 'removed', 'protected', 'background', 'uncertain', 'unobserved',
-                     'blocked_coverage', 'blocked_baseline', 'blocked_confidence']
+                     'blocked_coverage', 'blocked_baseline', 'blocked_confidence',
+                     'positive_points','blocked_min_views','blocked_positive_views','blocked_background','blocked_floor']
     frame_writer = csv.DictWriter(frame_file, fieldnames=frame_columns)
     frame_writer.writeheader()
     view_file = (run_dir / 'views.csv').open('w', newline='')
     view_columns = ['timestamp', 'keyframe_id', 'keyframe_dt_s', 'aligned_timestamp',
                     'nearest_keyframe_dt_s', 'pose_bracket_gap_s', 'status', 'objects',
                     'projected', 'visible', 'occluded', 'vehicle_votes', 'background_votes',
-                    'unknown_votes', 'depth', 'seconds', 'accepted_objects', 'positive_confidence_sum']
+                    'unknown_votes', 'depth', 'seconds', 'accepted_objects', 'positive_confidence_sum',
+                    'pose_source', 'pose_status', 'nearest_pose_dt_s', 'keyframe_bracket_gap_s', 'pose_correction']
     view_writer = csv.DictWriter(view_file, fieldnames=view_columns)
     view_writer.writeheader()
     diagnostics = cfg.get('diagnostics', {})
@@ -155,9 +209,11 @@ def run_keyframe_clean(args, cfg, frame_contract):
         header, cloud = vr.read_pcd(entries[index][2])
         xyz = np.column_stack([cloud['x'], cloud['y'], cloud['z']]).astype(float)
         finite = np.isfinite(xyz).all(axis=1)
-        pose = traj.pose(entries[index][1])
+        # Saved frame clouds always use their exact optimized keyframe poses.
+        pose = traj.keyframes.pose(entries[index][1])
         world = xyz[finite] @ pose[:3, :3].T + pose[:3, 3]
         voter = vr.VehicleVoter(cfg, world, model, args.device)
+        add_preview('raw', index, world)
         return header, cloud, finite, world, voter
 
     def finish(index, state):
@@ -165,6 +221,7 @@ def run_keyframe_clean(args, cfg, frame_contract):
         header, cloud, finite, world, voter = state
         _, remove, _, _ = decide(voter.visible, voter.vehicle, voter.background, cfg, voter.baseline,
                                 positive_score=voter.score_sum)
+        pre_floor_remove=remove.copy()
         protected = np.zeros(len(world), bool)
         floor_unknown = False
         stats['frames_with_votes'] += int(voter.views > 0)
@@ -185,16 +242,19 @@ def run_keyframe_clean(args, cfg, frame_contract):
                                                cfg, voter.baseline, protected, positive_score=voter.score_sum)
         for key, value in counts.items():
             decision_counts[key] = decision_counts.get(key, 0) + value
+        gates=vote_diagnostics(voter.visible,voter.vehicle,voter.background,cfg,protected,pre_floor_remove)
+        for key,value in gates.items():gate_counts[key]=gate_counts.get(key,0)+value
         frame_writer.writerow(dict(keyframe_id=entries[index][0], timestamp=entries[index][1],
                                    views=voter.views, invalid_points=int((~finite).sum()),
-                                   floor_unknown=int(floor_unknown), **counts))
+                                   floor_unknown=int(floor_unknown), **counts, **gates))
         frame_file.flush()
         drop = np.zeros(len(cloud), bool)
         drop[finite] = remove
         frame_path = clean_dir / f'{entries[index][0]}.pcd'
-        vr.write_pcd(frame_path, header, cloud, ~drop)
-        if storage['compress_keyframes']:
-            compress_pcd(frame_path)
+        if not compact_result:
+            vr.write_pcd(frame_path, header, cloud, ~drop)
+            if storage['compress_keyframes']:
+                compress_pcd(frame_path)
         # Frame files remain in IMU coordinates; only rebuilt visualization clouds are world-frame.
         world_cloud = None
         if storage['write_global_clean'] or storage['write_removed_points'] or evidence['write_uncertain']:
@@ -209,13 +269,12 @@ def run_keyframe_clean(args, cfg, frame_contract):
                 if name not in output:
                     filename = {'clean': 'global_clean.pcd', 'vehicles': 'global_vehicles.pcd',
                                 'uncertain': 'global_uncertain.pcd'}[name]
-                    output[name] = PcdStream(run_dir / filename, header)
+                    output[name] = (VoxelPcdStream(run_dir / filename, header, global_voxel_size)
+                                    if name=='clean' and global_voxel_size else PcdStream(run_dir / filename, header))
                 output[name].append(world_cloud[selection])
-            elif name in previews and args.rviz and index % frame_stride == 0:
-                selected = world[selection]
-                if len(selected):
-                    sample = np.linspace(0, len(selected)-1, min(len(selected), frame_budget), dtype=np.intp)
-                    previews[name].append(selected[sample])
+        if viz is not None:
+            add_preview('clean', index, world[~remove])
+            add_preview('vehicles', index, world[remove])
         stats['retained_points'] += int((~remove).sum())
         stats['removed_points'] += int(remove.sum())
         stats['invalid_points'] += int((~finite).sum())
@@ -238,6 +297,7 @@ def run_keyframe_clean(args, cfg, frame_contract):
                 raise RuntimeError('Too many simultaneous keyframes. Reduce max_image_dt_s or '
                                    'increase max_active_frames only if memory permits.')
             masks = None
+            preview_voter, preview_dt = None, np.inf
             def shared_masks(image):
                 nonlocal masks
                 if masks is None:
@@ -252,6 +312,8 @@ def run_keyframe_clean(args, cfg, frame_contract):
                 voter.vehicle_mask = shared_masks
                 before = time.monotonic()
                 count = voter.add_view(pose, image, depth)
+                if count is not None and abs(aligned_t-entries[i][1]) < preview_dt:
+                    preview_voter, preview_dt = voter, abs(aligned_t-entries[i][1])
                 view_writer.writerow(dict(timestamp=t, keyframe_id=entries[i][0],
                     keyframe_dt_s=aligned_t-entries[i][1], **timing_stats(traj, t, cfg),
                     status='no_projection' if count is None else 'voted',
@@ -264,6 +326,11 @@ def run_keyframe_clean(args, cfg, frame_contract):
                     cv2.imwrite(str(run_dir / f'overlay_{overlays:03d}.jpg'),
                                 vr.make_overlay(voter, image, t, traj))
                     overlays += 1
+            now = time.monotonic()
+            if viz is not None and preview_voter is not None and now-last_view_preview >= 1.0:
+                viz.publish_view(t, pose, preview_voter, image)
+                last_view_preview = now
+            publish_preview()
             stats['selected_images'] += 1
             if stats['selected_images'] == 1 or stats['selected_images'] % 20 == 0:
                 print(f'keyframe clean: images={stats["selected_images"]}, '
@@ -277,9 +344,13 @@ def run_keyframe_clean(args, cfg, frame_contract):
         for stream in output.values():
             stream.finish()
         # Copy the coordinate/pose contract for retained IMU-frame clouds.
-        shutil.copy2(directory / 'keyframe_clouds/index.csv', clean_dir / 'index.csv')
+        if not compact_result:
+            shutil.copy2(directory / 'keyframe_clouds/index.csv', clean_dir / 'index.csv')
         shutil.copy2(directory / 'keyframes.txt', run_dir / 'keyframes.txt')
         shutil.copy2(directory / 'map_frames.yaml', run_dir / 'map_frames.yaml')
+        if traj.source == 'dense':
+            for name in DENSE_FILES:
+                shutil.copy2(directory / name, run_dir / name)
         cache = inference.cache
         stats.update(evidence=decision_counts, evidence_units='finite keyframe points (overlap retained)',
                      semantics=report_semantics(), uncertain_cloud_written=evidence['write_uncertain'],
@@ -290,46 +361,29 @@ def run_keyframe_clean(args, cfg, frame_contract):
                      elapsed_seconds=time.monotonic()-started, config=cfg,
                      selection=selector.stats, coordinate_contract=frame_contract,
                      source='retained_keyframes', overlapping_frame_points_retained=True)
+        stats.update(trajectory=traj.description, pose_queries=traj.query_stats)
+        stats.update(vote_gates=gate_counts,result_layout='global_only' if compact_result else 'keyframes',
+            global_export=dict(voxel_size_m=global_voxel_size,points=output['clean'].count,
+                input_points=getattr(output['clean'],'input_count',output['clean'].count),
+                policy='first_observed_point_per_voxel' if global_voxel_size else 'concatenated_frames')
+                if 'clean' in output else None)
+        stats.update(output_directory=str(run_dir), input_map=str(directory.resolve()))
+        (run_dir/'pose_failures.json').write_text(json.dumps(traj.failure_samples,indent=2,allow_nan=False)+'\n')
         (run_dir / 'summary.json').write_text(json.dumps(stats, indent=2) + '\n')
-        print(f'Finished: cleaned frames={clean_dir}; world_cloud={storage["write_global_clean"]}; '
+        (run_dir / 'INCOMPLETE').unlink()
+        print(f'Finished: output={run_dir}; saved_frames={not compact_result}; world_cloud={storage["write_global_clean"]}; '
               f'removed_debug={storage["write_removed_points"]}; '
               f'{stats["removed_points"]}/'
               f'{stats["retained_points"] + stats["removed_points"]} points removed', flush=True)
+        print(f'Clean map saved to: {run_dir}', flush=True)
+        if storage['write_global_clean']:
+            print(f'Full cleaned map: {run_dir / "global_clean.pcd"}', flush=True)
         if args.rviz:
-            # Display each final cloud sequentially; publisher bounds message size.
-            from clean_map_rviz import RvizPublisher
-            viz = RvizPublisher(max_points=int(cfg.get('rviz_max_points', 300000)))
-            viz.publish_trajectory(traj)
-            for topic, name in [('clean', 'global_clean.pcd'), ('vehicles', 'global_vehicles.pcd')]:
-                # Our rebuilt files are uncompressed binary. Sample through mmap; do not
-                # load a potentially huge concatenated map just for an RViz preview.
-                path = run_dir / name
-                if topic not in output:
-                    sample = np.concatenate(previews[topic]) if previews[topic] else np.empty((0,3))
-                    viz.publish_cloud(topic, sample[:preview_budget])
-                    continue
-                with path.open('rb') as stream:
-                    while True:
-                        line = stream.readline()
-                        if not line:
-                            raise ValueError('Missing rebuilt PCD header')
-                        if line.startswith(b'DATA '):
-                            offset = stream.tell()
-                            break
-                count = output[topic].count
-                if count:
-                    points = np.memmap(path, mode='r', dtype=output[topic].dtype,
-                                       offset=offset, shape=(count,))
-                    stride = max(1, int(np.ceil(count / int(cfg.get('rviz_max_points', 300000)))))
-                    sample = points[::stride]
-                    xyz = np.column_stack([sample['x'], sample['y'], sample['z']])
-                    viz.publish_cloud(topic, xyz)
-                    del sample, points
-                else:
-                    viz.publish_cloud(topic, np.empty((0, 3)))
+            publish_preview(force=True)
             print('RViz final clouds ready; Ctrl+C to exit', flush=True)
             viz.spin()
     finally:
+        (run_dir/'pose_failures.json').write_text(json.dumps(traj.failure_samples,indent=2,allow_nan=False)+'\n')
         frame_file.close()
         view_file.close()
         for stream in output.values():

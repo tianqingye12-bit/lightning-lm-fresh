@@ -14,6 +14,7 @@
 #include "core/lio/eskf.hpp"
 #include "core/lio/feature_quality.h"
 #include "core/lio/registration_quality.h"
+#include "core/lio/scan_trajectory.h"
 #include "core/lio/surface_support.h"
 #include "core/lio/map_detail.h"
 #include "core/lio/imu_prediction.h"
@@ -100,6 +101,8 @@ class LaserMapping {
     }
     InputStats GetInputStats();
     RuntimeStats& Stats() { return runtime_stats_; }
+    void ExportScanTrajectory(const std::string& directory, const std::vector<Keyframe::Ptr>& keyframes,
+                              const std::vector<SE3>& optimized_poses) const;
 
     void SetUI(std::shared_ptr<ui::PangolinWindow> ui) { ui_ = ui; }
 
@@ -153,6 +156,7 @@ class LaserMapping {
     void ObsModel(NavState &s, ESKF::CustomObservationModel &obs);
     bool AdvanceImuPrediction(const IMUPtr& imu, const char* source);
     void RebaseImuPrediction(bool update_accepted);
+    void RecordScan(trajectory::Status status);
 
 
     inline void PointBodyToWorld(const PointType &pi, PointType &po) {
@@ -180,6 +184,8 @@ class LaserMapping {
    private:
     RuntimeStats runtime_stats_;
     Options options_;
+    trajectory::Recorder trajectory_recorder_;
+    trajectory::Scan current_scan_record_;
 
     /// modules
     IVoxType::Options ivox_options_;

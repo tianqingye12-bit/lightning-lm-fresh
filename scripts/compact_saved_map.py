@@ -50,6 +50,10 @@ def plan(source, profile):
         trajectory = Trajectory(source/'keyframes.txt', np.finfo(float).max)
         entries = load_manifest(source, trajectory)
         paths = [Path('keyframes.txt'), Path('map_frames.yaml'), Path('keyframe_clouds/index.csv')]
+        from pose_trajectory import PoseTrajectory, DENSE_FILES
+        pose_source = PoseTrajectory(source, {}, trajectory)
+        if pose_source.source == 'dense':
+            paths += [Path(name) for name in DENSE_FILES]
         paths += [path.relative_to(source) for _,_,path in entries]
         if (source/'summary.json').is_file():
             paths.append(Path('summary.json'))

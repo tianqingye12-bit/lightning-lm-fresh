@@ -2,7 +2,8 @@
 """离线实例分割去车：累计地图投票或逐关键帧清理重建。
 
 --mode keyframes 使用 keyframe_clouds/index.csv 和版本2坐标约定；
-输出路径及限制见 doc/INSTANCE_CLEANUP_ROUND6.md。
+结果默认保存在输入地图旁的 <map>_clean 目录；--output 可指定目录，
+--export-global 可额外导出完整 global_clean.pcd。见 doc/CLEAN_MAP_OUTPUT.md。
 
 SLAM 用完整点云建图，结束后用 SaveMap 导出的 global.pcd + keyframes.txt，
 回放 bag 中的彩色图 (和对齐深度图)，YOLO 分割车辆，把地图体素投影到每个视角投票：
@@ -14,7 +15,8 @@ SLAM 用完整点云建图，结束后用 SaveMap 导出的 global.pcd + keyfram
 用法:
   python3 scripts/clean_map_vehicles.py --map data/garage --bag <bag目录或.bag> \
       --config config/garage_clean.yaml [--rviz]
-输出: <map>/global_clean.pcd, <map>/global_vehicles.pcd (被删除的点, 用于检查)
+map 模式输出: <map>/global_clean.pcd, <map>/global_vehicles.pcd。
+keyframes 模式输出: <map>_clean/keyframe_clouds/ 和配套位姿，完整 PCD 按配置/参数导出。
 """
 import argparse
 import csv
@@ -35,6 +37,7 @@ from clean_map_instances import associate_instances, association_options
 from semantic_evidence import PositiveBaseline, decide, evidence_options, timing_stats, report_semantics
 from segmentation_quality import (ScoredInstances, quality_options, instance_cache,
                                   associate_scored_instances, accepted_instances)
+from pose_trajectory import load_trajectory, trajectory_options
 
 PCD_TYPES = {('F', 4): 'f4', ('F', 8): 'f8', ('U', 1): 'u1', ('U', 2): 'u2', ('U', 4): 'u4',
              ('I', 1): 'i1', ('I', 2): 'i2', ('I', 4): 'i4'}
@@ -407,6 +410,10 @@ def make_overlay(voter, image, timestamp, traj=None):
                     f"nearest_kf_dt={timing['nearest_keyframe_dt_s']} "
                     f"pose_gap={timing['pose_bracket_gap_s']}", (10, 45),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        cv2.putText(output, f"pose={timing.get('pose_source','keyframes')} "
+                    f"dt={timing.get('nearest_pose_dt_s')} gap={timing['pose_bracket_gap_s']} "
+                    f"{timing.get('pose_correction','')}", (10, 65),
+                    cv2.FONT_HERSHEY_SIMPLEX, .4, (255, 255, 255), 1)
     return output
 
 
@@ -471,19 +478,30 @@ def main():
     parser.add_argument('--config', default='config/garage_clean.yaml')
     parser.add_argument('--device', default=None, help='YOLO 设备, 如 cpu / 0')
     parser.add_argument('--rviz', action='store_true',
-                        help='RViz preview: map mode live; keyframe mode final sampled clouds')
+                        help='Live RViz preview with bounded sampled clouds')
     parser.add_argument('--mode', choices=['map', 'keyframes'], default=None,
                         help='map: existing map voting; keyframes: clean saved frames and rebuild')
     parser.add_argument('--no-cache', action='store_true', help='Disable segmentation cache')
+    parser.add_argument('--output', type=Path,
+                        help='Keyframe result directory; default: next to input as <map>_clean (numbered if present)')
+    parser.add_argument('--export-global', action='store_true',
+                        help='Keyframe mode: also write a complete global_clean.pcd, overriding compact storage')
+    parser.add_argument('--compact-result',action='store_true',
+                        help='Keyframe mode: save only final global map and diagnostics, omit frame copies/debug clouds')
+    parser.add_argument('--global-voxel-size',type=float,default=0.,
+                        help='World voxel size for global export; compact-result defaults to 0.10m; 0 keeps all points')
     args = parser.parse_args()
     with open(args.config) as config_file:
         cfg = yaml.safe_load(config_file)
     association_options(cfg)
     evidence = evidence_options(cfg)
     quality = quality_options(cfg)
+    trajectory_options(cfg)
     mode = args.mode or cfg.get('clean_mode', 'map')
     if mode not in ('map', 'keyframes'):
         raise ValueError('clean_mode must be map or keyframes')
+    if mode != 'keyframes' and (args.output is not None or args.export_global or args.compact_result or args.global_voxel_size):
+        parser.error('Output layout/global export options require keyframes mode')
     map_dir = Path(args.map)
     T_imu_lidar, frame_contract = load_frame_contract(map_dir)
     cfg['_T_imu_lidar'] = T_imu_lidar.tolist()
@@ -494,6 +512,9 @@ def main():
         from clean_map_keyframes import run_keyframe_clean
         run_keyframe_clean(args, cfg, frame_contract)
         return
+
+    traj = load_trajectory(map_dir, cfg, Trajectory)
+    print(f'Image pose trajectory: {traj.source}; max gap={traj.max_gap}s', flush=True)
 
     from ultralytics import YOLO
     model = YOLO(cfg['yolo_model'])
@@ -511,7 +532,6 @@ def main():
     centroids = np.zeros((n_vox, 3))
     np.add.at(centroids, point_voxel, xyz[finite])
     centroids /= np.bincount(point_voxel, minlength=n_vox)[:, None]
-    traj = Trajectory(map_dir / 'keyframes.txt', cfg['max_kf_gap'])
     print(f'map: {len(cloud)} points, {n_vox} voxels, {len(traj.t)} keyframes', flush=True)
 
     voter = VehicleVoter(cfg, centroids, model, args.device)
@@ -548,7 +568,8 @@ def main():
         columns = ['timestamp', 'status', 'objects', 'projected', 'visible', 'occluded',
                    'vehicle_votes', 'background_votes', 'unknown_votes', 'depth', 'seconds',
                    'aligned_timestamp', 'nearest_keyframe_dt_s', 'pose_bracket_gap_s',
-                   'accepted_objects', 'positive_confidence_sum']
+                   'accepted_objects', 'positive_confidence_sum', 'pose_source', 'pose_status',
+                   'nearest_pose_dt_s', 'keyframe_bracket_gap_s', 'pose_correction']
         writer = csv.DictWriter(stream, fieldnames=columns)
         writer.writeheader()
         for t, pose, image, depth in iterate_views(args.bag, cfg, traj, selector):
@@ -577,6 +598,7 @@ def main():
                       f'cache_hits={cache.hits if cache else 0} '
                       f'{(now-start)/max(voter.views, 1):.2f}s/view; {selector.stats}', flush=True)
                 last_log = now
+    (diagnostic_dir/'pose_failures.json').write_text(json.dumps(traj.failure_samples,indent=2,allow_nan=False)+'\n')
     if voter.views == 0:
         raise RuntimeError(f'No usable projected view: selection={selector.stats}, '
                            f'no_projection={no_projection}; check time_offset, calibration and map frames')
@@ -635,6 +657,7 @@ def main():
                    observed_voxels=int(observed.sum()), total_voxels=int(n_vox),
                    elapsed_seconds=time.monotonic()-start, overlays_written=overlays,
                    config=cfg, with_depth=with_depth, invalid_points=int((~finite).sum()))
+    summary.update(trajectory=traj.description, pose_queries=traj.query_stats)
     (diagnostic_dir / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
     if viz is not None:
         viz.publish_cloud('clean', xyz[finite & ~drop])

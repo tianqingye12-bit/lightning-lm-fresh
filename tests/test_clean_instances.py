@@ -128,6 +128,7 @@ class InstanceTests(unittest.TestCase):
             model = SimpleNamespace(task='segment')
             modules = {'ultralytics': SimpleNamespace(YOLO=lambda _: model)}
             args = SimpleNamespace(map=tmp, bag='unused', device='cpu', no_cache=True, rviz=False)
+            args.output=directory/'clean_diagnostics'/'keyframes_result'
             # Mock only inference and floor; run real projection, association, votes and PCD rebuilding.
             cfg['instance_filter']['min_depth_pixels'] = 1
             masks = np.zeros((1, 32, 32), bool); masks[0, 16, 16] = True
@@ -164,6 +165,7 @@ class InstanceTests(unittest.TestCase):
             (frames / 'index.csv').write_text('id,timestamp,file\n0,1,0.pcd\n1,1.1,1.pcd\n')
             (directory / 'map_frames.yaml').write_text('format_version: 2\n')
             args = SimpleNamespace(map=tmp, bag='unused', device='cpu', no_cache=True, rviz=False)
+            args.output=directory/'clean_diagnostics'/'keyframes_rejected'
             cfg = self.config()
             image = np.zeros((32, 32, 3), np.uint8)
             views = [(1.05, np.eye(4), image, None)]
@@ -176,6 +178,7 @@ class InstanceTests(unittest.TestCase):
                     run_keyframe_clean(args, cfg, 'imu_v2')
                 infer.assert_not_called()
                 cfg['keyframe_clean']['max_active_frames'] = 2
+                args.output=directory/'clean_diagnostics'/'keyframes_result'
                 run_keyframe_clean(args, cfg, 'imu_v2')
                 self.assertEqual(infer.call_count, 1)
             successful = [p for p in (directory / 'clean_diagnostics').glob('keyframes_*')

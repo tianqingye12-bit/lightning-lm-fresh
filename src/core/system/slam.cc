@@ -334,6 +334,8 @@ void SlamSystem::SaveMap(const std::string& path) {
     }
     kf_file.flush();
     kf_file.close();
+    // Use the exact snapshot that assembled the map, including after loop optimization.
+    lio_->ExportScanTrajectory(save_path, keyframes, exported_poses);
     if (export_keyframe_clouds_) {
         frame_index.flush();
         if (!frame_index) throw std::runtime_error("failed to write keyframe cloud manifest");

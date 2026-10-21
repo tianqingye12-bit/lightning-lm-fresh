@@ -51,13 +51,16 @@ class StorageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp); source,original=self.source(root)
             cfg=self.config(); args=SimpleNamespace(map=str(source),bag='unused',device='cpu',no_cache=True,rviz=True)
+            args.output=source/'clean_diagnostics'/'keyframes_result'
             image=np.zeros((32,32,3),np.uint8)
             views=[(t,np.eye(4),image,None) for t in [.8,1,1.2]]
             clouds={}
+            overlays=[]
             class Publisher:
                 def __init__(self,**kwargs): pass
                 def publish_trajectory(self,*args): pass
                 def publish_cloud(self,name,xyz): clouds[name]=xyz
+                def publish_view(self,*args): overlays.append(args[0])
                 def spin(self): pass
             modules={'ultralytics':SimpleNamespace(YOLO=lambda _:SimpleNamespace(task='segment')),
                      'clean_map_rviz':SimpleNamespace(RvizPublisher=Publisher)}
@@ -70,6 +73,8 @@ class StorageTests(unittest.TestCase):
             self.assertFalse((run/'global_vehicles.pcd').exists())
             np.testing.assert_array_equal(vr.read_pcd(run/'keyframe_clouds/0.pcd')[1],original)
             self.assertLessEqual(len(clouds['clean']),1)
+            self.assertLessEqual(len(clouds['raw']),1)
+            self.assertGreater(len(overlays),0)
             self.assertEqual(len(clouds['vehicles']),0)
             report=json.loads((run/'summary.json').read_text())
             self.assertFalse(report['global_clean_written'])
