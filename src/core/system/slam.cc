@@ -7,6 +7,7 @@
 #include "core/lio/laser_mapping.h"
 #include "core/loop_closing/loop_closing.h"
 #include "core/maps/tiled_map.h"
+#include "core/maps/navigation_grid.h"
 #include "ui/pangolin_window.h"
 #include "wrapper/ros_utils.h"
 
@@ -36,6 +37,10 @@ bool SlamSystem::Init(const std::string& yaml_path) {
 
     auto yaml = YAML::LoadFile(yaml_path);
     export_keyframe_clouds_ = yaml["system"]["export_keyframe_clouds"].as<bool>(false);
+    const auto map_export = yaml["system"]["map_export"];
+    if (map_export && !map_export.IsMap()) return false;
+    localization_export_resolution_ = map_export ? map_export["localization_resolution"].as<float>(0.1f) : 0.1f;
+    if (!std::isfinite(localization_export_resolution_) || localization_export_resolution_ <= 0) return false;
     options_.with_loop_closing_ = yaml["system"]["with_loop_closing"].as<bool>();
     options_.with_visualization_ = yaml["system"]["with_ui"].as<bool>();
     options_.with_2dvisualization_ = yaml["system"]["with_2dui"].as<bool>();
@@ -275,6 +280,7 @@ void SlamSystem::SaveMap(const std::string& path) {
 
     TiledMap::Options tm_options;
     tm_options.map_path_ = save_path;
+    tm_options.voxel_size_in_chunk_ = localization_export_resolution_;
 
     TiledMap tm(tm_options);
     SE3 start_pose = exported_poses.front();
@@ -335,57 +341,17 @@ void SlamSystem::SaveMap(const std::string& path) {
 
     if (options_.with_gridmap_) {
         /// 存为ROS兼容的模式
-        auto map = g2p5_->GetNewestMap()->ToROS();
-        const int width = map.info.width;
-        const int height = map.info.height;
-
-        cv::Mat nav_image(height, width, CV_8UC1);
-        for (int y = 0; y < height; ++y) {
-            const int rowStartIndex = y * width;
-            for (int x = 0; x < width; ++x) {
-                const int index = rowStartIndex + x;
-                int8_t data = map.data[index];
-                if (data == 0) {                                   // Free
-                    nav_image.at<uchar>(height - 1 - y, x) = 255;  // White
-                } else if (data == 100) {                          // Occupied
-                    nav_image.at<uchar>(height - 1 - y, x) = 0;    // Black
-                } else {                                           // Unknown
-                    nav_image.at<uchar>(height - 1 - y, x) = 128;  // Gray
-                }
-            }
-        }
-
-        cv::imwrite(save_path + "/map.pgm", nav_image);
-
-        /// yaml
-        std::ofstream yamlFile(save_path + "/map.yaml");
-        if (!yamlFile.is_open()) {
-            LOG(ERROR) << "failed to write map.yaml";
-            return;  // 文件打开失败
-        }
-
-        try {
-            YAML::Emitter emitter;
-            emitter << YAML::BeginMap;
-            emitter << YAML::Key << "image" << YAML::Value << "map.pgm";
-            emitter << YAML::Key << "mode" << YAML::Value << "trinary";
-            emitter << YAML::Key << "width" << YAML::Value << map.info.width;
-            emitter << YAML::Key << "height" << YAML::Value << map.info.height;
-            emitter << YAML::Key << "resolution" << YAML::Value << float(0.05);
-            std::vector<double> orig{map.info.origin.position.x, map.info.origin.position.y, 0};
-            emitter << YAML::Key << "origin" << YAML::Value << orig;
-            emitter << YAML::Key << "negate" << YAML::Value << 0;
-            emitter << YAML::Key << "occupied_thresh" << YAML::Value << 0.65;
-            emitter << YAML::Key << "free_thresh" << YAML::Value << 0.25;
-
-            emitter << YAML::EndMap;
-
-            yamlFile << emitter.c_str();
-            yamlFile.close();
-        } catch (...) {
-            yamlFile.close();
-            return;
-        }
+        const auto newest = g2p5_->GetNewestMap();
+        if (!newest) throw std::runtime_error("no navigation grid available for export");
+        auto map = newest->ToROS();
+        navigation::GridSpec spec;
+        spec.width = map.info.width;
+        spec.height = map.info.height;
+        spec.resolution = map.info.resolution;
+        const auto& q = map.info.origin.orientation;
+        const double yaw = std::atan2(2*(q.w*q.z+q.x*q.y), 1-2*(q.y*q.y+q.z*q.z));
+        spec.origin = {map.info.origin.position.x, map.info.origin.position.y, yaw};
+        navigation::SaveGrid(save_path, spec, map.data);
     }
 
     LOG(INFO) << "map saved";
