@@ -52,7 +52,8 @@ def audit(directory):
         files_mib={k:round(v/1024**2,2) for k,v in sorted(usage.items(),key=lambda item:-item[1])},
         cleaning={k:report.get(k) for k in ('frames','frames_with_votes','frames_without_views',
             'floor_unknown_frames','selected_images','retained_points','removed_points',
-            'evidence','vote_gates','global_export','selection','pose_queries','trajectory')},
+            'evidence','vote_gates','global_export','selection','pose_queries','trajectory','cross_keyframe_semantics',
+            'removed_points_without_local_views')},
         views=views,view_count_units='image-keyframe pairs; not independent images',
         overlays=[str(p) for p in sorted(directory.glob('overlay_*.jpg'))[:3]])
 

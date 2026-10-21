@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""离线实例分割去车：累计地图投票或逐关键帧清理重建。
+"""离线车辆点云清理：检测框/实例分割与三维几何关联。
+
+vehicle_perception=detect 使用检测模型和三维点云约束，仅支持 map 模式；
+默认 segment 保留实例分割流程。见 doc/YOLO_DETECTION_CLEANUP.md。
 
 --mode keyframes 使用 keyframe_clouds/index.csv 和版本2坐标约定；
 结果默认保存在输入地图旁的 <map>_clean 目录；--output 可指定目录，
@@ -38,6 +41,14 @@ from semantic_evidence import PositiveBaseline, decide, evidence_options, timing
 from segmentation_quality import (ScoredInstances, quality_options, instance_cache,
                                   associate_scored_instances, accepted_instances)
 from pose_trajectory import load_trajectory, trajectory_options
+from cross_keyframe_semantics import cross_frame_options
+from legacy_map_cleanup import legacy_enabled,associate_legacy,legacy_votes
+from seed_local_cleanup import options as seed_options, complete as complete_seeds
+from vehicle_detection import (perception_mode, detection_options, DetectionCache,
+                               infer as infer_detections, associate as associate_detections)
+from vote_stage_diagnostics import rejection_stages
+from vehicle_instance_tracks import (options as track_options, extract as extract_vehicle_instances,
+                                     InstanceTracks)
 
 PCD_TYPES = {('F', 4): 'f4', ('F', 8): 'f8', ('U', 1): 'u1', ('U', 2): 'u2', ('U', 4): 'u4',
              ('I', 1): 'i1', ('I', 2): 'i2', ('I', 4): 'i4'}
@@ -287,6 +298,13 @@ class VehicleVoter:
         self.views = 0
         self.cache = None
         self.last_stats = {}
+        self.collect_world_evidence = cross_frame_options(cfg)['enabled']
+        self.legacy = legacy_enabled(cfg)
+        self.perception = perception_mode(cfg)
+        self.floor_mask = np.zeros(len(centroids), bool)
+        self.detection_stats = dict(boxes=0, accepted_components=0, skipped_core=0,
+                                    skipped_candidates=0, skipped_extent=0)
+        self.instance_tracks = None
 
     def vehicle_mask(self, image):
         key = self.cache.key(image) if self.cache is not None else None
@@ -300,6 +318,9 @@ class VehicleVoter:
         return result
 
     def infer_mask(self, image):
+        if self.perception == 'detect':
+            detection = infer_detections(self.model, image, self.cfg, self.device)
+            return detection, len(detection.boxes)
         r = self.model(image, conf=self.cfg['yolo_conf'], classes=self.cfg['vehicle_classes'],
                        imgsz=int(self.cfg.get('yolo_imgsz', 640)), max_det=100,
                        retina_masks=True, verbose=False, device=self.device)[0]
@@ -328,6 +349,7 @@ class VehicleVoter:
         self.last_stats = dict(projected=0, visible=0, occluded=0, vehicle_votes=0,
                                background_votes=0, unknown_votes=0, objects=0,
                                accepted_objects=0, positive_confidence_sum=0.)
+        self.last_association = None
         T = self.T_cam_lidar @ np.linalg.inv(T_world_lidar)
         rng = self.cfg['max_range']
         near = np.asarray(self.spatial_index.query_ball_point(
@@ -345,6 +367,7 @@ class VehicleVoter:
         uv = np.round(uv.reshape(-1, 2)).astype(int)
         inside = (uv[:, 0] >= 0) & (uv[:, 0] < self.w) & (uv[:, 1] >= 0) & (uv[:, 1] < self.h)
         near, z, u, v = near[inside], z[inside], uv[inside, 0], uv[inside, 1]
+        cam = cam[inside]
 
         if not len(near):
             return None
@@ -366,7 +389,28 @@ class VehicleVoter:
             scene = np.where(np.isfinite(dimg), dimg, scene)
 
         masks, n_obj = self.vehicle_mask(image)
-        if self.quality['enabled']:
+        if self.perception == 'detect':
+            is_vehicle, background, mask, detection_stats = associate_detections(
+                masks, cam, u, v, visible, self.floor_mask[near], (self.h, self.w), self.cfg)
+            for key,value in detection_stats.items():
+                self.detection_stats[key] += value
+            scores = np.ones(len(z), float)
+            accepted_objects, confidence_sum = detection_stats['accepted_components'], 0.
+            self.last_boxes = masks.boxes
+        elif self.instance_tracks is not None:
+            is_vehicle,background,mask,scores,observations=extract_vehicle_instances(
+                masks,scene,cam,u,v,z,visible,self.floor_mask[near],self.cfg)
+            self.score_sum[near[visible&is_vehicle]]+=scores[visible&is_vehicle]
+            for obs in observations:
+                obs['track_id']=self.instance_tracks.add(near[obs['indices']],obs['class_id'],obs['score'])
+            accepted_objects=len(observations)
+            confidence_sum=float(scores[visible&is_vehicle].sum())
+        elif self.legacy:
+            is_vehicle,mask=associate_legacy(masks,scene,u,v,z,self.cfg)
+            background=np.zeros(len(z),bool)
+            scores=np.zeros(len(z),float)
+            accepted_objects,confidence_sum=n_obj,0.
+        elif self.quality['enabled']:
             is_vehicle, background, mask, scores = associate_scored_instances(masks, scene, u, v, z, visible, self.cfg)
             self.score_sum[near[visible & is_vehicle]] += scores[visible & is_vehicle]
             accepted_objects = int(accepted_instances(masks, self.cfg).sum())
@@ -374,6 +418,7 @@ class VehicleVoter:
         else:
             is_vehicle, background, mask = associate_instances(masks, scene, u, v, z, visible, self.cfg)
             accepted_objects, confidence_sum = n_obj, 0.
+            scores = np.ones(len(near),float)
         self.visible[near[visible]] += 1
         self.vehicle[near[visible & is_vehicle]] += 1
         self.baseline.update(near[visible & is_vehicle], np.linalg.inv(T)[:3, 3])
@@ -381,6 +426,9 @@ class VehicleVoter:
         self.views += 1
         self.last_view = (u, v, visible, is_vehicle, mask)
         self.last_background = background
+        if self.collect_world_evidence:
+            self.last_association = dict(indices=near[visible],positive=is_vehicle[visible],
+                                         background=background[visible],scores=scores[visible])
         self.last_stats = dict(projected=len(near), visible=int(visible.sum()),
                                occluded=int((~visible).sum()),
                                vehicle_votes=int((visible & is_vehicle).sum()),
@@ -395,6 +443,10 @@ def make_overlay(voter, image, timestamp, traj=None):
     u, v, visible, vehicle, mask = voter.last_view
     output = image.copy()
     output[mask] = (0.5 * output[mask] + [127, 60, 0]).astype(np.uint8)
+    if getattr(voter, 'perception', 'segment') == 'detect':
+        for box in voter.last_boxes:
+            x1,y1,x2,y2 = np.round(box).astype(int)
+            cv2.rectangle(output, (x1,y1), (x2,y2), (255,128,0), 1)
     output[v[~visible], u[~visible]] = (128, 128, 128)
     background = visible & voter.last_background
     unknown = visible & ~vehicle & ~voter.last_background
@@ -497,9 +549,31 @@ def main():
     evidence = evidence_options(cfg)
     quality = quality_options(cfg)
     trajectory_options(cfg)
+    cross_options = cross_frame_options(cfg)
     mode = args.mode or cfg.get('clean_mode', 'map')
+    perception = perception_mode(cfg)
+    track_cfg = track_options(cfg)
+    if track_cfg['enabled'] and (mode!='map' or perception!='segment' or legacy_enabled(cfg) or
+                                 not quality['enabled'] or evidence['enabled'] or cross_options['enabled']):
+        parser.error('Instance tracks require map/segment, scored quality, legacy=false and disabled extra evidence/cross-frame gates')
+    if perception == 'detect':
+        detection_options(cfg)
+        if mode != 'map' or quality['enabled'] or evidence['enabled'] or cross_options['enabled'] or legacy_enabled(cfg):
+            parser.error('detect currently requires map mode, legacy_map_cleanup=false and disabled extra quality/evidence/cross-frame gates')
+    seed_cfg = seed_options(cfg)
+    if track_cfg['enabled'] and seed_cfg['enabled']:
+        parser.error('Instance completion replaces seed_local_cleanup; disable the latter')
+    if seed_cfg['enabled'] and mode != 'map':
+        parser.error('seed_local_cleanup requires map mode')
     if mode not in ('map', 'keyframes'):
         raise ValueError('clean_mode must be map or keyframes')
+    legacy=legacy_enabled(cfg)
+    if seed_cfg['enabled'] and not legacy and perception != 'detect':
+        parser.error('seed_local_cleanup currently requires the explicit legacy_map_cleanup recovery profile')
+    if legacy and (mode!='map' or evidence['enabled'] or quality['enabled'] or cross_options['enabled']):
+        parser.error('legacy_map_cleanup requires map mode and disabled extra semantic/quality/cross-frame gates')
+    if mode != 'keyframes' and cross_options['enabled']:
+        parser.error('cross_keyframe_semantics requires keyframes mode')
     if mode != 'keyframes' and (args.output is not None or args.export_global or args.compact_result or args.global_voxel_size):
         parser.error('Output layout/global export options require keyframes mode')
     map_dir = Path(args.map)
@@ -507,6 +581,8 @@ def main():
     cfg['_T_imu_lidar'] = T_imu_lidar.tolist()
     selector = ViewSelector(cfg)
     print(f'coordinate contract: {frame_contract}', flush=True)
+    if track_cfg['enabled'] and frame_contract!='imu_v2':
+        parser.error('Instance label transfer requires imu_v2 coordinates')
 
     if mode == 'keyframes':
         from clean_map_keyframes import run_keyframe_clean
@@ -518,8 +594,9 @@ def main():
 
     from ultralytics import YOLO
     model = YOLO(cfg['yolo_model'])
-    if model.task != 'segment':
-        raise RuntimeError(f'{cfg["yolo_model"]} is a {model.task} model; use a -seg model')
+    expected_task = 'detect' if perception == 'detect' else 'segment'
+    if model.task != expected_task:
+        raise RuntimeError(f'{cfg["yolo_model"]} task={model.task}; vehicle_perception={perception} requires {expected_task}')
 
     header, cloud = read_pcd(map_dir / 'global.pcd')
     xyz = np.column_stack([cloud['x'], cloud['y'], cloud['z']]).astype(float)
@@ -535,6 +612,12 @@ def main():
     print(f'map: {len(cloud)} points, {n_vox} voxels, {len(traj.t)} keyframes', flush=True)
 
     voter = VehicleVoter(cfg, centroids, model, args.device)
+    if perception == 'detect' or track_cfg['enabled']:
+        print('Estimating floor before box-to-point association...', flush=True)
+        floor_surface = estimate_floor(centroids, traj) + cfg['floor_keep']
+        voter.floor_mask = centroids[:, 2] < floor_surface
+    if track_cfg['enabled']:
+        voter.instance_tracks=InstanceTracks(centroids,cfg)
     cache_options = cfg.get('cache', {})
     if cache_options.get('enabled', False) and not args.no_cache:
         weights = Path(getattr(model, 'ckpt_path', None) or cfg['yolo_model'])
@@ -546,7 +629,11 @@ def main():
                         torch=importlib.metadata.version('torch'), device=args.device,
                         conf=cfg['yolo_conf'], classes=cfg['vehicle_classes'],
                         width=cfg['width'], height=cfg['height'], retina_masks=True)
-        voter.cache = instance_cache(cache_options.get('directory') or map_dir / '.vehicle_mask_cache', identity, cfg)
+        if perception == 'detect':
+            identity.update(schema=3, instance_masks=False, task='detect', retina_masks=False)
+            voter.cache = DetectionCache(cache_options.get('directory') or map_dir / '.vehicle_box_cache', identity)
+        else:
+            voter.cache = instance_cache(cache_options.get('directory') or map_dir / '.vehicle_mask_cache', identity, cfg)
     viz = None
     if args.rviz:
         from clean_map_rviz import RvizPublisher
@@ -562,6 +649,7 @@ def main():
     diagnostic_dir = Path(tempfile.mkdtemp(prefix='run_', dir=diagnostic_root))
     print(f'Diagnostics: {diagnostic_dir}', flush=True)
     overlays = 0
+    overlay_slots = set()
     last_log = start
     print('Reading bag and selecting views; first CPU inference may take a while...', flush=True)
     with open(diagnostic_dir / 'views.csv', 'w', newline='') as stream:
@@ -574,6 +662,8 @@ def main():
         writer.writeheader()
         for t, pose, image, depth in iterate_views(args.bag, cfg, traj, selector):
             before = time.monotonic()
+            if track_cfg['enabled']:
+                voter.instance_tracks.begin_image(t+cfg['time_offset'],(pose@np.linalg.inv(voter.T_cam_lidar))[:3,3])
             n_obj = voter.add_view(pose, image, depth)
             with_depth += depth is not None
             no_projection += n_obj is None
@@ -585,8 +675,16 @@ def main():
             if n_obj is not None:
                 if viz is not None:
                     viz.publish_view(t, pose, voter, image)
-                if overlays < max_overlays and (voter.views == 1 or voter.views % every == 0):
-                    cv2.imwrite(str(diagnostic_dir / f'overlay_{overlays:03d}.jpg'), make_overlay(voter, image, t, traj))
+                if track_cfg['enabled'] and max_overlays:
+                    progress=np.clip((t+cfg['time_offset']-traj.t[0])/max(traj.t[-1]-traj.t[0],1e-9),0,1)
+                    slot=min(max_overlays-1,int(progress*max_overlays))
+                    save_overlay=slot not in overlay_slots
+                else:
+                    slot=overlays
+                    save_overlay=overlays<max_overlays and (voter.views==1 or voter.views%every==0)
+                if save_overlay:
+                    cv2.imwrite(str(diagnostic_dir / f'overlay_{slot:03d}.jpg'), make_overlay(voter, image, t, traj))
+                    overlay_slots.add(slot)
                     overlays += 1
             now = time.monotonic()
             if voter.views == 1 or now - last_log >= 10:
@@ -604,14 +702,29 @@ def main():
                            f'no_projection={no_projection}; check time_offset, calibration and map frames')
 
     print('Voting finished; estimating floor and growing vehicle components...', flush=True)
-    floor = centroids[:, 2] < estimate_floor(centroids, traj) + cfg['floor_keep']
-    observed, remove, uncertain, evidence_counts = decide(
-        voter.visible, voter.vehicle, voter.background, cfg, voter.baseline, floor,
-        positive_score=getattr(voter, 'score_sum', None))
+    floor = voter.floor_mask if perception == 'detect' or track_cfg['enabled'] else centroids[:, 2] < estimate_floor(centroids, traj) + cfg['floor_keep']
+    if legacy:
+        observed,remove,uncertain,evidence_counts=legacy_votes(voter.visible,voter.vehicle,floor,cfg)
+    else:
+        observed, remove, uncertain, evidence_counts = decide(
+            voter.visible, voter.vehicle, voter.background, cfg, voter.baseline, floor,
+            positive_score=getattr(voter, 'score_sum', None))
     by_voxel = int(remove.sum())
+    vote_rejections = rejection_stages(voter.visible, voter.vehicle, voter.background, floor, remove, cfg, legacy)
 
     car_comp = np.zeros(0, bool)
-    if not evidence['enabled'] and not quality['enabled']:
+    local_report = dict(enabled=False)
+    instance_report = dict(enabled=False)
+    if track_cfg['enabled']:
+        remove,instance_report=voter.instance_tracks.finish(floor,voter.spatial_index)
+        uncertain=~(floor|remove)
+        print(f'Confirmed static vehicle instances: {instance_report["accepted_tracks"]}/{instance_report["tracks"]}; '
+              f'seed_voxels={instance_report["seed_voxels"]}; final_voxels={instance_report["final_voxels"]}',flush=True)
+    elif seed_cfg['enabled']:
+        remove, local_report = complete_seeds(centroids, remove, voter.visible, voter.vehicle,
+                                             voter.background, floor, cfg, voter.spatial_index)
+        print(f'Seed local completion: {local_report}', flush=True)
+    elif perception != 'detect' and not evidence['enabled'] and not quality['enabled']:
         above = np.nonzero(~floor)[0]
         label = components(centroids[above], cfg['cluster_voxel'])
         n_comp = int(label.max()) + 1 if len(label) else 0
@@ -627,8 +740,8 @@ def main():
         lim = np.concatenate([np.sort(lim[:2])[::-1], lim[2:]])
         car_comp = (obs_cnt >= cfg['cluster_min_observed']) & \
                    (veh_cnt >= cfg['cluster_vehicle_ratio'] * obs_cnt) & (ext <= lim).all(axis=1)
-        # Never grow into voxels with enough observations that explicitly voted for background.
-        growth = car_comp[label] & (~observed[above] | remove[above]) & (voter.background[above] == 0)
+        # Historical mode grows the whole bounded component; modern mode vetoes background.
+        growth = car_comp[label] if legacy else car_comp[label] & (~observed[above] | remove[above]) & (voter.background[above] == 0)
         remove[above[growth]] = True
     uncertain &= ~remove
     evidence_counts['removed'] = int(remove.sum())
@@ -638,16 +751,23 @@ def main():
     drop[finite] = remove[point_voxel]
     write_pcd(map_dir / 'global_clean.pcd', header, cloud, ~drop)
     write_pcd(map_dir / 'global_vehicles.pcd', header, cloud, drop)
+    if track_cfg['enabled']:
+        from instance_map_labels import write_labels
+        write_labels(map_dir/'vehicle_labels.sqlite',map_dir,centroids,remove,floor_surface,cfg['voxel_size'])
+        (diagnostic_dir/'vehicle_instances.json').write_text(json.dumps(instance_report,indent=2)+'\n')
     if evidence['write_uncertain']:
         uncertain_points = np.zeros(len(cloud), bool)
         uncertain_points[finite] = uncertain[point_voxel]
         write_pcd(diagnostic_dir / 'global_uncertain.pcd', header, cloud, uncertain_points)
+    stage = 'after instance confirmation' if track_cfg['enabled'] else 'after local completion' if seed_cfg['enabled'] else 'after clusters'
+    delta_name = 'raw_vote_difference' if track_cfg['enabled'] else 'added'
     print(f'views={voter.views}, observed voxels={observed.sum()}/{n_vox}, '
-          f'vehicle voxels: vote={by_voxel}, after clusters={remove.sum()} ({car_comp.sum()} vehicle clusters)')
+          f'vehicle voxels: vote={by_voxel}, {stage}={remove.sum()} '
+          f'({delta_name}={int(remove.sum())-by_voxel}, {car_comp.sum()} whole vehicle clusters)')
     print(f'removed {drop.sum()}/{len(cloud)} points -> {map_dir / "global_clean.pcd"}')
     cache = getattr(voter, 'cache', None)
     summary = dict(evidence=evidence_counts, evidence_units="voxels",
-                   semantics=report_semantics(), cluster_growth_enabled=not evidence["enabled"] and not quality['enabled'],
+                   semantics=report_semantics(), cluster_growth_enabled=not track_cfg['enabled'] and perception != 'detect' and not seed_cfg['enabled'] and not evidence["enabled"] and not quality['enabled'],
                    uncertain_cloud_written=evidence["write_uncertain"],
                    coordinate_contract=frame_contract, views=voter.views,
                    selection=selector.stats, no_projection=no_projection,
@@ -658,6 +778,24 @@ def main():
                    elapsed_seconds=time.monotonic()-start, overlays_written=overlays,
                    config=cfg, with_depth=with_depth, invalid_points=int((~finite).sum()))
     summary.update(trajectory=traj.description, pose_queries=traj.query_stats)
+    summary['legacy_map_cleanup']=legacy
+    summary['vehicle_perception'] = perception
+    summary['vehicle_instance_tracks'] = {key:value for key,value in instance_report.items() if key!='instances'}
+    summary['vote_rejections'] = vote_rejections
+    if perception == 'detect':
+        summary['detection_association'] = voter.detection_stats
+    summary['seed_local_cleanup'] = local_report
+    summary['removal_stages'] = dict(vote_voxels=by_voxel, final_voxels=int(remove.sum()),
+                                   added_voxels=int(remove.sum())-by_voxel,
+                                   whole_vehicle_clusters=int(car_comp.sum()))
+    if track_cfg['enabled']:
+        summary['removal_stages'].update(instance_seed_voxels=instance_report['seed_voxels'],
+            instance_completion_voxels=instance_report['final_voxels']-instance_report['seed_voxels'],
+            added_voxels=None,raw_vote_difference_voxels=int(remove.sum())-by_voxel)
+    summary['coverage'] = dict(unobserved_voxels=int((voter.visible == 0).sum()),
+                              below_min_views_voxels=int((voter.visible < cfg['min_views']).sum()),
+                              positive_voxels=int((voter.vehicle > 0).sum()),
+                              positive_below_min_views_voxels=int(((voter.vehicle > 0) & (voter.visible < cfg['min_views'])).sum()))
     (diagnostic_dir / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
     if viz is not None:
         viz.publish_cloud('clean', xyz[finite & ~drop])
