@@ -664,6 +664,8 @@ def main():
             before = time.monotonic()
             if track_cfg['enabled']:
                 voter.instance_tracks.begin_image(t+cfg['time_offset'],(pose@np.linalg.inv(voter.T_cam_lidar))[:3,3])
+                if not voter.instance_tracks.active:
+                    continue  # Duplicate timestamps must not inflate fallback point votes either.
             n_obj = voter.add_view(pose, image, depth)
             with_depth += depth is not None
             no_projection += n_obj is None
@@ -716,10 +718,16 @@ def main():
     local_report = dict(enabled=False)
     instance_report = dict(enabled=False)
     if track_cfg['enabled']:
-        remove,instance_report=voter.instance_tracks.finish(floor,voter.spatial_index)
+        instance_remove,instance_report=voter.instance_tracks.finish(floor,voter.spatial_index)
+        instance_report.update(point_vote_voxels=by_voxel,
+            instance_only_voxels=int((instance_remove&~remove).sum()))
+        # Track gates govern whole-body completion, not already accepted point votes.
+        remove |= instance_remove
+        instance_report['combined_final_voxels']=int(remove.sum())
         uncertain=~(floor|remove)
         print(f'Confirmed static vehicle instances: {instance_report["accepted_tracks"]}/{instance_report["tracks"]}; '
-              f'seed_voxels={instance_report["seed_voxels"]}; final_voxels={instance_report["final_voxels"]}',flush=True)
+              f'point_votes={by_voxel}; instance_added={instance_report["instance_only_voxels"]}; '
+              f'combined_final={instance_report["combined_final_voxels"]}',flush=True)
     elif seed_cfg['enabled']:
         remove, local_report = complete_seeds(centroids, remove, voter.visible, voter.vehicle,
                                              voter.background, floor, cfg, voter.spatial_index)
@@ -791,7 +799,7 @@ def main():
     if track_cfg['enabled']:
         summary['removal_stages'].update(instance_seed_voxels=instance_report['seed_voxels'],
             instance_completion_voxels=instance_report['final_voxels']-instance_report['seed_voxels'],
-            added_voxels=None,raw_vote_difference_voxels=int(remove.sum())-by_voxel)
+            added_voxels=int(remove.sum())-by_voxel,raw_vote_difference_voxels=int(remove.sum())-by_voxel)
     summary['coverage'] = dict(unobserved_voxels=int((voter.visible == 0).sum()),
                               below_min_views_voxels=int((voter.visible < cfg['min_views']).sum()),
                               positive_voxels=int((voter.vehicle > 0).sum()),

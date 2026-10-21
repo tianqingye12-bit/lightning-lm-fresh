@@ -2,6 +2,7 @@
 
 这是一条独立的可选流程，默认配置保持不变。仍用原分割权重与原标定，要求 map/segment、imu_v2 坐标约定及带类别置信度的分割输出。
 本轮重点是几何稳定的停放车辆：不把车体部分残点当作独立目标，不用检测框直接删除，不叠加旧整簇扩展或上一轮种子补全。
+逐体素投票已通过的删除点继续保留，实例确认负责新增的车身补全；未关联成功、基线不足或几何不稳定的轨迹不会撤销已通过逐体素门限和地面保护的删除决定。
 未实现行驶车辆的按时间实例跟踪/逐扫描剔除；几何不稳定实例会被拒绝，保留原点云。
 世界坐标中的静态一致性无法可靠区分慢速车辆与视角变化，不应宣称动态目标处理已完成。
 
@@ -87,8 +88,8 @@ nice -n 19 python3 scripts/rebuild_instance_static_map.py \
 clean_diagnostics/run_*/vehicle_instances.json 保存每个实例的观测数、基线、置信度、中心漂移、确认状态及有向范围。
 accepted_tracks 是确认的轨迹段数量，长时间重访或未关联的互补视角可能重复表示同一辆车，不能当作去重车辆总数。
 summary.json 的 vehicle_instance_tracks 提供汇总。vote_rejections 仍解释原始逐体素投票；实例确认是另一条判定流程，不能把两者误当成相同门限。
-removal_stages 中 instance_seed_voxels 与 instance_completion_voxels 分别表示实例种子和几何补全；raw_vote_difference_voxels 可以为负，added_voxels 在此模式为 null。
-实例确认更严格时可能删除更少，不能用删点总数代替车辆召回率和背景误删率。
+removal_stages 中 instance_seed_voxels 与 instance_completion_voxels 分别表示实例种子和几何补全；added_voxels 为相对本次逐体素投票新增的删除量（非负）。vehicle_instance_tracks 中 point_vote_voxels、instance_only_voxels 和 combined_final_voxels 分别记录两条路径的合并过程。
+这个保留保证仅针对本次实例模式实际提取到的正票，不等于恢复旧模式的掩膜膨胀、深度关联或整簇扩展，不能保证删点总数超过历史版本。不能用删点总数代替车辆召回率和背景误删率。
 
 测试覆盖合成多视角、相邻车辆分离、重复图像、低置信度、相机基线、疑似运动几何、地面保护、资源上限、浮点边界，以及实际 map 主流程和多关键帧标签回传重建。
 尚未使用用户原始 bag、真实 YOLO 权重或 ROS2 完成实测，也未测量实际识别准确率或运行速度。
