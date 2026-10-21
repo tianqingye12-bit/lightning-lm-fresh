@@ -16,6 +16,7 @@ from segmentation_quality import instance_cache
 from semantic_evidence import decide, evidence_options, timing_stats, report_semantics
 from clean_map_runtime import ViewSelector, file_digest
 from map_storage import storage_options, compress_pcd, require_compressor
+from pose_trajectory import load_trajectory, DENSE_FILES
 
 
 def load_manifest(directory, traj):
@@ -87,7 +88,8 @@ def run_keyframe_clean(args, cfg, frame_contract):
     if storage['compress_keyframes']:
         require_compressor()
     directory = Path(args.map)
-    traj = vr.Trajectory(directory / 'keyframes.txt', cfg['max_kf_gap'])
+    traj = load_trajectory(directory, cfg, vr.Trajectory)
+    print(f'Image pose trajectory: {traj.source}; max gap={traj.max_gap}s', flush=True)
     entries = load_manifest(directory, traj)  # Fail before loading/downloading any model.
     options = cfg.get('keyframe_clean', {})
     window = float(options.get('max_image_dt_s', .35))
@@ -144,7 +146,8 @@ def run_keyframe_clean(args, cfg, frame_contract):
     view_columns = ['timestamp', 'keyframe_id', 'keyframe_dt_s', 'aligned_timestamp',
                     'nearest_keyframe_dt_s', 'pose_bracket_gap_s', 'status', 'objects',
                     'projected', 'visible', 'occluded', 'vehicle_votes', 'background_votes',
-                    'unknown_votes', 'depth', 'seconds', 'accepted_objects', 'positive_confidence_sum']
+                    'unknown_votes', 'depth', 'seconds', 'accepted_objects', 'positive_confidence_sum',
+                    'pose_source', 'pose_status', 'nearest_pose_dt_s', 'keyframe_bracket_gap_s', 'pose_correction']
     view_writer = csv.DictWriter(view_file, fieldnames=view_columns)
     view_writer.writeheader()
     diagnostics = cfg.get('diagnostics', {})
@@ -155,7 +158,8 @@ def run_keyframe_clean(args, cfg, frame_contract):
         header, cloud = vr.read_pcd(entries[index][2])
         xyz = np.column_stack([cloud['x'], cloud['y'], cloud['z']]).astype(float)
         finite = np.isfinite(xyz).all(axis=1)
-        pose = traj.pose(entries[index][1])
+        # Saved frame clouds always use their exact optimized keyframe poses.
+        pose = traj.keyframes.pose(entries[index][1])
         world = xyz[finite] @ pose[:3, :3].T + pose[:3, 3]
         voter = vr.VehicleVoter(cfg, world, model, args.device)
         return header, cloud, finite, world, voter
@@ -280,6 +284,9 @@ def run_keyframe_clean(args, cfg, frame_contract):
         shutil.copy2(directory / 'keyframe_clouds/index.csv', clean_dir / 'index.csv')
         shutil.copy2(directory / 'keyframes.txt', run_dir / 'keyframes.txt')
         shutil.copy2(directory / 'map_frames.yaml', run_dir / 'map_frames.yaml')
+        if traj.source == 'dense':
+            for name in DENSE_FILES:
+                shutil.copy2(directory / name, run_dir / name)
         cache = inference.cache
         stats.update(evidence=decision_counts, evidence_units='finite keyframe points (overlap retained)',
                      semantics=report_semantics(), uncertain_cloud_written=evidence['write_uncertain'],
@@ -290,6 +297,7 @@ def run_keyframe_clean(args, cfg, frame_contract):
                      elapsed_seconds=time.monotonic()-started, config=cfg,
                      selection=selector.stats, coordinate_contract=frame_contract,
                      source='retained_keyframes', overlapping_frame_points_retained=True)
+        stats.update(trajectory=traj.description, pose_queries=traj.query_stats)
         (run_dir / 'summary.json').write_text(json.dumps(stats, indent=2) + '\n')
         print(f'Finished: cleaned frames={clean_dir}; world_cloud={storage["write_global_clean"]}; '
               f'removed_debug={storage["write_removed_points"]}; '
@@ -330,6 +338,7 @@ def run_keyframe_clean(args, cfg, frame_contract):
             print('RViz final clouds ready; Ctrl+C to exit', flush=True)
             viz.spin()
     finally:
+        (run_dir/'pose_failures.json').write_text(json.dumps(traj.failure_samples,indent=2,allow_nan=False)+'\n')
         frame_file.close()
         view_file.close()
         for stream in output.values():

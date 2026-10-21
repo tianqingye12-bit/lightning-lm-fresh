@@ -92,7 +92,11 @@ def timing_stats(traj, timestamp, cfg):
                   default=None)
     exact = i < len(traj.t) and traj.t[i] == aligned
     gap = 0.0 if exact else (float(traj.t[i] - traj.t[i-1]) if 0 < i < len(traj.t) else None)
-    return dict(aligned_timestamp=aligned, nearest_keyframe_dt_s=nearest, pose_bracket_gap_s=gap)
+    result = dict(aligned_timestamp=aligned, nearest_keyframe_dt_s=nearest, pose_bracket_gap_s=gap)
+    if hasattr(traj, 'association_info'):
+        result['keyframe_bracket_gap_s'] = gap
+        result.update(traj.association_info(aligned))
+    return result
 
 
 def report_semantics():

@@ -142,6 +142,15 @@ bool LaserMapping::LoadParamsFromYAML(const std::string &yaml_file) {
         }
         if (!options_.registration_quality_.Valid()) throw std::invalid_argument("invalid registration_quality options");
 
+        trajectory::Options recording;
+        const auto trajectory_config = yaml["fasterlio"]["trajectory_recording"];
+        if (trajectory_config && !trajectory_config.IsMap()) throw std::invalid_argument("trajectory_recording must be a map");
+        if (trajectory_config) {
+            recording.enabled = trajectory_config["enabled"].as<bool>(false);
+            recording.max_records = trajectory_config["max_records"].as<int>(200000);
+        }
+        trajectory_recorder_.Configure(recording);
+
         const auto detail = yaml["fasterlio"]["map_detail"];
         if (detail && !detail.IsMap()) {
             LOG(ERROR) << "fasterlio.map_detail must be a map";
@@ -208,6 +217,7 @@ bool LaserMapping::LoadParamsFromYAML(const std::string &yaml_file) {
               << " max_constraints_per_term=" << options_.registration_quality_.max_constraints
               << " diagnostics=" << options_.registration_quality_.diagnostics
               << " rotation_scale_m=" << options_.registration_quality_.rotation_scale_m;
+    LOG(INFO) << "[scan_trajectory] enabled=" << trajectory_recorder_.Enabled();
     LOG(INFO) << "feature quality: pca=" << options_.plane_quality_.enabled
               << " min_spread=" << options_.plane_quality_.min_spread
               << " tangent_ratio=" << options_.plane_quality_.min_tangent_ratio
@@ -333,6 +343,38 @@ LaserMapping::InputStats LaserMapping::GetInputStats() {
     return {imu_buffer_.size(), lidar_buffer_.size(), dropped_input_lidar_, input_buffer_fault_};
 }
 
+void LaserMapping::RecordScan(trajectory::Status status) {
+    if (!trajectory_recorder_.Enabled()) return;
+    auto& scan = current_scan_record_;
+    const auto state = kf_.GetX();
+    scan.state_timestamp = state.timestamp_;
+    const Eigen::Isometry3d pose(state.GetPose().matrix());
+    scan.pose_valid = trajectory::Rigid(pose);
+    if (scan.pose_valid) scan.raw = trajectory::Pack(pose);
+    scan.status = status;
+    scan.imu_gap = p_imu_->LastScanHadImuGap();
+    const auto previous_faults = trajectory_recorder_.Faults();
+    trajectory_recorder_.Add(scan);
+    if (trajectory_recorder_.Faults() != previous_faults &&
+        (trajectory_recorder_.Faults() == 1 || trajectory_recorder_.Faults() % 100 == 0))
+        LOG(ERROR) << "[scan_trajectory] recording incomplete: capacity or non-increasing scan time; faults="
+                   << trajectory_recorder_.Faults();
+}
+
+void LaserMapping::ExportScanTrajectory(const std::string& directory, const std::vector<Keyframe::Ptr>& keyframes,
+                                      const std::vector<SE3>& optimized_poses) const {
+    if (!trajectory_recorder_.Enabled()) return;
+    if (keyframes.size() != optimized_poses.size()) throw std::runtime_error("trajectory snapshot count mismatch");
+    std::vector<trajectory::Anchor> anchors;
+    anchors.reserve(keyframes.size());
+    for (std::size_t i = 0; i < keyframes.size(); ++i)
+        anchors.push_back({keyframes[i]->GetID(), keyframes[i]->GetState().timestamp_,
+            Eigen::Isometry3d(keyframes[i]->GetLIOPose().matrix()), Eigen::Isometry3d(optimized_poses[i].matrix())});
+    trajectory_recorder_.Export(directory, anchors);
+    LOG(INFO) << "[scan_trajectory] saved rows=" << trajectory_recorder_.Scans().size()
+              << " recording_faults=" << trajectory_recorder_.Faults();
+}
+
 void LaserMapping::ProcessIMU(const lightning::IMUPtr &imu) {
     publish_count_++;
     const double timestamp = imu->timestamp;
@@ -379,12 +421,30 @@ bool LaserMapping::Run() {
         return false;
     }
 
+    if (trajectory_recorder_.Enabled()) {
+        current_scan_record_ = trajectory::Scan{};
+        auto& record = current_scan_record_;
+        record.begin = measures_.lidar_begin_time_;
+        record.timestamp = measures_.lidar_end_time_;
+        record.points = trajectory::InspectPointTiming(measures_.scan_->points);
+        record.propagation_begin = kf_.GetX().timestamp_;
+        record.imu_count = measures_.imu_.size();
+        if (!measures_.imu_.empty()) {
+            record.imu_first = measures_.imu_.front()->timestamp;
+            record.imu_last = measures_.imu_.back()->timestamp;
+        }
+        record.imu_latest = last_timestamp_imu_;
+    }
+
     /// IMU process, kf prediction, undistortion
     Measure(runtime_stats_, RuntimeStats::deskew, [&] { p_imu_->Process(measures_, kf_, scan_undistort_); });
 
     if (!scan_undistort_ || scan_undistort_->empty()) {
         if (p_imu_->IsIMUInited()) RebaseImuPrediction(false);
         LOG(WARNING) << "No point or unreliable IMU coverage, skip this scan!";
+        RecordScan(p_imu_->HasPropagationFault() ? trajectory::Status::PropagationFault :
+                   !p_imu_->IsIMUInited() ? trajectory::Status::Initializing :
+                   p_imu_->LastScanHadImuGap() ? trajectory::Status::ImuGap : trajectory::Status::NoPoints);
         return false;
     }
 
@@ -392,6 +452,7 @@ bool LaserMapping::Run() {
     if (!std::isfinite(imu_clock_error) || std::abs(imu_clock_error) > 1e-5) {
         LOG(ERROR) << "[imu_clock] reject scan: state/frame time mismatch " << imu_clock_error;
         RebaseImuPrediction(false);
+        RecordScan(trajectory::Status::ClockMismatch);
         return false;
     }
 
@@ -423,6 +484,7 @@ bool LaserMapping::Run() {
         has_map_update_ = true;
         flg_first_scan_ = false;
         RebaseImuPrediction(true);
+        RecordScan(trajectory::Status::Bootstrap);
         return true;
     }
 
@@ -438,6 +500,7 @@ bool LaserMapping::Run() {
             }
 
             RebaseImuPrediction(false);
+            RecordScan(trajectory::Status::Skipped);
             return false;
         }
     }
@@ -487,6 +550,7 @@ bool LaserMapping::Run() {
 
     if (cur_pts < 5) {
         LOG(WARNING) << "Too few points, skip this scan!" << scan_undistort_->size() << ", " << scan_down_body_->size();
+        RecordScan(trajectory::Status::TooFewPoints);
         return false;
     }
 
@@ -579,6 +643,7 @@ bool LaserMapping::Run() {
     }
 
     RebaseImuPrediction(update_accepted);
+    RecordScan(update_accepted ? trajectory::Status::Accepted : trajectory::Status::Rejected);
 
     if (ui_) {
         Measure(runtime_stats_, RuntimeStats::ui_prepare, [&] {
