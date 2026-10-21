@@ -13,7 +13,7 @@
 namespace lightning::features {
 
 enum class PlaneStatus : std::size_t {
-    Accepted, InsufficientNeighbors, InvalidInput, Degenerate, NonPlanar, ResidualRejected, Count
+    Accepted, InsufficientNeighbors, InvalidInput, Degenerate, NonPlanar, ResidualRejected, SupportRejected, Count
 };
 
 struct PlaneQualityOptions {
@@ -143,7 +143,7 @@ struct FeatureStats {
         out << "candidates=" << candidates << " accepted=" << accepted
             << " no_neighbors=" << status[1] << " invalid=" << status[2]
             << " degenerate=" << status[3] << " nonplanar=" << status[4]
-            << " residual_rejected=" << status[5] << " huber_downweighted=" << downweighted
+            << " residual_rejected=" << status[5] << " support_rejected=" << status[6] << " huber_downweighted=" << downweighted
             << " mean_weight=" << (accepted ? weight_sum / accepted : 0.0);
         const auto bins = [&](const char* name, const auto& values) {
             out << ' ' << name << "=[";

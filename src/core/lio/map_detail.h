@@ -9,6 +9,7 @@ namespace mapping {
 
 // All defaults preserve the old dataset configuration's behavior.
 struct DetailOptions {
+    bool preserve_observed_points = false;  // Opt-in: representative raw points instead of centroids.
     int input_point_filter_num = 0;  // 0 inherits fasterlio.point_filter_num
     double keyframe_resolution = 0.0;  // 0 retains the preprocessed, deskewed cloud
     std::size_t keyframe_max_points = 0;  // 0 disables the additional cap

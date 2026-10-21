@@ -293,6 +293,7 @@ void SlamSystem::SaveMap(const std::string& path) {
         TiledMap::Options tm_options;
         tm_options.map_path_ = save_path;
         tm_options.voxel_size_in_chunk_ = localization_export_resolution_;
+        tm_options.preserve_observed_points_ = lio_->PreserveObservedPoints();
         TiledMap tm(tm_options);
         tm.ConvertFromFullPCD(global_map, exported_poses.front(), save_path);
     }

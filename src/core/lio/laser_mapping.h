@@ -13,6 +13,7 @@
 #include "core/ivox3d/ivox3d.h"
 #include "core/lio/eskf.hpp"
 #include "core/lio/feature_quality.h"
+#include "core/lio/surface_support.h"
 #include "core/lio/map_detail.h"
 #include "core/lio/imu_prediction.h"
 #include "utils/runtime_stats.h"
@@ -44,6 +45,7 @@ class LaserMapping {
         double icp_weight_ = 100;        // ICP部分的权重
 
         features::PlaneQualityOptions plane_quality_;
+        features::SurfaceSupportOptions surface_support_;
         bool robust_plane_weight_ = true;
         double plane_huber_delta_ = 0.10;  // metres; point-to-plane residual
         int feature_stats_interval_ = 20;  // processed scans; 0 disables reporting
@@ -117,6 +119,8 @@ class LaserMapping {
             return s;
         }
     }
+
+    bool PreserveObservedPoints() const { return detail_options_.preserve_observed_points; }
 
     // T_imu_lidar maps raw/deskewed LiDAR points into the IMU body frame.
     SE3 GetTImuLidar() const { return SE3(SO3(offset_R_lidar_fixed_), offset_t_lidar_fixed_); }

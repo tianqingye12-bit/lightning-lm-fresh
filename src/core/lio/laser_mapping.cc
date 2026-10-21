@@ -114,8 +114,16 @@ bool LaserMapping::LoadParamsFromYAML(const std::string &yaml_file) {
             options_.robust_plane_weight_ = feature["robust_weight"].as<bool>(options_.robust_plane_weight_);
             options_.plane_huber_delta_ = feature["huber_delta"].as<double>(options_.plane_huber_delta_);
             options_.feature_stats_interval_ = feature["stats_interval"].as<int>(options_.feature_stats_interval_);
+            const auto support = feature["surface_support"];
+            if (support && !support.IsMap()) throw std::invalid_argument("surface_support must be a map");
+            if (support) {
+                options_.surface_support_.enabled = support["enabled"].as<bool>(false);
+                options_.surface_support_.max_neighbor_distance = support["max_neighbor_distance"].as<double>(.6);
+                options_.surface_support_.max_plane_residual = support["max_plane_residual"].as<double>(.15);
+                options_.surface_support_.max_tangent_gap = support["max_tangent_gap"].as<double>(.10);
+            }
         }
-        if (!options_.plane_quality_.Valid() || !std::isfinite(options_.plane_huber_delta_) ||
+        if (!options_.surface_support_.Valid() || !options_.plane_quality_.Valid() || !std::isfinite(options_.plane_huber_delta_) ||
             options_.plane_huber_delta_ <= 0.0 || options_.feature_stats_interval_ < 0 ||
             !std::isfinite(fasterlio::ESTI_PLANE_THRESHOLD) || fasterlio::ESTI_PLANE_THRESHOLD <= 0.0f) {
             LOG(ERROR) << "invalid feature quality thresholds";
@@ -128,6 +136,7 @@ bool LaserMapping::LoadParamsFromYAML(const std::string &yaml_file) {
             return false;
         }
         if (detail) {
+            detail_options_.preserve_observed_points = detail["preserve_observed_points"].as<bool>(false);
             detail_options_.input_point_filter_num = detail["input_point_filter_num"].as<int>(0);
             detail_options_.keyframe_resolution = detail["keyframe_resolution"].as<double>(0.0);
             const auto max_points = detail["keyframe_max_points"].as<long long>(0);
@@ -176,8 +185,13 @@ bool LaserMapping::LoadParamsFromYAML(const std::string &yaml_file) {
               << " keyframe_m=" << detail_options_.keyframe_resolution
               << " keyframe_max_points=" << detail_options_.keyframe_max_points
               << " export_m=" << detail_options_.export_resolution
-              << " local_fill=" << detail_options_.local_fill_enabled;
+              << " local_fill=" << detail_options_.local_fill_enabled
+              << " observed_points=" << detail_options_.preserve_observed_points;
 
+    LOG(INFO) << "[surface_support] enabled=" << options_.surface_support_.enabled
+              << " neighbor_m=" << options_.surface_support_.max_neighbor_distance
+              << " residual_m=" << options_.surface_support_.max_plane_residual
+              << " tangent_gap_m=" << options_.surface_support_.max_tangent_gap;
     LOG(INFO) << "feature quality: pca=" << options_.plane_quality_.enabled
               << " min_spread=" << options_.plane_quality_.min_spread
               << " tangent_ratio=" << options_.plane_quality_.min_tangent_ratio
@@ -372,9 +386,13 @@ bool LaserMapping::Run() {
         state_point_ = kf_.GetX();
         CloudPtr bootstrap = scan_undistort_;
         if (detail_options_.input_point_filter_num > 0) {
-            bootstrap.reset(new PointCloudType());
-            voxel_scan_.setInputCloud(scan_undistort_);
-            voxel_scan_.filter(*bootstrap);
+            if (detail_options_.preserve_observed_points) {
+                bootstrap = mapping::ObservedVoxelCloud<PointType>(scan_undistort_, voxel_scan_.getLeafSize()[0]);
+            } else {
+                bootstrap.reset(new PointCloudType());
+                voxel_scan_.setInputCloud(scan_undistort_);
+                voxel_scan_.filter(*bootstrap);
+            }
         }
         scan_down_world_->resize(bootstrap->size());
         for (size_t i = 0; i < bootstrap->size(); i++) {
@@ -422,7 +440,11 @@ bool LaserMapping::Run() {
 
     /// downsample
     voxel_scan_.setInputCloud(scan_undistort_);
-    Measure(runtime_stats_, RuntimeStats::downsample, [&] { voxel_scan_.filter(*scan_down_body_); });
+    Measure(runtime_stats_, RuntimeStats::downsample, [&] {
+        if (detail_options_.preserve_observed_points)
+            scan_down_body_ = mapping::ObservedVoxelCloud<PointType>(scan_undistort_, voxel_scan_.getLeafSize()[0]);
+        else voxel_scan_.filter(*scan_down_body_);
+    });
 
     // if (options_.proj_kfs_) {
     //     ProjectKFs();
@@ -434,9 +456,14 @@ bool LaserMapping::Run() {
         /// 降采样太狠了,有效点数不够，用0.1分辨率代替
         // LOG(INFO) << "too few points, using 0.1 resol";
         auto v = voxel_scan_;
-        v.setLeafSize(0.1, 0.1, 0.1);
+        const float leaf = std::min(0.1f, voxel_scan_.getLeafSize()[0]);
+        v.setLeafSize(leaf, leaf, leaf);
         v.setInputCloud(scan_undistort_);
-        Measure(runtime_stats_, RuntimeStats::downsample, [&] { v.filter(*scan_down_body_); });
+        Measure(runtime_stats_, RuntimeStats::downsample, [&] {
+            if (detail_options_.preserve_observed_points)
+                scan_down_body_ = mapping::ObservedVoxelCloud<PointType>(scan_undistort_, leaf);
+            else v.filter(*scan_down_body_);
+        });
 
         // LOG(INFO) << "Now pts: " << scan_down_body_->size() << ", before: " << cur_pts;
         cur_pts = scan_down_body_->size();
@@ -804,6 +831,11 @@ void LaserMapping::MapIncremental() {
 
         /* decide if need add to map */
         PointType &point_world = scan_down_world_->points[i];
+        if (detail_options_.preserve_observed_points) {
+            if (mapping::NeedsObservedVoxelPoint(point_world, nearest_points_[i], filter_size_map_min_))
+                points_to_add.emplace_back(point_world);
+            return;
+        }
         if (!nearest_points_[i].empty() && flg_EKF_inited_) {
             const PointVector &points_near = nearest_points_[i];
 
@@ -916,6 +948,15 @@ void LaserMapping::ObsModel(NavState &s, ESKF::CustomObservationModel &obs) {
                         point_selected_surf_[i] = false;
                         match_status[i] = features::PlaneStatus::InvalidInput;
                     }
+                }
+
+                if (point_selected_surf_[i] && options_.surface_support_.enabled &&
+                    !features::HasSurfaceSupport(std::array<double, 3>{point_world.x, point_world.y, point_world.z},
+                        std::array<double, 3>{plane_coef_[i][0], plane_coef_[i][1], plane_coef_[i][2]},
+                        points_near, options_.surface_support_)) {
+                    point_selected_surf_[i] = false;
+                    point_selected_icp_[i] = false;
+                    match_status[i] = features::PlaneStatus::SupportRejected;
                 }
 
                 /// 计算平面阈值
@@ -1095,6 +1136,22 @@ CloudPtr LaserMapping::GetGlobalMap(bool use_lio_pose, bool use_voxel, float res
     const auto keyframes = all_keyframes_;
     const auto poses = Keyframe::SnapshotPoses(keyframes, use_lio_pose);
     if (exported_poses) *exported_poses = poses;
+    if (use_voxel && detail_options_.preserve_observed_points) {
+        // Voxelize once in the final world frame. Do not average each keyframe, then average again.
+        mapping::CloudObservedSampler<PointType> sampler(res);
+        for (size_t i = 0; i < keyframes.size(); ++i) {
+            PointCloudType transformed;
+            pcl::transformPointCloud(*keyframes[i]->GetCloud(), transformed, poses[i].matrix());
+            for (const auto& point : transformed.points) sampler.Add(point);
+        }
+        global_map->points = sampler.ReleasePoints();
+        global_map->height = 1;
+        global_map->width = global_map->size();
+        global_map->is_dense = false;
+        LOG(INFO) << "[map_detail] observed-point global map: " << global_map->size()
+                  << ", invalid points skipped: " << sampler.Invalid();
+        return global_map;
+    }
     for (size_t i = 0; i < keyframes.size(); ++i) {
         const auto& kf = keyframes[i];
         CloudPtr cloud = kf->GetCloud();
