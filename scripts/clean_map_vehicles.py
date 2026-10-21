@@ -486,6 +486,10 @@ def main():
                         help='Keyframe result directory; default: next to input as <map>_clean (numbered if present)')
     parser.add_argument('--export-global', action='store_true',
                         help='Keyframe mode: also write a complete global_clean.pcd, overriding compact storage')
+    parser.add_argument('--compact-result',action='store_true',
+                        help='Keyframe mode: save only final global map and diagnostics, omit frame copies/debug clouds')
+    parser.add_argument('--global-voxel-size',type=float,default=0.,
+                        help='World voxel size for global export; compact-result defaults to 0.10m; 0 keeps all points')
     args = parser.parse_args()
     with open(args.config) as config_file:
         cfg = yaml.safe_load(config_file)
@@ -496,8 +500,8 @@ def main():
     mode = args.mode or cfg.get('clean_mode', 'map')
     if mode not in ('map', 'keyframes'):
         raise ValueError('clean_mode must be map or keyframes')
-    if mode != 'keyframes' and (args.output is not None or args.export_global):
-        parser.error('--output and --export-global require --mode keyframes or clean_mode: keyframes')
+    if mode != 'keyframes' and (args.output is not None or args.export_global or args.compact_result or args.global_voxel_size):
+        parser.error('Output layout/global export options require keyframes mode')
     map_dir = Path(args.map)
     T_imu_lidar, frame_contract = load_frame_contract(map_dir)
     cfg['_T_imu_lidar'] = T_imu_lidar.tolist()

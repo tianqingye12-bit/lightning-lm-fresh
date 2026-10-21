@@ -18,6 +18,8 @@ from clean_map_runtime import ViewSelector, file_digest
 from map_storage import storage_options, compress_pcd, require_compressor
 from pose_trajectory import load_trajectory, DENSE_FILES
 from clean_map_output import create_output_directory
+from audit_clean_map import vote_diagnostics
+from voxel_pcd_stream import VoxelPcdStream
 
 
 def load_manifest(directory, traj):
@@ -86,9 +88,20 @@ def run_keyframe_clean(args, cfg, frame_contract):
         raise ValueError('Keyframe rebuilding requires a version-2 IMU-frame map')
     evidence = evidence_options(cfg)
     storage = storage_options(cfg)
+    compact_result = getattr(args, 'compact_result', False)
+    global_voxel_size = getattr(args, 'global_voxel_size', 0.)
+    if compact_result and global_voxel_size == 0:
+        global_voxel_size = .1
+    if not np.isfinite(global_voxel_size) or (global_voxel_size != 0 and not .02 <= global_voxel_size <= .3):
+        raise ValueError('global_voxel_size must be zero or in [0.02, 0.3] metres')
+    if compact_result:
+        storage.update(write_global_clean=True,write_removed_points=False)
+        evidence['write_uncertain']=False
+    if global_voxel_size:
+        storage['write_global_clean']=True
     if getattr(args, 'export_global', False):
         storage['write_global_clean'] = True
-    if storage['compress_keyframes']:
+    if storage['compress_keyframes'] and not compact_result:
         require_compressor()
     directory = Path(args.map)
     traj = load_trajectory(directory, cfg, vr.Trajectory)
@@ -123,7 +136,8 @@ def run_keyframe_clean(args, cfg, frame_contract):
                                          directory / '.vehicle_mask_cache', identity, cfg)
     run_dir = create_output_directory(directory, getattr(args, 'output', None))
     clean_dir = run_dir / 'keyframe_clouds'
-    clean_dir.mkdir()
+    if not compact_result:
+        clean_dir.mkdir()
     print(f'Keyframe mode: {len(entries)} frames; image window=±{window:.2f}s; '
           f'active limit={max_active}; output={run_dir}', flush=True)
     print(f'Clean map output directory: {run_dir}', flush=True)
@@ -171,10 +185,12 @@ def run_keyframe_clean(args, cfg, frame_contract):
     started = time.monotonic()
     overlays = 0
     decision_counts = {}
+    gate_counts = {}
     frame_file = (run_dir / 'frames.csv').open('w', newline='')
     frame_columns = ['keyframe_id', 'timestamp', 'views', 'invalid_points', 'floor_unknown',
                      'total', 'removed', 'protected', 'background', 'uncertain', 'unobserved',
-                     'blocked_coverage', 'blocked_baseline', 'blocked_confidence']
+                     'blocked_coverage', 'blocked_baseline', 'blocked_confidence',
+                     'positive_points','blocked_min_views','blocked_positive_views','blocked_background','blocked_floor']
     frame_writer = csv.DictWriter(frame_file, fieldnames=frame_columns)
     frame_writer.writeheader()
     view_file = (run_dir / 'views.csv').open('w', newline='')
@@ -205,6 +221,7 @@ def run_keyframe_clean(args, cfg, frame_contract):
         header, cloud, finite, world, voter = state
         _, remove, _, _ = decide(voter.visible, voter.vehicle, voter.background, cfg, voter.baseline,
                                 positive_score=voter.score_sum)
+        pre_floor_remove=remove.copy()
         protected = np.zeros(len(world), bool)
         floor_unknown = False
         stats['frames_with_votes'] += int(voter.views > 0)
@@ -225,16 +242,19 @@ def run_keyframe_clean(args, cfg, frame_contract):
                                                cfg, voter.baseline, protected, positive_score=voter.score_sum)
         for key, value in counts.items():
             decision_counts[key] = decision_counts.get(key, 0) + value
+        gates=vote_diagnostics(voter.visible,voter.vehicle,voter.background,cfg,protected,pre_floor_remove)
+        for key,value in gates.items():gate_counts[key]=gate_counts.get(key,0)+value
         frame_writer.writerow(dict(keyframe_id=entries[index][0], timestamp=entries[index][1],
                                    views=voter.views, invalid_points=int((~finite).sum()),
-                                   floor_unknown=int(floor_unknown), **counts))
+                                   floor_unknown=int(floor_unknown), **counts, **gates))
         frame_file.flush()
         drop = np.zeros(len(cloud), bool)
         drop[finite] = remove
         frame_path = clean_dir / f'{entries[index][0]}.pcd'
-        vr.write_pcd(frame_path, header, cloud, ~drop)
-        if storage['compress_keyframes']:
-            compress_pcd(frame_path)
+        if not compact_result:
+            vr.write_pcd(frame_path, header, cloud, ~drop)
+            if storage['compress_keyframes']:
+                compress_pcd(frame_path)
         # Frame files remain in IMU coordinates; only rebuilt visualization clouds are world-frame.
         world_cloud = None
         if storage['write_global_clean'] or storage['write_removed_points'] or evidence['write_uncertain']:
@@ -249,7 +269,8 @@ def run_keyframe_clean(args, cfg, frame_contract):
                 if name not in output:
                     filename = {'clean': 'global_clean.pcd', 'vehicles': 'global_vehicles.pcd',
                                 'uncertain': 'global_uncertain.pcd'}[name]
-                    output[name] = PcdStream(run_dir / filename, header)
+                    output[name] = (VoxelPcdStream(run_dir / filename, header, global_voxel_size)
+                                    if name=='clean' and global_voxel_size else PcdStream(run_dir / filename, header))
                 output[name].append(world_cloud[selection])
         if viz is not None:
             add_preview('clean', index, world[~remove])
@@ -323,7 +344,8 @@ def run_keyframe_clean(args, cfg, frame_contract):
         for stream in output.values():
             stream.finish()
         # Copy the coordinate/pose contract for retained IMU-frame clouds.
-        shutil.copy2(directory / 'keyframe_clouds/index.csv', clean_dir / 'index.csv')
+        if not compact_result:
+            shutil.copy2(directory / 'keyframe_clouds/index.csv', clean_dir / 'index.csv')
         shutil.copy2(directory / 'keyframes.txt', run_dir / 'keyframes.txt')
         shutil.copy2(directory / 'map_frames.yaml', run_dir / 'map_frames.yaml')
         if traj.source == 'dense':
@@ -340,11 +362,16 @@ def run_keyframe_clean(args, cfg, frame_contract):
                      selection=selector.stats, coordinate_contract=frame_contract,
                      source='retained_keyframes', overlapping_frame_points_retained=True)
         stats.update(trajectory=traj.description, pose_queries=traj.query_stats)
+        stats.update(vote_gates=gate_counts,result_layout='global_only' if compact_result else 'keyframes',
+            global_export=dict(voxel_size_m=global_voxel_size,points=output['clean'].count,
+                input_points=getattr(output['clean'],'input_count',output['clean'].count),
+                policy='first_observed_point_per_voxel' if global_voxel_size else 'concatenated_frames')
+                if 'clean' in output else None)
         stats.update(output_directory=str(run_dir), input_map=str(directory.resolve()))
         (run_dir/'pose_failures.json').write_text(json.dumps(traj.failure_samples,indent=2,allow_nan=False)+'\n')
         (run_dir / 'summary.json').write_text(json.dumps(stats, indent=2) + '\n')
         (run_dir / 'INCOMPLETE').unlink()
-        print(f'Finished: cleaned frames={clean_dir}; world_cloud={storage["write_global_clean"]}; '
+        print(f'Finished: output={run_dir}; saved_frames={not compact_result}; world_cloud={storage["write_global_clean"]}; '
               f'removed_debug={storage["write_removed_points"]}; '
               f'{stats["removed_points"]}/'
               f'{stats["retained_points"] + stats["removed_points"]} points removed', flush=True)

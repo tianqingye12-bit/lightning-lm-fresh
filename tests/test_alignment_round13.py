@@ -167,7 +167,7 @@ class AlignmentTests(unittest.TestCase):
         for value in (0,True,float('nan')):
             with self.assertRaises(ValueError):trajectory_options({'pose_trajectory':{'max_gap_s':value}})
 
-    def exercise_clean(self,mode,preview=False,compact_preview=False,export_global=False):
+    def exercise_clean(self,mode,preview=False,compact_preview=False,export_global=False,delivery=False):
         with tempfile.TemporaryDirectory() as tmp:
             d=Path(tmp);frames=d/'keyframe_clouds';frames.mkdir()
             times=[.8,1.,1.2];poses=[[t,x,0,0,0,0,0,1] for t,x in zip(times,[0,.06,.12])]
@@ -215,8 +215,10 @@ class AlignmentTests(unittest.TestCase):
                 if mode=='keyframes':
                     result_path=d/'clean_diagnostics'/'keyframes_result'
                     if export_global:
-                        with patch.object(sys,'argv',['clean','--map',tmp,'--bag','unused','--config',str(path),
-                            '--output',str(result_path),'--export-global','--rviz']):vr.main()
+                        argv=['clean','--map',tmp,'--bag','unused','--config',str(path),
+                            '--output',str(result_path),'--export-global','--rviz']
+                        if delivery:argv.append('--compact-result')
+                        with patch.object(sys,'argv',argv):vr.main()
                     else:
                         run_keyframe_clean(SimpleNamespace(map=tmp,bag='unused',device='cpu',no_cache=True,
                             rviz=preview,output=result_path),cfg,'imu_v2')
@@ -232,9 +234,11 @@ class AlignmentTests(unittest.TestCase):
                     self.assertEqual(len(complete_cloud),1)
                     self.assertAlmostEqual(float(complete_cloud['x'][0]),1.06,places=6)
                     self.assertEqual(float(complete_cloud['intensity'][0]),9)
-                cleaned=vr.read_pcd(output/'keyframe_clouds/0.pcd')[1]
-                self.assertEqual(len(cleaned),2)
-                self.assertEqual(float(cleaned['intensity'][0]),9)
+                if delivery:self.assertFalse((output/'keyframe_clouds').exists())
+                else:
+                    cleaned=vr.read_pcd(output/'keyframe_clouds/0.pcd')[1]
+                    self.assertEqual(len(cleaned),2)
+                    self.assertEqual(float(cleaned['intensity'][0]),9)
             else:
                 removed=vr.read_pcd(output/'global_vehicles.pcd')[1]
                 self.assertEqual(len(removed),1);self.assertEqual(float(removed['intensity'][0]),7)
@@ -255,6 +259,11 @@ class AlignmentTests(unittest.TestCase):
                 self.assertEqual(events[-1][0],'spin')
             if mode=='keyframes':
                 reloaded=load_trajectory(run,cfg,vr.Trajectory);self.assertEqual(reloaded.source,'dense')
+                if delivery:
+                    self.assertEqual(report['result_layout'],'global_only')
+                    self.assertEqual(report['global_export']['voxel_size_m'],.1)
+                    self.assertEqual(report['vote_gates']['positive_points'],1)
+                    return
                 copied=d.parent/(d.name+'_copy')
                 try:
                     compact(run,copied,'mapping',compress=False)
@@ -273,6 +282,9 @@ class AlignmentTests(unittest.TestCase):
 
     def test_cli_output_and_global_export_override_compact_without_changing_cleaning(self):
         self.exercise_clean('keyframes',preview=True,compact_preview=True,export_global=True)
+
+    def test_delivery_result_omits_duplicate_frame_archive_and_preserves_cleaning(self):
+        self.exercise_clean('keyframes',preview=True,compact_preview=True,export_global=True,delivery=True)
 
     def test_static_projection_known_offset_and_fair_common_coverage(self):
         with tempfile.TemporaryDirectory() as tmp:
