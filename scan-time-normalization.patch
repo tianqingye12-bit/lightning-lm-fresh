@@ -1,0 +1,1417 @@
+diff --git a/src/core/lio/laser_mapping.cc b/src/core/lio/laser_mapping.cc
+index 9cb57bf2e715..d4139c3ea348 100644
+--- a/src/core/lio/laser_mapping.cc
++++ b/src/core/lio/laser_mapping.cc
+@@ -143,12 +143,28 @@
+         if (!options_.registration_quality_.Valid()) throw std::invalid_argument("invalid registration_quality options");
+ 
+         trajectory::Options recording;
++        const auto timing_config = yaml["fasterlio"]["scan_timing"];
++        if (timing_config && !timing_config.IsMap()) throw std::invalid_argument("scan_timing must be a map");
++        if (timing_config) {
++            const auto reference = timing_config["reference"].as<std::string>("legacy");
++            if (reference != "legacy" && reference != "relative_header")
++                throw std::invalid_argument("scan_timing.reference must be legacy or relative_header");
++            scan_timing_options_.enabled = reference == "relative_header";
++            scan_timing_options_.min_duration_s = timing_config["min_duration_s"].as<double>(.05);
++            scan_timing_options_.max_duration_s = timing_config["max_duration_s"].as<double>(.15);
++            scan_timing_options_.max_header_offset_s = timing_config["max_header_offset_s"].as<double>(.2);
++        }
++        if (!scan_timing_options_.Valid() || (scan_timing_options_.enabled && lidar_type != 2))
++            throw std::invalid_argument("relative_header timing requires Velodyne and valid duration/window limits");
++        preprocess_->RequireHeaderOffsets(scan_timing_options_.enabled);
++        p_imu_->RequireNormalizedScanTiming(scan_timing_options_.enabled);
+         const auto trajectory_config = yaml["fasterlio"]["trajectory_recording"];
+         if (trajectory_config && !trajectory_config.IsMap()) throw std::invalid_argument("trajectory_recording must be a map");
+         if (trajectory_config) {
+             recording.enabled = trajectory_config["enabled"].as<bool>(false);
+             recording.max_records = trajectory_config["max_records"].as<int>(200000);
+         }
++        recording.normalized_timing = scan_timing_options_.enabled;
+         trajectory_recorder_.Configure(recording);
+ 
+         const auto detail = yaml["fasterlio"]["map_detail"];
+@@ -218,6 +234,9 @@
+               << " diagnostics=" << options_.registration_quality_.diagnostics
+               << " rotation_scale_m=" << options_.registration_quality_.rotation_scale_m;
+     LOG(INFO) << "[scan_trajectory] enabled=" << trajectory_recorder_.Enabled();
++    LOG(INFO) << "[scan_timing] reference=" << (scan_timing_options_.enabled ? "relative_header" : "legacy")
++              << " duration_limits_s=" << scan_timing_options_.min_duration_s << ","
++              << scan_timing_options_.max_duration_s;
+     LOG(INFO) << "feature quality: pca=" << options_.plane_quality_.enabled
+               << " min_spread=" << options_.plane_quality_.min_spread
+               << " tangent_ratio=" << options_.plane_quality_.min_tangent_ratio
+@@ -750,6 +769,30 @@
+     // }
+ }
+ 
++bool LaserMapping::NormalizeScanTime(CloudPtr cloud, double header, double& begin) {
++    begin = header;
++    if (!scan_timing_options_.enabled) return true;
++    const auto interval = timing::NormalizeHeaderOffsets(cloud->points, header, scan_timing_options_);
++    if (!interval.valid || interval.end <= last_normalized_end_ ||
++        (std::isfinite(last_normalized_end_) && header <= last_timestamp_lidar_)) {
++        input_buffer_fault_ = true; imu_prediction_suspended_ = true;
++        trajectory_recorder_.MarkFault();
++        if (ui_) ui_->UpdatePredictionStatus(false, "scan_timing_fault", 0);
++        LOG(ERROR) << "[scan_timing] stopped: " << (interval.valid ? "non-increasing scan end" : interval.reason)
++                   << " header=" << std::setprecision(16) << header
++                   << " raw_min_s=" << interval.minimum_s << " raw_max_s=" << interval.maximum_s
++                   << "; inspect the raw time field and restart; no timing fallback";
++        return false;
++    }
++    begin = interval.begin;
++    last_normalized_end_ = interval.end;
++    if (scan_count_ == 1 || scan_count_ % 200 == 0)
++        LOG(INFO) << "[scan_timing] begin=" << std::setprecision(16) << begin << " end=" << interval.end
++                  << " duration_s=" << interval.end-begin << " raw_min_s=" << interval.minimum_s
++                  << " raw_max_s=" << interval.maximum_s;
++    return true;
++}
++
+ void LaserMapping::ProcessPointCloud2(const sensor_msgs::msg::PointCloud2::SharedPtr &msg) {
+     UL lock(mtx_buffer_);
+     if (input_buffer_fault_) return;
+@@ -764,6 +807,10 @@
+             scan_count_++;
+             double timestamp = ToSec(msg->header.stamp);
+             if (timestamp < last_timestamp_lidar_) {
++                if (scan_timing_options_.enabled) {
++                    input_buffer_fault_ = true; imu_prediction_suspended_ = true;
++                    trajectory_recorder_.MarkFault();
++                }
+                 LOG(ERROR) << "lidar loop back, dt: " << timestamp - last_timestamp_lidar_;
+                 return;
+             }
+@@ -772,10 +819,20 @@
+                       << ", latest imu: " << last_timestamp_imu_;
+ 
+             CloudPtr cloud(new PointCloudType());
+-            Measure(runtime_stats_, RuntimeStats::preprocess, [&] { preprocess_->Process(msg, cloud); });
+-
++            try {
++                Measure(runtime_stats_, RuntimeStats::preprocess, [&] { preprocess_->Process(msg, cloud); });
++            } catch (const std::exception& error) {
++                if (!scan_timing_options_.enabled) throw;
++                input_buffer_fault_ = true; imu_prediction_suspended_ = true;
++                trajectory_recorder_.MarkFault();
++                LOG(ERROR) << "[scan_timing] stopped during preprocessing: " << error.what();
++                return;
++            }
++
++            double begin = timestamp;
++            if (!NormalizeScanTime(cloud, timestamp, begin)) return;
+             lidar_buffer_.push_back(cloud);
+-            time_buffer_.push_back(timestamp);
++            time_buffer_.push_back(begin);
+             last_timestamp_lidar_ = timestamp;
+         },
+         "Preprocess (Standard)");
+@@ -784,6 +841,11 @@
+ void LaserMapping::ProcessPointCloud2(const livox_ros_driver2::msg::CustomMsg::SharedPtr &msg) {
+     UL lock(mtx_buffer_);
+     if (input_buffer_fault_) return;
++    if (scan_timing_options_.enabled) {
++        input_buffer_fault_ = true; imu_prediction_suspended_ = true;trajectory_recorder_.MarkFault();
++        LOG(ERROR) << "[scan_timing] relative_header profile accepts Velodyne PointCloud2 only";
++        return;
++    }
+     if (max_lidar_buffer_ && lidar_buffer_.size() >= max_lidar_buffer_) {
+         ++dropped_input_lidar_;
+         if (dropped_input_lidar_ == 1 || dropped_input_lidar_ % 20 == 0)
+@@ -827,12 +889,19 @@
+ 
+             double timestamp = math::ToSec(cloud->header.stamp);
+             if (timestamp < last_timestamp_lidar_) {
++                if (scan_timing_options_.enabled) {
++                    input_buffer_fault_ = true; imu_prediction_suspended_ = true;trajectory_recorder_.MarkFault();
++                    LOG(ERROR) << "[scan_timing] non-increasing input header";return;
++                }
+                 LOG(ERROR) << "lidar loop back, clear buffer";
+                 lidar_buffer_.clear();
+             }
+ 
++            if (scan_timing_options_.enabled) cloud.reset(new PointCloudType(*cloud));
++            double begin = timestamp;
++            if (!NormalizeScanTime(cloud, timestamp, begin)) return;
+             lidar_buffer_.push_back(cloud);
+-            time_buffer_.push_back(timestamp);
++            time_buffer_.push_back(begin);
+             last_timestamp_lidar_ = timestamp;
+         },
+         "Preprocess (Standard)");
+@@ -849,7 +918,20 @@
+         measures_.scan_ = lidar_buffer_.front();
+         measures_.lidar_begin_time_ = time_buffer_.front();
+ 
+-        if (measures_.scan_->points.size() <= 1) {
++        if (scan_timing_options_.enabled) {
++            const auto points = trajectory::InspectPointTiming(measures_.scan_->points);
++            if (points.count < 2 || points.nonfinite || points.negative ||
++                !std::isfinite(points.maximum_s) || std::abs(points.minimum_s) > 1e-6 ||
++                points.maximum_s < scan_timing_options_.min_duration_s ||
++                points.maximum_s > scan_timing_options_.max_duration_s) {
++                input_buffer_fault_ = true;
++                imu_prediction_suspended_ = true;trajectory_recorder_.MarkFault();
++                LOG(ERROR) << "[scan_timing] normalized scan failed synchronization validation";
++                return false;
++            }
++            lidar_end_time_ = measures_.lidar_begin_time_ + points.maximum_s;
++            lidar_mean_scantime_ = points.maximum_s;
++        } else if (measures_.scan_->points.size() <= 1) {
+             LOG(WARNING) << "Too few input point cloud!";
+             lidar_end_time_ = measures_.lidar_begin_time_ + lidar_mean_scantime_;
+         } else if (measures_.scan_->points.back().time / double(1000) < 0.5 * lidar_mean_scantime_) {
+diff --git a/src/core/lio/laser_mapping.h b/src/core/lio/laser_mapping.h
+index d31c4696155a..8b5441e87694 100644
+--- a/src/core/lio/laser_mapping.h
++++ b/src/core/lio/laser_mapping.h
+@@ -15,6 +15,7 @@
+ #include "core/lio/feature_quality.h"
+ #include "core/lio/registration_quality.h"
+ #include "core/lio/scan_trajectory.h"
++#include "core/lio/scan_timing.h"
+ #include "core/lio/surface_support.h"
+ #include "core/lio/map_detail.h"
+ #include "core/lio/imu_prediction.h"
+@@ -157,6 +158,7 @@
+     bool AdvanceImuPrediction(const IMUPtr& imu, const char* source);
+     void RebaseImuPrediction(bool update_accepted);
+     void RecordScan(trajectory::Status status);
++    bool NormalizeScanTime(CloudPtr cloud, double header, double& begin);
+ 
+ 
+     inline void PointBodyToWorld(const PointType &pi, PointType &po) {
+@@ -186,6 +188,8 @@
+     Options options_;
+     trajectory::Recorder trajectory_recorder_;
+     trajectory::Scan current_scan_record_;
++    timing::Options scan_timing_options_;
++    double last_normalized_end_ = -std::numeric_limits<double>::infinity();
+ 
+     /// modules
+     IVoxType::Options ivox_options_;
+diff --git a/src/core/lio/imu_processing.hpp b/src/core/lio/imu_processing.hpp
+index 2fa84600edc3..2b41789bee55 100644
+--- a/src/core/lio/imu_processing.hpp
++++ b/src/core/lio/imu_processing.hpp
+@@ -19,6 +19,7 @@
+ #include "core/lio/eskf.hpp"
+ #include "core/lio/imu_filter.h"
+ #include "core/lio/imu_prediction.h"
++#include "core/lio/scan_timing.h"
+ #include "core/lio/pose6d.h"
+ #include "utils/timer.h"
+ 
+@@ -45,6 +46,7 @@
+     bool LastScanHadImuGap() const { return last_scan_had_gap_; }
+     bool IsIMUInited() const { return imu_need_init_ == false; }
+     void SetUseIMUFilter(bool b) { use_imu_filter_ = b; }
++    void RequireNormalizedScanTiming(bool enabled) { normalized_scan_timing_ = enabled; }
+ 
+     double GetMeanAccNorm() const { return mean_acc_.norm(); }
+     double GetAccScaleFactor() const { return acc_scale_factor_; }
+@@ -84,6 +86,7 @@
+     bool propagation_fault_ = false;
+     bool last_scan_had_gap_ = false;
+     bool use_imu_filter_ = true;
++    bool normalized_scan_timing_ = false;
+     IMUFilter filter_;
+ };
+ 
+@@ -214,6 +217,19 @@
+ 
+     auto imu_state = kf_state.GetX();
+     imu_pose_.clear();
++    if (normalized_scan_timing_ && imu_state.timestamp_ > pcl_beg_time) {
++        const double dt_start = pcl_beg_time-imu_state.timestamp_;
++        if (timing::CanBackcast(pcl_beg_time, imu_state.timestamp_)) {
++            // Adjacent Velodyne packets can overlap by fractions of a millisecond.
++            // Include this bounded prefix in deskew, without moving the ESKF clock backwards.
++            const Mat3d rotation = (imu_state.rot_ * SO3::exp(angvel_last_*dt_start)).matrix();
++            imu_pose_.emplace_back(0., acc_s_last_, angvel_last_,
++                imu_state.vel_+acc_s_last_*dt_start,
++                imu_state.pos_+imu_state.vel_*dt_start+.5*acc_s_last_*dt_start*dt_start, rotation);
++        } else {
++            last_scan_had_gap_ = true;  // Predict through the interval; skip registration and insertion.
++        }
++    }
+     imu_pose_.emplace_back(imu_state.timestamp_ - pcl_beg_time, acc_s_last_, angvel_last_,
+                            imu_state.vel_, imu_state.pos_, imu_state.rot_.matrix());
+     Vec3d angvel_avr, acc_avr, acc_imu, vel_imu, pos_imu;
+diff --git a/src/core/lio/pointcloud_preprocess.h b/src/core/lio/pointcloud_preprocess.h
+index 91583ca7a5cf..85eacfc62609 100644
+--- a/src/core/lio/pointcloud_preprocess.h
++++ b/src/core/lio/pointcloud_preprocess.h
+@@ -42,6 +42,7 @@
+     float &TimeScale() { return time_scale_; }
+     LidarType GetLidarType() const { return lidar_type_; }
+     void SetLidarType(LidarType lt) { lidar_type_ = lt; }
++    void RequireHeaderOffsets(bool enabled) { require_header_offsets_ = enabled; }
+ 
+     void SetHeightROI(float height_max, float height_min) {
+         height_max_ = height_max;
+@@ -61,6 +62,7 @@
+     double blind_ = 0.01;
+     float time_scale_ = 1e-3;
+     bool given_offset_time_ = false;
++    bool require_header_offsets_ = false;
+ 
+     float height_max_ = 1.0;
+     float height_min_ = -1.0;
+diff --git a/src/core/lio/pointcloud_preprocess.cc b/src/core/lio/pointcloud_preprocess.cc
+index 7b6b255a20cf..69f32c9afb0a 100644
+--- a/src/core/lio/pointcloud_preprocess.cc
++++ b/src/core/lio/pointcloud_preprocess.cc
+@@ -1,5 +1,7 @@
+ #include "pointcloud_preprocess.h"
++#include <algorithm>
+ #include <execution>
++#include <stdexcept>
+ 
+ #include <glog/logging.h>
+ 
+@@ -181,10 +183,19 @@
+     cloud_out_.clear();
+     cloud_full_.clear();
+ 
++    if (require_header_offsets_) {
++        const auto field = std::find_if(msg->fields.begin(), msg->fields.end(),
++            [](const auto& f) { return f.name == "time"; });
++        if (field == msg->fields.end() || field->count != 1 ||
++            field->datatype != sensor_msgs::msg::PointField::FLOAT32)
++            throw std::invalid_argument("relative_header Velodyne timing requires scalar FLOAT32 field 'time'");
++    }
++
+     pcl::PointCloud<velodyne_ros::Point> pl_orig;
+     pcl::fromROSMsg(*msg, pl_orig);
+     int plsize = pl_orig.points.size();
+     cloud_out_.reserve(plsize);
++    if (plsize == 0) return;
+ 
+     /*** These variables only works when no point timestamps given ***/
+     double omega_l = 3.61;  // scan angular velocity
+@@ -194,7 +205,7 @@
+     std::vector<float> time_last(num_scans_, 0.0);  // last offset time
+     /*****************************************************************/
+ 
+-    if (pl_orig.points[plsize - 1].time > 0) {
++    if (require_header_offsets_ || pl_orig.points[plsize - 1].time > 0) {
+         given_offset_time_ = true;
+     } else {
+         given_offset_time_ = false;
+@@ -216,10 +227,11 @@
+         added_pt.y = pl_orig.points[i].y;
+         added_pt.z = pl_orig.points[i].z;
+         added_pt.intensity = pl_orig.points[i].intensity;
+-        added_pt.time = pl_orig.points[i].time * time_scale_;  // curvature unit: ms
++        added_pt.time = static_cast<double>(pl_orig.points[i].time) * time_scale_;  // ms
+ 
+         if (!given_offset_time_) {
+             int layer = pl_orig.points[i].ring;
++            if (layer < 0 || layer >= num_scans_) continue;
+             double yaw_angle = atan2(added_pt.y, added_pt.x) * 57.2957;
+ 
+             if (is_first[layer]) {
+diff --git a/src/core/lio/scan_timing.h b/src/core/lio/scan_timing.h
+new file mode 100644
+index 000000000000..92cd093c78c4 100644
+--- /dev/null
++++ b/src/core/lio/scan_timing.h
+@@ -0,0 +1,64 @@
++#pragma once
++
++#include <algorithm>
++#include <cmath>
++#include <limits>
++
++namespace lightning::timing {
++// Explicit opt-in: milliseconds are offsets from the ROS header, which can lie
++// before, inside or after a scan. Preserve header+offset for every sample.
++struct Options {
++    bool enabled = false;
++    double min_duration_s = .05, max_duration_s = .15, max_header_offset_s = .2;
++    bool Valid() const {
++        return std::isfinite(min_duration_s) && std::isfinite(max_duration_s) &&
++               std::isfinite(max_header_offset_s) && min_duration_s > 0 &&
++               min_duration_s < max_duration_s && max_duration_s <= 1 &&
++               max_header_offset_s >= max_duration_s && max_header_offset_s <= 2;
++    }
++};
++struct Interval {
++    bool valid = false;
++    double begin = 0, end = 0, minimum_s = 0, maximum_s = 0;
++    const char* reason = "empty_scan";
++};
++template <class PointRange>
++Interval HeaderInterval(const PointRange& points, double header, const Options& options) {
++    Interval out;
++    if (!options.Valid()) { out.reason = "invalid_options"; return out; }
++    if (!std::isfinite(header)) { out.reason = "nonfinite_header"; return out; }
++    if (points.size() < 2) return out;
++    double low = std::numeric_limits<double>::infinity(), high = -low;
++    for (const auto& point : points) {
++        const double offset = point.time / 1000.0;
++        if (!std::isfinite(offset)) { out.reason = "nonfinite_point_time"; return out; }
++        low = std::min(low, offset); high = std::max(high, offset);
++    }
++    out.minimum_s = low; out.maximum_s = high;
++    if (std::max(std::abs(low),std::abs(high)) > options.max_header_offset_s) {
++        out.reason = "offset_outside_header_window"; return out;
++    }
++    const double duration = high-low;
++    if (duration < options.min_duration_s || duration > options.max_duration_s) {
++        out.reason = "scan_duration_outside_limits"; return out;
++    }
++    out.begin = header+low; out.end = header+high;
++    if (!std::isfinite(out.begin) || !std::isfinite(out.end) || out.end <= out.begin) {
++        out.reason = "unrepresentable_scan_interval"; return out;
++    }
++    out.valid = true; out.reason = "ok"; return out;
++}
++template <class PointRange>
++Interval NormalizeHeaderOffsets(PointRange& points, double header, const Options& options) {
++    const auto out = HeaderInterval(points, header, options);
++    if (!out.valid) return out;  // Validation failure must not partially mutate a scan.
++    double shift_ms = points.front().time;
++    for (const auto& point : points) shift_ms = std::min(shift_ms, static_cast<double>(point.time));
++    for (auto& point : points) point.time -= shift_ms;
++    return out;
++}
++inline bool CanBackcast(double begin, double state_time, double tolerance = .002) {
++    return std::isfinite(begin) && std::isfinite(state_time) &&
++           state_time-begin <= tolerance+1e-9;
++}
++}  // namespace lightning::timing
+diff --git a/src/core/lio/scan_trajectory.h b/src/core/lio/scan_trajectory.h
+index 199a19fc5a75..efa6baa204d0 100644
+--- a/src/core/lio/scan_trajectory.h
++++ b/src/core/lio/scan_trajectory.h
+@@ -19,6 +19,7 @@
+ 
+ struct Options {
+     bool enabled = false;
++    bool normalized_timing = false;
+     int max_records = 200000;
+     bool Valid() const { return max_records >= 100 && max_records <= 2000000; }
+ };
+@@ -61,6 +62,14 @@
+         else { out.minimum_s = std::min(out.minimum_s, value); out.maximum_s = std::max(out.maximum_s, value); }
+     }
+     return out;
++}
++
++inline bool UsablePointTiming(const PointTiming& points, double duration) {
++    return points.count >= 2 && points.nonfinite == 0 && points.negative == 0 &&
++        std::isfinite(points.minimum_s) && std::isfinite(points.maximum_s) &&
++        std::isfinite(duration) && duration > 0 && duration <= 1 &&
++        points.minimum_s >= 0 && points.minimum_s <= points.maximum_s &&
++        std::abs(points.maximum_s-duration) <= .002;
+ }
+ 
+ inline bool Rigid(const Eigen::Isometry3d& pose) {
+@@ -128,6 +137,7 @@
+     bool Enabled() const { return options_.enabled; }
+     const std::vector<Scan>& Scans() const { return scans_; }
+     std::size_t Faults() const { return faults_; }
++    void MarkFault() { if (Enabled()) ++faults_; }
+     void Add(const Scan& scan) {
+         if (!Enabled()) return;
+         if (scans_.size() >= static_cast<std::size_t>(options_.max_records) ||
+@@ -173,9 +183,11 @@
+             const auto& s = scans_[i];
+             const auto raw = Unpack(s.raw);
+             const auto corrected = Correct(s.timestamp, raw, anchors);
++            const double duration = s.timestamp-s.begin;
++            const bool timing_valid = UsablePointTiming(s.points,duration);
+             const bool usable = s.pose_valid && Rigid(raw) &&
+                 (s.status == Status::Accepted || s.status == Status::Bootstrap) && !s.imu_gap &&
+-                s.points.nonfinite == 0 && s.points.negative == 0 &&
++                timing_valid &&
+                 std::isfinite(s.state_timestamp) && std::abs(s.state_timestamp-s.timestamp) <= 1e-5;
+             usable_count += usable;
+             file << i << ',' << s.begin << ',' << s.timestamp << ',' << s.state_timestamp << ',' << Name(s.status) << ',' << usable;
+@@ -188,11 +200,15 @@
+         }
+         file.close();
+         auto metadata = open("trajectory.yaml");
+-        metadata << "format_version: 1\npose_frame: imu\ncoordinate_frame: exported_map\n"
++        metadata << "format_version: " << (options_.normalized_timing ? 2 : 1)
++                 << "\npose_frame: imu\ncoordinate_frame: exported_map\n"
+                  << "timestamp_reference: lidar_end\ncorrection_method: interpolated_keyframe_correction\n"
+                  << "complete: " << (faults_ == 0 ? "true" : "false") << "\nrows: " << scans_.size()
+                  << "\nusable_rows: " << usable_count << "\nrecording_faults: " << faults_
+                  << "\nkeyframes: " << anchors.size() << '\n';
++        if (options_.normalized_timing)
++            metadata << "point_time_reference: scan_begin\nscan_timing_policy: relative_header\n"
++                     << "point_end_tolerance_s: 0.002\n";
+         metadata.close();
+     }
+  private:
+diff --git a/scripts/pose_trajectory.py b/scripts/pose_trajectory.py
+index ba34683514ea..5455129ab0cb 100644
+--- a/scripts/pose_trajectory.py
++++ b/scripts/pose_trajectory.py
+@@ -13,13 +13,17 @@
+ 
+ 
+ def trajectory_options(cfg):
+-    options = dict(source='auto', max_gap_s=.2)
++    options = dict(source='auto', max_gap_s=.2, require_normalized_timing=False)
+     supplied = cfg.get('pose_trajectory', {})
+     if not isinstance(supplied, dict) or set(supplied)-set(options):
+         raise ValueError('Unknown pose_trajectory option')
+     options.update(supplied)
+     if options['source'] not in ('auto', 'dense', 'keyframes'):
+         raise ValueError('pose_trajectory.source must be auto, dense or keyframes')
++    if not isinstance(options['require_normalized_timing'], bool):
++        raise ValueError('require_normalized_timing must be boolean')
++    if options['require_normalized_timing'] and options['source'] != 'dense':
++        raise ValueError('require_normalized_timing requires source=dense')
+     gap = options['max_gap_s']
+     if isinstance(gap, bool) or not isinstance(gap, (int, float)) or not np.isfinite(gap) or gap <= 0 or gap > 2:
+         raise ValueError('pose_trajectory.max_gap_s must be numeric in (0, 2]')
+@@ -78,10 +82,18 @@
+         if contract != 'imu_v2':
+             raise ValueError('Dense IMU trajectory requires the version-2 map frame contract')
+         metadata = yaml.safe_load((directory/'trajectory.yaml').read_text())
+-        required = dict(format_version=1, pose_frame='imu', coordinate_frame='exported_map',
++        required = dict(pose_frame='imu', coordinate_frame='exported_map',
+                         timestamp_reference='lidar_end', correction_method='interpolated_keyframe_correction')
+-        if not isinstance(metadata, dict) or any(metadata.get(k) != v for k,v in required.items()):
++        if (not isinstance(metadata, dict) or metadata.get('format_version') not in (1,2) or
++                any(metadata.get(k) != v for k,v in required.items())):
+             raise ValueError('Unsupported dense trajectory coordinate/version contract')
++        normalized = metadata['format_version'] == 2
++        if normalized and (metadata.get('point_time_reference') != 'scan_begin' or
++                metadata.get('scan_timing_policy') != 'relative_header' or
++                metadata.get('point_end_tolerance_s') != .002):
++            raise ValueError('Unsupported normalized point timing contract')
++        if self.options['require_normalized_timing'] and not normalized:
++            raise ValueError('This profile needs a NEW map recorded with scan_timing.reference=relative_header; old usable flags cannot repair timing')
+         if metadata.get('complete') is not True or metadata.get('recording_faults') != 0:
+             raise ValueError('Dense recording incomplete (capacity/time fault); no automatic sparse fallback')
+         for key in ('rows', 'usable_rows', 'keyframes'):
+@@ -120,9 +132,22 @@
+                 if min(counters)<0 or row['imu_gap'] not in ('0','1'):
+                     raise ValueError('Invalid dense scan timing flags')
+                 bad_points = sum(counters)
++                end_difference = float(row['point_end_difference_s'])
++                timing_bad = not np.isfinite(end_difference) or abs(end_difference) > .002
++                if normalized:
++                    begin = float(row['begin_time'])
++                    duration = float(row['scan_duration_s'])
++                    minimum,maximum = float(row['point_min_s']),float(row['point_max_s'])
++                    if not np.isfinite([begin,duration,minimum,maximum]).all():
++                        timing_bad = True
++                    else:
++                        timing_bad |= (int(row['point_count']) < 2 or not 0 < duration <= 1 or
++                            abs(vector[0]-begin-duration) > 1e-6 or abs(minimum) > 1e-6 or minimum < 0 or minimum > maximum or
++                            abs(maximum-duration) > .002 or
++                            abs(end_difference-(maximum-duration)) > 1e-6)
+                 if valid and (row['status'] not in ('accepted','bootstrap') or row['imu_gap'] != '0' or
+-                              bad_points or not np.isfinite(clock_error) or abs(clock_error) > 1e-5):
+-                    raise ValueError('Dense usable flag contradicts scan quality')
++                              bad_points or timing_bad or not np.isfinite(clock_error) or abs(clock_error) > 1e-5):
++                    raise ValueError('Dense usable flag contradicts scan quality/point timing; rebuild a NEW map, do not change usable flags')
+                 values.extend(vector); usable.append(valid); modes.append(MODES.index(row['correction_mode']))
+                 status_counts[row['status']] = status_counts.get(row['status'],0)+1
+                 timing['imu_gap_scans'] += int(row['imu_gap'])
+@@ -139,13 +164,18 @@
+         # Every graph anchor must be represented exactly in this recording.
+         for i,t in enumerate(self.t):
+             j = int(np.searchsorted(self.dense_t,t))
+-            if (j == len(data) or abs(self.dense_t[j]-t)>1e-6 or not self.usable[j] or
++            candidates = [k for k in (j-1,j) if 0 <= k < len(data)]
++            j = min(candidates,key=lambda k:abs(self.dense_t[k]-t))
++            if abs(self.dense_t[j]-t)<=1e-6 and not self.usable[j]:
++                raise ValueError(f'Saved keyframe {self.ids[i]} is marked unusable in dense trajectory; inspect point timing and rebuild a NEW map')
++            if (abs(self.dense_t[j]-t)>1e-6 or
+                     np.linalg.norm(self.dense_p[j]-self.p[i])>1e-5 or
+                     abs(abs(np.dot(self.dense_q[j],self.q[i]))-1)>1e-6):
+                 raise ValueError('Dense trajectory does not reproduce a saved keyframe pose')
+         self.source = 'dense'
+         self.description = dict(source='dense', max_gap_s=float(self.options['max_gap_s']),
+             rows=len(data), usable_rows=int(self.usable.sum()), statuses=status_counts, timing=timing,
++            format_version=metadata['format_version'],normalized_timing=normalized,
+             correction_method=metadata['correction_method'], hashes={name:file_digest(directory/name) for name in DENSE_FILES})
+ 
+     def _lookup(self, timestamp):
+diff --git a/scripts/restore_map_cleanup.py b/scripts/restore_map_cleanup.py
+index 22939408cfdb..37e86fa57a17 100644
+--- a/scripts/restore_map_cleanup.py
++++ b/scripts/restore_map_cleanup.py
+@@ -28,16 +28,23 @@
+     return result
+ 
+ 
+-def prepare(source,output,resolution=.1):
++def prepare(source,output,resolution=.1,require_dense=False):
+     from clean_map_runtime import load_frame_contract
+     from clean_map_keyframes import load_manifest
+     from clean_map_vehicles import Trajectory,read_pcd
+     from voxel_pcd_stream import VoxelPcdStream
++    from pose_trajectory import DENSE_FILES, load_trajectory
+     source=Path(source).expanduser().resolve()
+     if (source/'INCOMPLETE').exists():raise ValueError('Source map is incomplete')
+     if not np.isfinite(resolution) or not .02<=resolution<=.2:raise ValueError('Resolution must be in [0.02,0.2] metres')
+     _,contract=load_frame_contract(source)
+     trajectory=Trajectory(source/'keyframes.txt',2.)
++    dense_present=[(source/name).is_file() for name in DENSE_FILES]
++    if require_dense and any(dense_present) and not all(dense_present):
++        raise ValueError('Source contains a partial dense trajectory; restore the complete export before preparing')
++    if require_dense:
++        load_trajectory(source,dict(max_kf_gap=2.,pose_trajectory=dict(
++            source='dense',max_gap_s=.2,require_normalized_timing=True)),Trajectory)
+     original=source/'global.pcd'
+     entries=None
+     if not original.is_file():
+@@ -68,9 +75,12 @@
+             if writer is not None:writer.close()
+     for name in ('keyframes.txt','map_frames.yaml'):
+         if (source/name).exists():shutil.copy2(source/name,output/name)
++    if require_dense:
++        for name in DENSE_FILES: shutil.copy2(source/name,output/name)
+     report=dict(source_map=str(source),output_map=str(output),preparation=mode,
+         reconstruction_resolution_m=resolution if entries is not None else None,
+-        source_unchanged=True,semantic_cleaning_performed=False)
++        source_unchanged=True,semantic_cleaning_performed=False,
++        dense_trajectory_copied=bool(require_dense),normalized_dense_verified=bool(require_dense))
+     (output/'PREPARED_MAP.json').write_text(json.dumps(report,indent=2)+'\n')
+     (output/'INCOMPLETE').unlink()
+     print(f'Map-mode input ready: {output}',flush=True)
+@@ -84,8 +94,10 @@
+     profile=sub.add_parser('config');profile.add_argument('--input',required=True);profile.add_argument('--output',required=True)
+     preparation=sub.add_parser('prepare');preparation.add_argument('--map',required=True);preparation.add_argument('--output',required=True)
+     preparation.add_argument('--voxel-size',type=float,default=.1)
++    preparation.add_argument('--require-dense',action='store_true',
++        help='Validate the normalized dense trajectory before creating a map-mode input')
+     args=parser.parse_args()
+     try:
+         if args.command=='config':write_profile(args.input,args.output)
+-        else:prepare(args.map,args.output,args.voxel_size)
++        else:prepare(args.map,args.output,args.voxel_size,args.require_dense)
+     except (ValueError,TypeError,OSError,yaml.YAMLError) as error:parser.exit(1,f'{error}\n')
+diff --git a/scripts/configure_scan_timing.py b/scripts/configure_scan_timing.py
+new file mode 100644
+index 000000000000..82be7f08bf3a 100644
+--- /dev/null
++++ b/scripts/configure_scan_timing.py
+@@ -0,0 +1,64 @@
++#!/usr/bin/env python3
++"""Create NEW M2DGR timing profiles; original YAML and old maps are never changed."""
++import argparse
++import copy
++from pathlib import Path
++import yaml
++
++# Official calibration_results.txt gives T_lidar_handsfree; this is its inverse,
++# T_imu_lidar, as consumed by LaserMapping/GetTImuLidar.
++HANDSFREE_T_IMU_LIDAR = [.27255, -.00053, .17954]
++IDENTITY_ROTATION = [1.,0.,0.,0.,1.,0.,0.,0.,1.]
++
++
++def configure(cfg, mode, handsfree_extrinsics=False):
++    if not isinstance(cfg,dict):
++        raise ValueError('Input must be a YAML mapping')
++    out=copy.deepcopy(cfg)
++    if mode=='mapping':
++        common,lio=out.get('common',{}),out.get('fasterlio',{})
++        if (common.get('dataset')!='m2dgr' or lio.get('lidar_type')!=2 or
++                lio.get('time_scale')!=1000.):
++            raise ValueError('This profile requires M2DGR Velodyne, lidar_type=2 and seconds->ms time_scale=1000')
++        lio['scan_timing']=dict(reference='relative_header',min_duration_s=.05,
++                                max_duration_s=.15,max_header_offset_s=.2)
++        lio['trajectory_recording']={**lio.get('trajectory_recording',{}), 'enabled':True}
++        lio['trajectory_recording'].setdefault('max_records',200000)
++        if handsfree_extrinsics:
++            if common.get('imu_topic')!='/handsfree/imu':
++                raise ValueError('--handsfree-extrinsics requires /handsfree/imu')
++            lio['extrinsic_T']=HANDSFREE_T_IMU_LIDAR.copy()
++            lio['extrinsic_R']=IDENTITY_ROTATION.copy()
++            lio['extrinsic_est_en']=False
++        out['fasterlio']=lio
++        if not isinstance(out.get('system'),dict):
++            raise ValueError('Missing system mapping')
++        out['system']['export_keyframe_clouds']=True
++    elif mode=='semantic':
++        if handsfree_extrinsics:
++            raise ValueError('IMU calibration is applied when mapping, not to an existing semantic map')
++        out['pose_trajectory']=dict(source='dense',max_gap_s=.2,require_normalized_timing=True)
++    else:
++        raise ValueError('Mode must be mapping or semantic')
++    return out
++
++
++def write_profile(source,output,mode,handsfree_extrinsics=False):
++    result=configure(yaml.safe_load(Path(source).read_text()),mode,handsfree_extrinsics)
++    with Path(output).open('x') as stream:
++        yaml.safe_dump(result,stream,allow_unicode=True,sort_keys=False)
++    return result
++
++
++def main():
++    parser=argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('mode',choices=['mapping','semantic'])
++    parser.add_argument('--input',required=True);parser.add_argument('--output',required=True)
++    parser.add_argument('--handsfree-extrinsics',action='store_true')
++    args=parser.parse_args()
++    try: write_profile(args.input,args.output,args.mode,args.handsfree_extrinsics)
++    except (OSError,ValueError,TypeError,yaml.YAMLError) as exc:parser.exit(1,str(exc)+'\n')
++    print(f'Created {args.output}; use only with a NEW map')
++
++
++if __name__=='__main__':main()
+diff --git a/scripts/audit_lidar_timing.py b/scripts/audit_lidar_timing.py
+new file mode 100644
+index 000000000000..683ab338abee 100644
+--- /dev/null
++++ b/scripts/audit_lidar_timing.py
+@@ -0,0 +1,91 @@
++#!/usr/bin/env python3
++"""Read raw Velodyne time fields without SLAM/YOLO; test an explicit relative-header hypothesis."""
++import argparse
++from collections import Counter
++import json
++from pathlib import Path
++import numpy as np
++import yaml
++
++
++def time_values(msg):
++    fields=[f for f in msg.fields if f.name=='time']
++    if len(fields)!=1 or fields[0].datatype!=7 or fields[0].count!=1:
++        raise ValueError('Expected one scalar FLOAT32 PointCloud2 time field')
++    field=fields[0]
++    width,height,step,row=map(int,(msg.width,msg.height,msg.point_step,msg.row_step))
++    if (min(width,height,step)<=0 or width*height>2000000 or
++            row<width*step or field.offset<0 or field.offset+4>step):
++        raise ValueError('Invalid PointCloud2 dimensions, stride or time offset')
++    payload=memoryview(msg.data)
++    if len(payload)!=height*row:
++        raise ValueError('PointCloud2 payload does not match row_step*height')
++    return np.ndarray((height,width),dtype='>f4' if msg.is_bigendian else '<f4',
++                      buffer=payload,offset=field.offset,strides=(row,step)).astype(float).ravel()
++
++
++def interval(values,header,time_scale,limits):
++    values=np.asarray(values,dtype=float)*time_scale/1000.
++    if len(values)<2 or not np.isfinite(values).all() or not np.isfinite(header):
++        raise ValueError('Empty/nonfinite raw scan timing')
++    low,high=float(values.min()),float(values.max())
++    duration=high-low
++    if not limits['min_duration_s']<=duration<=limits['max_duration_s']:
++        raise ValueError('scan_duration_outside_limits')
++    if max(abs(low),abs(high))>limits['max_header_offset_s']:
++        raise ValueError('offset_outside_header_window')
++    return dict(header=header,begin=header+low,end=header+high,minimum_s=low,
++                maximum_s=high,duration_s=duration,negative_points=int((values<0).sum()))
++
++
++def audit(bag,cfg,count):
++    from rosbags.highlevel import AnyReader
++    from rosbags.typesys import Stores,get_typestore
++    lio=cfg['fasterlio'];limits=lio['scan_timing']
++    if limits.get('reference')!='relative_header' or lio.get('lidar_type')!=2:
++        raise ValueError('Use the newly generated M2DGR relative_header mapping profile')
++    results=[];errors=Counter();scans=0;previous_end=None;overlaps=[];samples=[]
++    with AnyReader([Path(bag)],default_typestore=get_typestore(Stores.ROS2_HUMBLE)) as reader:
++        connections=[c for c in reader.connections if c.topic==cfg['common']['lidar_topic']]
++        if not connections:raise ValueError('Configured LiDAR topic is absent from bag')
++        for connection,_,raw in reader.messages(connections=connections):
++            msg=reader.deserialize(raw,connection.msgtype)
++            header=float(msg.header.stamp.sec)+float(msg.header.stamp.nanosec)*1e-9
++            scans+=1
++            try:
++                row=interval(time_values(msg),header,float(lio['time_scale']),limits)
++                if previous_end is not None:
++                    if row['end']<=previous_end:raise ValueError('non_increasing_scan_end')
++                    overlaps.append(previous_end-row['begin'])
++                previous_end=row['end'];results.append(row)
++            except ValueError as exc:
++                errors[str(exc)]+=1
++                if len(samples)<20:samples.append(dict(scan=scans,header=header,error=str(exc)))
++            if scans>=count:break
++    def quantiles(values):
++        return dict(zip(('min','median','p99','max'),map(float,np.quantile(values,[0,.5,.99,1])))) if len(values) else None
++    return dict(scans=scans,valid_scans=len(results),errors=dict(errors),error_samples=samples,
++        duration_s=quantiles([r['duration_s'] for r in results]),
++        minimum_offset_s=quantiles([r['minimum_s'] for r in results]),
++        maximum_offset_s=quantiles([r['maximum_s'] for r in results]),
++        prefix_overlap_s=quantiles(overlaps),
++        scans_with_negative_offsets=sum(r['negative_points']>0 for r in results),
++        assumed_reference='raw seconds relative to ROS header, converted by time_scale',
++        limitation='Checks field layout and internal timing consistency; does not establish physical synchronization or calibrate a time offset.')
++
++
++def main():
++    p=argparse.ArgumentParser(description=__doc__)
++    p.add_argument('--bag',required=True);p.add_argument('--config',required=True)
++    p.add_argument('--scans',type=int,default=300);p.add_argument('--output',required=True)
++    args=p.parse_args()
++    if not 2<=args.scans<=20000:p.error('--scans must be 2..20000')
++    try:
++        result=audit(args.bag,yaml.safe_load(Path(args.config).read_text()),args.scans)
++        with Path(args.output).open('x') as stream:json.dump(result,stream,indent=2,allow_nan=False)
++    except (OSError,ValueError,KeyError,ImportError) as exc:p.exit(1,str(exc)+'\n')
++    print(json.dumps(result,indent=2))
++    raise SystemExit(0 if result['scans'] and not result['errors'] else 1)
++
++
++if __name__=='__main__':main()
+diff --git a/scripts/audit_scan_trajectory.py b/scripts/audit_scan_trajectory.py
+new file mode 100644
+index 000000000000..d187374481d1 100644
+--- /dev/null
++++ b/scripts/audit_scan_trajectory.py
+@@ -0,0 +1,51 @@
++#!/usr/bin/env python3
++"""Validate the NEW scan timing contract and its anchors without loading point clouds."""
++import argparse
++from collections import Counter
++import csv
++import json
++from pathlib import Path
++from types import SimpleNamespace
++import numpy as np
++import yaml
++from pose_trajectory import PoseTrajectory
++
++
++def audit(directory,require_normalized=True):
++    directory=Path(directory)
++    metadata=yaml.safe_load((directory/'trajectory.yaml').read_text())
++    with (directory/'scan_trajectory.csv').open(newline='') as stream:
++        rows=list(csv.DictReader(stream))
++    report=dict(metadata=metadata,rows=len(rows),
++        statuses=dict(Counter(r['status'] for r in rows)),
++        usable_rows=sum(r['usable']=='1' for r in rows),
++        scans_with_negative_offsets=sum(int(r['point_negative'])>0 for r in rows),
++        scans_with_nonfinite_offsets=sum(int(r['point_nonfinite'])>0 for r in rows),
++        point_end_mismatch_scans=sum(not np.isfinite(v:=float(r['point_end_difference_s'])) or abs(v)>.002 for r in rows))
++    duration=np.array([float(r['scan_duration_s']) for r in rows])
++    report['scan_duration_median_s']=float(np.median(duration)) if len(duration) else None
++    values=np.loadtxt(directory/'keyframes.txt',ndmin=2)
++    values=values[np.argsort(values[:,1])]
++    keyframes=SimpleNamespace(t=values[:,1],p=values[:,2:5],q=values[:,5:9],
++                              ids=values[:,0].astype(int),max_gap=2.)
++    try:
++        traj=PoseTrajectory(directory,dict(pose_trajectory=dict(source='dense',max_gap_s=.2,
++                            require_normalized_timing=require_normalized)),keyframes)
++        report.update(valid=True,trajectory=traj.description)
++    except (ValueError,KeyError,IndexError) as exc:
++        report.update(valid=False,error=str(exc))
++    return report
++
++
++def main():
++    p=argparse.ArgumentParser(description=__doc__)
++    p.add_argument('--map',required=True)
++    p.add_argument('--allow-legacy',action='store_true',help='Inspect older exports; never changes their usable flags')
++    args=p.parse_args()
++    try:report=audit(args.map,not args.allow_legacy)
++    except (OSError,ValueError,KeyError) as exc:p.exit(1,str(exc)+'\n')
++    print(json.dumps(report,indent=2,allow_nan=False))
++    raise SystemExit(0 if report['valid'] else 1)
++
++
++if __name__=='__main__':main()
+diff --git a/tests/scan_timing.cc b/tests/scan_timing.cc
+new file mode 100644
+index 000000000000..32cde7e63563 100644
+--- /dev/null
++++ b/tests/scan_timing.cc
+@@ -0,0 +1,42 @@
++#include "core/lio/scan_timing.h"
++#include <cassert>
++#include <iostream>
++#include <vector>
++
++struct Point { double time; };
++using namespace lightning::timing;
++
++int main() {
++    Options options; assert(options.Valid());
++    const double header=1628081061.36510754;
++    // Captured M2DGR statistics: last point is near the header, not scan duration.
++    for (auto points : {std::vector<Point>{{-99.49707794189454},{.6428160071373},{-20.}},
++                        std::vector<Point>{{.6428160071373},{-20.},{-99.49707794189454}},
++                        std::vector<Point>{{0.},{100.},{40.}},
++                        std::vector<Point>{{-100.},{-20.},{0.}}}) {
++        const auto original=points;
++        const auto result=NormalizeHeaderOffsets(points,header,options);
++        assert(result.valid && result.end>result.begin);
++        double low=points.front().time,high=low;
++        for (size_t i=0;i<points.size();++i) {
++            assert(std::abs(header+original[i].time/1000.-(result.begin+points[i].time/1000.))<1e-6);
++            low=std::min(low,points[i].time);high=std::max(high,points[i].time);
++        }
++        assert(low==0 && std::abs(result.end-result.begin-high/1000.)<1e-6);
++    }
++    for (auto points : {std::vector<Point>{},std::vector<Point>{{0.}},
++                        std::vector<Point>{{0.},{.642816}},std::vector<Point>{{0.},{200.}},
++                        std::vector<Point>{{1000.},{1100.}},
++                        std::vector<Point>{{0.},{std::numeric_limits<double>::quiet_NaN()}}}) {
++        const auto original=points;
++        assert(!NormalizeHeaderOffsets(points,header,options).valid);
++        for (size_t i=0;i<points.size();++i)
++            assert(points[i].time==original[i].time || (std::isnan(points[i].time)&&std::isnan(original[i].time)));
++    }
++    auto invalid=options;invalid.min_duration_s=0;assert(!invalid.Valid());
++    invalid=options;invalid.max_header_offset_s=.01;assert(!invalid.Valid());
++    assert(CanBackcast(10.,10.0006));
++    assert(!CanBackcast(10.,10.003));
++    assert(!CanBackcast(10.,std::numeric_limits<double>::quiet_NaN()));
++    std::cout<<"scan_timing: signed/header offsets, arbitrary order, timestamp invariance, malformed timing and bounded overlap passed\n";
++}
+diff --git a/tests/run_scan_timing.py b/tests/run_scan_timing.py
+new file mode 100644
+index 000000000000..e9ef61be20fd 100644
+--- /dev/null
++++ b/tests/run_scan_timing.py
+@@ -0,0 +1,16 @@
++#!/usr/bin/env python3
++"""Compile the point-time normalization regression without ROS2/PCL."""
++import argparse
++import os
++from pathlib import Path
++import subprocess
++import tempfile
++
++p=argparse.ArgumentParser(description=__doc__);p.add_argument('--sanitize',action='store_true')
++args=p.parse_args();root=Path(__file__).resolve().parents[1]
++with tempfile.TemporaryDirectory(prefix='scan-timing-') as tmp:
++    binary=str(Path(tmp)/'test')
++    flags=['-fsanitize=undefined','-fno-sanitize-recover=all'] if args.sanitize else []
++    subprocess.run([os.environ.get('CXX','c++'),'-std=c++17','-O1','-Wall','-Wextra','-pedantic',
++                    *flags,'-I'+str(root/'src'),str(root/'tests/scan_timing.cc'),'-o',binary],check=True)
++    subprocess.run([binary],check=True)
+diff --git a/tests/scan_trajectory.cc b/tests/scan_trajectory.cc
+index cec146dbbd7d..e1db4581144a 100644
+--- a/tests/scan_trajectory.cc
++++ b/tests/scan_trajectory.cc
+@@ -18,6 +18,9 @@
+     assert(timing.count == 6 && timing.nonfinite == 1 && timing.negative == 1);
+     assert(timing.minimum_s == -.001 && timing.maximum_s == .1 && timing.last_s == .05);
+     assert(InspectPointTiming(std::vector<Point>{}).count == 0);
++    assert(!UsablePointTiming(InspectPointTiming(std::vector<Point>{{.05},{98.56}}),.0006428));
++    assert(!UsablePointTiming(InspectPointTiming(std::vector<Point>{{-99.5},{.6428}}),.0006428));
++    assert(UsablePointTiming(InspectPointTiming(std::vector<Point>{{0},{100.14}}),.10014));
+     Options options; assert(options.Valid() && !options.enabled);
+     auto invalid=options; invalid.max_records=99; assert(!invalid.Valid());
+     Recorder disabled; disabled.Add(Scan{}); assert(disabled.Scans().empty());
+@@ -37,7 +40,7 @@
+     const std::vector<Anchor> identity{{0,10,Pose(0),Pose(0)},{1,12,Pose(2),Pose(2)}};
+     assert((Correct(11,Pose(1,1,.3),identity).pose.matrix()-Pose(1,1,.3).matrix()).norm()<1e-10);
+ 
+-    Recorder recorder; options.enabled=true; recorder.Configure(options);
++    Recorder recorder; options.enabled=true; options.normalized_timing=true; recorder.Configure(options);
+     for(int index=-1;index<=21;++index) {
+         const double t=10+index*.1;
+         const double a=(t-10)/2;
+@@ -55,6 +58,8 @@
+     for(int i=0;i<101;++i) { duplicate.begin=20+i*.1;duplicate.timestamp=duplicate.begin+.1;limited.Add(duplicate); }
+     assert(limited.Scans().size()==100 && limited.Faults()==1);
+     limited.Add(duplicate); assert(limited.Faults()==2);
++    limited.MarkFault(); assert(limited.Faults()==3);
++    disabled.MarkFault(); assert(disabled.Faults()==0);
+     if(argc>1) {
+         const std::filesystem::path directory(argv[1]);
+         std::filesystem::create_directories(directory);
+diff --git a/tests/verify_scan_export.py b/tests/verify_scan_export.py
+index c411aa79500e..8bf5e56331ad 100644
+--- a/tests/verify_scan_export.py
++++ b/tests/verify_scan_export.py
+@@ -8,9 +8,10 @@
+ from clean_map_runtime import load_frame_contract
+ 
+ directory=Path(sys.argv[1])
+-cfg=dict(max_kf_gap=3,pose_trajectory=dict(source='dense',max_gap_s=.2))
++cfg=dict(max_kf_gap=3,pose_trajectory=dict(source='dense',max_gap_s=.2,require_normalized_timing=True))
+ traj=load_trajectory(directory,cfg,Trajectory)
+ assert traj.source=='dense' and traj.description['rows']==23 and traj.description['usable_rows']==22
++assert traj.description['format_version']==2 and traj.description['normalized_timing']
+ expected=np.array([5+np.cos(.4)-np.sin(.4),np.sin(.4)+np.cos(.4),0])
+ np.testing.assert_allclose(traj.pose(11)[:3,3],expected,atol=1e-10)
+ assert np.linalg.norm(traj.pose(11)[:3,3]-traj.keyframes.pose(11)[:3,3])>.5
+diff --git a/tests/test_scan_timing.py b/tests/test_scan_timing.py
+new file mode 100644
+index 000000000000..e6bc8953a4ab 100644
+--- /dev/null
++++ b/tests/test_scan_timing.py
+@@ -0,0 +1,157 @@
++"""Regression coverage for the supplied M2DGR timing failures and new-map contract."""
++import copy
++import csv
++import json
++from pathlib import Path
++import sys
++import tempfile
++from types import SimpleNamespace
++import unittest
++
++import numpy as np
++import yaml
++
++ROOT=Path(__file__).resolve().parents[1]
++sys.path.insert(0,str(ROOT/'scripts'))
++from configure_scan_timing import configure,write_profile,HANDSFREE_T_IMU_LIDAR
++from audit_lidar_timing import time_values,interval
++from audit_scan_trajectory import audit
++from pose_trajectory import PoseTrajectory
++from restore_map_cleanup import prepare
++
++
++def fixture(directory):
++    d=Path(directory);d.mkdir(parents=True,exist_ok=True)
++    (d/'map_frames.yaml').write_text('format_version: 2\nkeyframe_pose_frame: imu\nkeyframe_cloud_frame: imu\n'
++        'T_imu_lidar: [1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]\n')
++    np.savetxt(d/'keyframes.txt',[[0,10,0,0,0,0,0,0,1],[1,10.2,.2,0,0,0,0,0,1]],fmt='%.18g')
++    fields=('tx','ty','tz','qx','qy','qz','qw')
++    rows=[]
++    for i,t in enumerate((10.,10.1,10.2)):
++        rows.append(dict(scan_id=i,begin_time=t-.1,timestamp=t,state_timestamp=t,status='accepted',usable=1,
++            tx=t-10,ty=0,tz=0,qx=0,qy=0,qz=0,qw=1,imu_gap=0,point_count=100,
++            point_nonfinite=0,point_negative=0,point_min_s=0,point_max_s=.1,scan_duration_s=.1,
++            clock_error_s=0,point_end_difference_s=0,correction_mode='anchor' if i!=1 else 'interpolated_correction'))
++    with (d/'scan_trajectory.csv').open('w',newline='') as stream:
++        writer=csv.DictWriter(stream,fieldnames=list(rows[0]));writer.writeheader();writer.writerows(rows)
++    with (d/'trajectory_anchors.csv').open('w',newline='') as stream:
++        writer=csv.DictWriter(stream,fieldnames=['id','timestamp',*fields,*('raw_'+v for v in fields)])
++        writer.writeheader()
++        for i,t in enumerate((10.,10.2)):
++            values=[t-10,0,0,0,0,0,1]
++            writer.writerow(dict(id=i,timestamp=t,**dict(zip(fields,values)),
++                **dict(zip(('raw_'+v for v in fields),values))))
++    meta=dict(format_version=2,pose_frame='imu',coordinate_frame='exported_map',timestamp_reference='lidar_end',
++        correction_method='interpolated_keyframe_correction',complete=True,rows=3,usable_rows=3,
++        recording_faults=0,keyframes=2,point_time_reference='scan_begin',scan_timing_policy='relative_header',
++        point_end_tolerance_s=.002)
++    (d/'trajectory.yaml').write_text(yaml.safe_dump(meta))
++    return d
++
++
++class ScanTimingTests(unittest.TestCase):
++    def test_profiles_preserve_map_detail_and_model_and_require_new_dense_map(self):
++        original=dict(common=dict(dataset='m2dgr',imu_topic='/handsfree/imu'),fasterlio=dict(
++            lidar_type=2,time_scale=1000.,extrinsic_T=[0.,0.,0.],extrinsic_R=[1.,0.,0.,0.,1.,0.,0.,0.,1.],
++            map_detail={'keyframe_resolution':.05}),system={'map_export':{'save_global_pcd':False}})
++        before=copy.deepcopy(original)
++        result=configure(original,'mapping')
++        self.assertEqual(original,before)
++        self.assertEqual(result['fasterlio']['map_detail'],original['fasterlio']['map_detail'])
++        self.assertEqual(result['fasterlio']['extrinsic_T'],[0.,0.,0.])
++        self.assertTrue(result['system']['export_keyframe_clouds'])
++        calibrated=configure(original,'mapping',True)
++        self.assertEqual(calibrated['fasterlio']['extrinsic_T'],HANDSFREE_T_IMU_LIDAR)
++        old=dict(yolo_model='model-seg.pt',time_offset=0.,vehicle_instance_tracks={'enabled':True})
++        semantic=configure(old,'semantic')
++        for k in old:self.assertEqual(old[k],semantic[k])
++        self.assertTrue(semantic['pose_trajectory']['require_normalized_timing'])
++        wrong=copy.deepcopy(original);wrong['common']['imu_topic']='/camera/imu'
++        with self.assertRaises(ValueError):configure(wrong,'mapping',True)
++        wrong=copy.deepcopy(original);wrong['fasterlio']['time_scale']=1
++        with self.assertRaises(ValueError):configure(wrong,'mapping')
++
++    def test_profile_generation_never_overwrites_input_or_existing_output(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            source=Path(tmp)/'source.yaml';dest=Path(tmp)/'new.yaml'
++            source.write_text('yolo_model: model-seg.pt\n')
++            before=source.read_bytes()
++            write_profile(source,dest,'semantic')
++            with self.assertRaises(FileExistsError):write_profile(source,dest,'semantic')
++            self.assertEqual(source.read_bytes(),before)
++
++    def test_pointcloud_time_reader_respects_rows_padding_and_big_endian(self):
++        for endian in ('<','>'):
++            payload=bytearray(48)
++            for offset,value in ((4,-.0995),(20,.0006428),(28,-.050),(44,0.)):
++                payload[offset:offset+4]=np.array([value],dtype=endian+'f4').tobytes()
++            # 2 rows; each point has x plus time, then 8 bytes of row padding.
++            msg=SimpleNamespace(fields=[SimpleNamespace(name='time',datatype=7,count=1,offset=4)],
++                width=2,height=2,point_step=8,row_step=24,data=payload,is_bigendian=endian=='>')
++            # Actual time positions are 4,12,28,36.
++            for offset,value in ((12,.0006428),(36,0.)):
++                payload[offset:offset+4]=np.array([value],dtype=endian+'f4').tobytes()
++            np.testing.assert_allclose(time_values(msg),[-.0995,.0006428,-.05,0.],atol=1e-8)
++            msg.fields[0].datatype=8
++            with self.assertRaises(ValueError):time_values(msg)
++
++    def test_signed_raw_offsets_preserve_absolute_sample_times(self):
++        raw=np.array([-.09949707794,.000642816,-.020])
++        limits=dict(min_duration_s=.05,max_duration_s=.15,max_header_offset_s=.2)
++        result=interval(raw,1628081061.,1000.,limits)
++        self.assertAlmostEqual(result['duration_s'],.10013989394)
++        normalized=raw-raw.min()
++        np.testing.assert_allclose(1628081061.+raw,result['begin']+normalized,atol=3e-7,rtol=0)
++        for values in ([0,.0006428],[0,float('nan')],[1.,1.1]):
++            with self.assertRaises(ValueError):interval(values,10.,1000.,limits)
++
++    def test_valid_new_trajectory_and_prepare_copy_full_contract(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            source=fixture(Path(tmp)/'source')
++            # Existing global copy path does not read the PCD body.
++            (source/'global.pcd').write_bytes(b'original map payload')
++            report=audit(source)
++            self.assertTrue(report['valid'])
++            original={p.name:p.read_bytes() for p in source.iterdir() if p.is_file()}
++            out=prepare(source,Path(tmp)/'prepared',require_dense=True)
++            for name in ('scan_trajectory.csv','trajectory.yaml','trajectory_anchors.csv'):
++                self.assertEqual((out/name).read_bytes(),original[name])
++            self.assertTrue(audit(out)['valid'])
++            self.assertEqual(original,{p.name:p.read_bytes() for p in source.iterdir() if p.is_file()})
++            self.assertTrue(json.loads((out/'PREPARED_MAP.json').read_text())['normalized_dense_verified'])
++
++    def test_old_map_cannot_be_relabelled_as_new_or_forced_usable(self):
++        for problem in ('legacy','duration','negative','reference','missing','prefix'):
++            with self.subTest(problem=problem),tempfile.TemporaryDirectory() as tmp:
++                source=fixture(Path(tmp)/'source')
++                meta=yaml.safe_load((source/'trajectory.yaml').read_text())
++                with (source/'scan_trajectory.csv').open(newline='') as stream:
++                    rows=list(csv.DictReader(stream))
++                if problem=='legacy':meta['format_version']=1
++                elif problem=='duration':
++                    rows[1]['scan_duration_s']=.0006428;rows[1]['begin_time']=10.1-.0006428
++                    rows[1]['point_max_s']=.098565;rows[1]['point_end_difference_s']=.0979222
++                elif problem=='negative':rows[1]['point_negative']=1
++                elif problem=='reference':meta['point_time_reference']='header'
++                elif problem=='missing':(source/'trajectory_anchors.csv').unlink()
++                else:rows[1]['point_min_s']=.01
++                (source/'trajectory.yaml').write_text(yaml.safe_dump(meta))
++                with (source/'scan_trajectory.csv').open('w',newline='') as stream:
++                    writer=csv.DictWriter(stream,fieldnames=list(rows[0]));writer.writeheader();writer.writerows(rows)
++                self.assertFalse(audit(source)['valid'])
++                with self.assertRaises(ValueError):prepare(source,Path(tmp)/'refused',require_dense=True)
++                self.assertFalse((Path(tmp)/'refused').exists())
++
++    def test_malformed_valid_flag_is_checked_even_for_legacy_version(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            source=fixture(tmp);meta=yaml.safe_load((source/'trajectory.yaml').read_text());meta['format_version']=1
++            (source/'trajectory.yaml').write_text(yaml.safe_dump(meta))
++            with (source/'scan_trajectory.csv').open(newline='') as stream:rows=list(csv.DictReader(stream))
++            rows[1]['point_end_difference_s']=.0979
++            with (source/'scan_trajectory.csv').open('w',newline='') as stream:
++                writer=csv.DictWriter(stream,fieldnames=list(rows[0]));writer.writeheader();writer.writerows(rows)
++            result=audit(source,require_normalized=False)
++            self.assertFalse(result['valid']);self.assertIn('point timing',result['error'])
++
++
++if __name__=='__main__':unittest.main()
+diff --git a/tests/imu_deskew.cc b/tests/imu_deskew.cc
+index 63f3ba2c105a..317c11489300 100644
+--- a/tests/imu_deskew.cc
++++ b/tests/imu_deskew.cc
+@@ -97,7 +97,36 @@
+     return 0;
+ }
+ 
++int check_normalized_prefix(double overlap) {
++    ImuProcess proc;
++    proc.SetUseIMUFilter(false);
++    proc.RequireNormalizedScanTiming(true);
++    proc.SetAccCov(Vec3d::Constant(.1));proc.SetGyrCov(Vec3d::Constant(.1));
++    ESKF filter;
++    MeasureGroup init;init.lidar_begin_time_=0;init.lidar_end_time_=.2;
++    for (int i=0;i<=20;++i) init.imu_.push_back(sample(i*.01,9.81));
++    CloudPtr out(new PointCloudType);proc.Process(init,filter,out);
++    auto state=filter.GetX();state.vel_=Vec3d(2,0,0);filter.ChangeX(state);
++    // Initialized gyro bias cancels the constant gyro; this isolates prefix translation.
++    MeasureGroup scan;scan.lidar_begin_time_=.2-overlap;scan.lidar_end_time_=.3;
++    scan.scan_.reset(new PointCloudType);
++    for (int i=1;i<=10;++i) scan.imu_.push_back(sample(.2+i*.01,9.81));
++    for (int i=0;i<=20;++i) {
++        const double t=-overlap+(.1+overlap)*i/20.;
++        PointType p;p.x=10-2*t;p.y=0;p.z=1;p.time=(t+overlap)*1000.;p.intensity=1;
++        scan.scan_->push_back(p);
++    }
++    const double old_interval=lo::lidar_time_interval;
++    lo::lidar_time_interval=.1+overlap;
++    proc.Process(scan,filter,out);lo::lidar_time_interval=old_interval;
++    if (std::abs(filter.GetX().timestamp_-.3)>1e-10) return 20;
++    if(overlap>.002) return out->empty()&&proc.LastScanHadImuGap() ? 0 : 21;
++    if(out->empty()||proc.LastScanHadImuGap()) return 22;
++    for(const auto& p:*out) if(std::abs(p.x-9.8)>1e-5) return 23;
++    return 0;
++}
++
+ int main() {
+     return check(0., 9.81) || check(2., 9.81) || check(0., 10.02) || check(0., 1.02) ||
+-           check_gap_and_recovery();
++           check_gap_and_recovery() || check_normalized_prefix(.0006) || check_normalized_prefix(.003);
+ }
+diff --git a/tests/pointcloud_timing.cc b/tests/pointcloud_timing.cc
+new file mode 100644
+index 000000000000..245a9b3554bd 100644
+--- /dev/null
++++ b/tests/pointcloud_timing.cc
+@@ -0,0 +1,40 @@
++#include "core/lio/pointcloud_preprocess.h"
++#include "core/lio/scan_timing.h"
++#include <cassert>
++#include <cstring>
++#include <iostream>
++#include <stdexcept>
++
++using namespace lightning;
++int main() {
++    auto msg=std::make_shared<sensor_msgs::msg::PointCloud2>();
++    msg->height=1;msg->width=3;msg->point_step=24;msg->row_step=72;
++    msg->is_bigendian=false;msg->is_dense=true;msg->data.resize(72,0);
++    const std::vector<std::string> names{"x","y","z","intensity","time","ring"};
++    for(size_t i=0;i<names.size();++i) {
++        sensor_msgs::msg::PointField f;f.name=names[i];f.offset=i*4;f.count=1;
++        f.datatype=i==5 ? sensor_msgs::msg::PointField::UINT16 : sensor_msgs::msg::PointField::FLOAT32;
++        msg->fields.push_back(f);
++    }
++    const std::vector<float> times{-.1f,0.f,-.05f};
++    for(size_t i=0;i<times.size();++i) {
++        const float values[]{2.f,0.f,0.f,1.f,times[i]};
++        std::memcpy(msg->data.data()+i*24,values,sizeof(values));
++    }
++    PointCloudPreprocess processor;
++    processor.SetLidarType(LidarType::VELO32);
++    processor.TimeScale()=1000.f;processor.RequireHeaderOffsets(true);
++    CloudPtr output(new PointCloudType);
++    processor.Process(msg,output);
++    assert(output->size()==3); // Negative/zero last time must not activate yaw reconstruction.
++    assert(output->front().time < -99. && output->back().time < -49.);
++    const auto normalized=timing::NormalizeHeaderOffsets(output->points,100.,timing::Options{});
++    assert(normalized.valid && output->front().time==0);
++    msg->width=0;msg->row_step=0;msg->data.clear();
++    processor.Process(msg,output);assert(output->empty());
++    for (auto& f:msg->fields) if(f.name=="time") f.name="not_time";
++    bool refused=false;
++    try { processor.Process(msg,output); } catch (const std::invalid_argument&) { refused=true; }
++    assert(refused);
++    std::cout<<"PointCloud2 -> preprocessor: signed offsets retained, empty scan guarded, missing time rejected\n";
++}
+diff --git a/tests/run_lio_regressions.py b/tests/run_lio_regressions.py
+index aa3c8ac532cd..ccae284fd37c 100644
+--- a/tests/run_lio_regressions.py
++++ b/tests/run_lio_regressions.py
+@@ -11,9 +11,9 @@
+     if line.startswith(('CXX_INCLUDES =', 'CXX_DEFINES =')):
+         opts += shlex.split(line.split('=', 1)[1])
+ with tempfile.TemporaryDirectory(prefix='lio-regression-') as tmp:
+-    for name in ('nav_state_prediction', 'imu_deskew', 'eskf_update_rejection', 'feature_quality'):
++    for name in ('nav_state_prediction', 'imu_deskew', 'eskf_update_rejection', 'feature_quality', 'pointcloud_timing'):
+         binary = str(Path(tmp) / name)
+-        subprocess.run(['c++', '-std=c++17', '-O1', *opts, str(root / 'tests' / (name + '.cc')),
++        subprocess.run(['c++', '-std=c++17', '-O1', *opts, '-UNDEBUG', str(root / 'tests' / (name + '.cc')),
+                         '-L' + str(root / 'install/lightning/lib'),
+                         '-Wl,-rpath,' + str(root / 'install/lightning/lib'),
+                         '-llightning.libs', '-lglog', '-lfmt', '-o', binary], check=True)
+diff --git a/doc/SCAN_TIME_NORMALIZATION.md b/doc/SCAN_TIME_NORMALIZATION.md
+new file mode 100644
+index 000000000000..48c90b46832b 100644
+--- /dev/null
++++ b/doc/SCAN_TIME_NORMALIZATION.md
+@@ -0,0 +1,208 @@
++# M2DGR 逐点时间与逐帧轨迹修复
++
++本轮针对上传的 street_vehicle_test4 诊断：4928 条逐帧轨迹只有 7 条 usable，
++大多数帧的点时间横跨约 0.1 秒，而旧同步区间约为 0.000643 秒。
++那 7 条 usable 也存在约 0.098 秒的点时间/帧末差异，不能通过修改 CSV 标记修复。
++
++本轮完成时间适配、轨迹一致性检查、原始消息审计、工作地图轨迹复制和新配置生成。
++车辆分割、投票、实例关联及删除阈值保持原配置；本轮不增加同步扫描帧上的语义关联，
++也不宣称已经提升实际去车率。应先验证这条时间基础，再调整车辆关联。
++
++## 时间约定
++
++新配置显式使用 fasterlio.scan_timing.reference=relative_header：
++
++- Velodyne 的原始 time 是相对 ROS header 的秒偏移，time_scale=1000 转成内部毫秒。
++- 根据全帧最早和最晚点确定起止时间，不使用最后一个点代替最大值。
++- 将内部点时间平移到扫描起点，保持 header+原始偏移 == 新起点+新偏移。
++- time 字段存在时，不因为最后一个值为负/零而切换到角度估算。
++- 允许 50～150ms 的扫描跨度，点时间须位于 header 前后 200ms 内。
++  无效时间、错误字段或非递增扫描末时刻会停止输入并使轨迹导出标为不完整。
++- IMU 去畸变覆盖扫描起点。相邻帧最多 2ms 的重叠用已有状态作短时回推；
++  超过该范围时仅推进 IMU 状态，跳过该扫描的配准/入图，并保留不可用状态。
++
++该模式只支持本次 Velodyne PointCloud2 输入，不自动猜测其他驱动的时间含义。
++未配置新模式时继续使用 legacy 同步策略。原始审计检验数值与字段布局，
++不能单独证明相机/IMU/雷达的物理同步。
++
++## 1. 更新并低负载编译
++
++本轮以补丁交付，尚未发布远端分支。补丁以你上传记录中的
++codex/instance-region-association、d792cfd 为基线。
++先下载 scan-time-normalization.patch；以下假设下载到 ~/Downloads：
++
++~~~bash
++cd ~/lightning-lm-fresh
++git branch --show-current
++git log -1 --oneline
++git apply --check "$HOME/Downloads/scan-time-normalization.patch"
++git apply "$HOME/Downloads/scan-time-normalization.patch"
++
++source /opt/ros/humble/setup.bash
++MAKEFLAGS=-j2 nice -n 19 colcon build --parallel-workers 1
++source install/setup.bash
++~~~
++
++若检查报错，先保留输出，不要强制覆盖本地修改。
++补丁只修改本轮代码、测试和说明，保留本地生成的 M2DGR YAML 和旧地图。
++本轮有 C++ 修改，必须重新编译后再运行。
++
++## 2. 生成配套的新配置
++
++~~~bash
++cd ~/lightning-lm-fresh
++
++python3 scripts/configure_scan_timing.py mapping \
++  --input config/m2dgr_slam_alignment13.yaml \
++  --output config/m2dgr_slam_timing.yaml \
++  --handsfree-extrinsics
++
++python3 scripts/configure_scan_timing.py semantic \
++  --input config/m2dgr_clean_instance_regions.yaml \
++  --output config/m2dgr_clean_timing.yaml
++~~~
++
++输入使用你上传的现有配置。生成器保留建图细节参数、相机标定、YOLO、实例与投票设置。
++输出文件必须不存在；重复实验时换一个新文件名，不覆盖原配置。
++
++--handsfree-extrinsics 仅用于 /handsfree/imu：
++官方文件提供 T_lidar_handsfree，取逆后得到本项目需要的 T_imu_lidar，
++平移为 [0.27255, -0.00053, 0.17954] 米，旋转为单位阵。
++这个选项明确关闭在线外参估计，应用于随后新建的地图。
++若仅对时间处理做单因素对照，省略该选项，保留原外参。
++
++不要给旧地图改写 map_frames.yaml，也不要将新建图轨迹替换进旧地图。
++新坐标约定会由实际建图程序写入新地图。
++
++标定来源：[M2DGR calibration_results.txt](https://github.com/SJTU-ViSYS/M2DGR/blob/main/calibration_results.txt)。
++相机的 K、畸变和 T_cam_lidar 不由本轮修改。
++
++## 3. 先审计原始点时间
++
++无需启动 SLAM 或 YOLO：
++
++~~~bash
++OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 MKL_NUM_THREADS=2 \
++nice -n 19 python3 scripts/audit_lidar_timing.py \
++  --bag "/media/lizhi/Seagate Backup Plus Drive/M2DGR数据集/street_06_ros2" \
++  --config config/m2dgr_slam_timing.yaml \
++  --scans 300 \
++  --output data/street06_raw_timing_audit.json
++~~~
++
++检查 errors 是否为空，扫描跨度是否在约 0.1 秒附近。
++原始 negative_offsets 可以存在；归一化后的内部偏移应从 0 开始。
++若报错，保留报告检查驱动字段、单位和时间含义，不放宽时间范围绕过错误。
++报告输出也不覆盖已有文件。
++
++## 4. 先做 30～60 秒建图验证
++
++终端一：
++
++~~~bash
++cd ~/lightning-lm-fresh
++source /opt/ros/humble/setup.bash
++source install/setup.bash
++
++OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 MKL_NUM_THREADS=2 \
++nice -n 19 ./bin/run_slam_online --config config/m2dgr_slam_timing.yaml
++~~~
++
++终端二只回放建图需要的传感器话题：
++
++~~~bash
++cd ~/lightning-lm-fresh
++source /opt/ros/humble/setup.bash
++
++ros2 bag play \
++  "/media/lizhi/Seagate Backup Plus Drive/M2DGR数据集/street_06_ros2" \
++  --rate 0.5 \
++  --topics /velodyne_points /handsfree/imu \
++  --qos-profile-overrides-path config/m2dgr_playback_qos.yaml
++~~~
++
++播放约 30～60 秒数据后按空格暂停，等建图追上。
++终端三保存测试地图，建图进程此时仍需运行：
++
++~~~bash
++cd ~/lightning-lm-fresh
++source /opt/ros/humble/setup.bash
++source install/setup.bash
++
++ros2 service call /lightning/save_map lightning/srv/SaveMap \
++  "{map_id: street06_timing_smoke}"
++
++python3 scripts/audit_scan_trajectory.py --map data/street06_timing_smoke
++~~~
++
++验收项：
++
++- 程序日志中 scan_timing duration_s 接近 0.1 秒，不再是约 0.000643 秒。
++- 审计 valid=true，format_version=2，point_end_mismatch_scans=0，
++  scans_with_negative_offsets=0。
++- 每个保存的关键帧都对应一条可信的逐帧位姿。
++- 初始化、配准拒绝、IMU 间断可造成 unusable，不要求全程所有行都是 1。
++- 继续用叠加图/静态标志物检验投影；通过时间审计不代表建图精度已经被真值验证。
++
++测试通过后，退出旧进程并从头回放整包，保存到新的 map_id，例如 street06_timing_01。
++再运行同一审计命令检查完整地图。不要用未暂停的旧进程重放另一个时间周期。
++
++## 5. 准备工作地图并清理
++
++完整地图审计通过后，关闭建图进程以释放内存：
++
++~~~bash
++OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 MKL_NUM_THREADS=2 \
++nice -n 19 python3 scripts/restore_map_cleanup.py prepare \
++  --map data/street06_timing_01 \
++  --output data/street06_timing_01_instances \
++  --require-dense
++
++OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 MKL_NUM_THREADS=2 \
++nice -n 19 python3 scripts/clean_map_vehicles.py \
++  --map data/street06_timing_01_instances \
++  --bag "/media/lizhi/Seagate Backup Plus Drive/M2DGR数据集/street_06_ros2" \
++  --config config/m2dgr_clean_timing.yaml \
++  --mode map \
++  --device cpu \
++  --rviz
++~~~
++
++--require-dense 在生成大地图前验证新时间契约，并复制 trajectory.yaml、
++scan_trajectory.csv、trajectory_anchors.csv。默认旧 prepare 命令仍保留原来的关键帧模式。
++新语义配置显式要求配套的新逐帧轨迹，防止自动退回稀疏插值。
++
++可另开终端：
++
++~~~bash
++rviz2 -d config/clean_map.rviz
++~~~
++
++完整清理结果在 data/street06_timing_01_instances/global_clean.pcd，
++车辆标签在同目录 vehicle_labels.sqlite。保留原始关键帧作为几何来源，
++需要重新导出静态地图时：
++
++~~~bash
++OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 MKL_NUM_THREADS=2 \
++nice -n 19 python3 scripts/rebuild_instance_static_map.py \
++  --map data/street06_timing_01 \
++  --labels data/street06_timing_01_instances/vehicle_labels.sqlite \
++  --output data/street06_timing_01_static \
++  --voxel-size 0.10
++~~~
++
++结果直接位于 data/street06_timing_01_static/global_clean.pcd。
++
++## 验证范围
++
++离线 C++ 测试覆盖符号偏移、点顺序、绝对时刻不变、错误时间拒绝、轨迹导出/读取契约。
++Python 测试覆盖原始 PointCloud2 字段读取、配置保留、旧错误 usable 检出、轨迹复制及源文件保护。
++本开发环境没有 ROS2/PCL 或完整 bag，无法执行实际建图/完整 ROS2 编译。
++在 Humble 编译后，可运行以下实际库集成回归（包含预处理和去畸变前缀覆盖测试）：
++
++~~~bash
++python3 tests/run_lio_regressions.py
++~~~
++
++下一轮再对同步扫描帧上的语义关联、静态车辆可见面变化与夜景识别做对照。
++实际效果需以新地图的投影、结构保留和车辆残留检查为准。

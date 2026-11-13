@@ -1,77 +1,95 @@
-# 针对NCLT的配置
+# WHEELTEC S100 + RoboSense Airy 在线配置
+# 话题与驱动一致（Project_manager/S100/Sensors/Profiles/suite_001/drivers/robosense.yaml）：
+#   点云 /lidar/lidar_02/points   frame: airy_frame
+#   IMU  /lidar/lidar_02/imu      frame: airy_frame（物理系为 Airy 内置 IMU）
+# 外参取自 Sensors/Calibration/extrinsics.yaml :: tf_airy_lidar_to_embedded_imu
+#   约定 p_imu = R_imu_lidar * p_lidar + t_imu_lidar（与 laser_mapping T_imu_lidar 一致）
 common:
   dataset: "robosense"
-  lidar_topic: "/LIDAR/POINTS"
+  lidar_topic: "/lidar/lidar_02/points"
   livox_lidar_topic: "/livox/lidar"
-  imu_topic: "/IMU"
+  imu_topic: "/lidar/lidar_02/imu"
+  imu_queue_depth: 2000
 
 # fasterlio 参数
 fasterlio:
-  lidar_type: 4                # 1 for Livox serials LiDAR, 2 for Velodyne LiDAR, 3 for ouster LiDAR, 4 for robosense
-  scan_line: 32
-  blind: 0.5                # 盲区，小于盲区距离的不会处理
-  time_scale: 1e-3             # 兼容不同数据集的时间单位，仅对Velodyne LiDAR(lidar_type=2)生效
+  lidar_type: 4                # 1 Livox, 2 Velodyne, 3 Ouster, 4 RoboSense
+  scan_line: 96                # Airy 线束；RoboSenseHandler 主要用 per-point timestamp
+  blind: 0.2                   # 与驱动 min_distance 对齐
+  time_scale: 1e-3             # 仅 Velodyne(lidar_type=2) 生效
 
-  skip_lidar_num: 0 # 点云的跳帧情况
-  point_filter_num: 6 # 点云采样参数
-  max_iteration: 4 # 最大迭代次数
-  filter_size_scan: 0.5 # 对scan进行的降采样
-  filter_size_map: 0.5
+  skip_lidar_num: 0
+  # S100 算力有限：加稀疏、加大体素，避免配准拖到 >100ms 后触发 IMU 覆盖跳帧
+  point_filter_num: 12
+  max_iteration: 3
+  filter_size_scan: 0.8
+  filter_size_map: 0.8
 
-  ivox_grid_resolution: 0.5        # default=0.2
-  ivox_nearby_type: 18             # 6, 18, 26
-  esti_plane_threshold: 0.1        # default=0.1
+  ivox_grid_resolution: 0.8
+  ivox_nearby_type: 18
+  esti_plane_threshold: 0.1
 
-  use_aa: false  # use anderson-acceleration
+  use_aa: false
 
   acc_cov: 0.1
   gyr_cov: 0.1
   b_acc_cov: 0.0001
   b_gyr_cov: 0.0001
-  extrinsic_est_en: false      # true: enable the online estimation of IMU-LiDAR extrinsic
-  extrinsic_T: [ 0, 0, 0 ]
-  extrinsic_R: [ 1, 0, 0,
-                 0, 1, 0,
-                 0, 0, 1 ]
+  extrinsic_est_en: false
+  # Airy 内置 IMU：vendor DIFOP IMU_CALIB_DATA 的雷达→IMU 变换
+  extrinsic_T: [ 0.00418, 0.00425, -0.00446 ]
+  extrinsic_R: [ 0.0, -1.0,  0.0,
+                -1.0,  0.0,  0.0,
+                 0.0,  0.0, -1.0 ]
 
   keep_first_imu_estimation: false
   kf_dis_th: 1.0
   kf_angle_th: 2.0
 
-  enable_icp_part: true
+  enable_icp_part: false
+  plane_icp_weight: 300.0
   kalman_R: 0.1
-  min_pts: 300
-  imu_filter: true
+  min_pts: 200
+  imu_filter: false            # Airy 内置 IMU 已较干净；滤波会增加延迟
+  proj_kfs: false
 
 g2p5:
-  esti_floor: false   # 是否动态估计地面
-  lidar_height: 0.0   # 雷达安装高度
-  floor_height: -1.2   # 默认地面高度
-  min_th_floor: 0.50  # 距离地面这个高度的障碍物被扫入栅格地图中
-  max_th_floor: 1.0  # 距离地面这个高度的障碍物被扫入栅格地图中
-  grid_map_resolution: 0.2 # 栅格地图分辨率
+  esti_floor: false
+  lidar_height: 0.34           # base_link→airy_frame 安装高度（URDF airy_joint）
+  floor_height: -1.2
+  min_th_floor: 0.50
+  max_th_floor: 1.0
+  grid_map_resolution: 0.2
 
 system:
-  with_loop_closing: true # 是否需要回环检测
-  with_ui: true  # 是否需要3D UI
-  with_2dui: true # 是否需要2D UI
-  with_g2p5: true # 是否需要栅格地图
-  step_on_kf: true # 是否在关键帧处暂停
+  with_loop_closing: false     # 板端先关回环，降低丢帧
+  with_ui: false               # 无 X11/DISPLAY 时关掉 Pangolin，避免启动即崩
+  with_2dui: false
+  with_g2p5: false             # 板端先关栅格，专心 LIO
+  step_on_kf: false            # 在线建图不要在关键帧处暂停
+  # 在线队列：默认 lidar_capacity=2 太容易在同步等待时把 IMU 挤到后面
+  runtime:
+    async: true
+    stats_interval: 20
+    imu_capacity: 4096
+    lidar_capacity: 8
 
   enable_lidar_loc_skip: false
   enable_lidar_loc_rviz: false
+  publish_rviz: true           # 发布 /lightning/map、/lightning/current_scan、/lightning/path，坐标系 map
+  rviz_map_leaf: 0.5           # RViz 地图体素（米），只影响显示
   enable_lidar_odom_skip: false
   lidar_loc_skip_num: 4
   lidar_odom_skip_num: 0
-  map_path: ./data/new_map/
+  map_path: ./data/s100_airy_map/
   pub_tf: true
 
 loop_closing:
-  loop_kf_gap: 20       # 每隔多少个关键帧检查一次
-  min_id_interval: 20   # 被检查的关键帧ID间隔
-  closest_id_th: 50     # 历史关键帧与当前帧的ID间隔
-  max_range: 30.0       # 候选帧的最大距离
-  ndt_score_th: 1.0     # ndt位姿分值
+  loop_kf_gap: 20
+  min_id_interval: 20
+  closest_id_th: 50
+  max_range: 30.0
+  ndt_score_th: 1.0
   with_height: true
 
 

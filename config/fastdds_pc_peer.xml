@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- PC 端：保留 builtin，并点名车端 WiFi，避免纯组播发现失败 -->
+<dds xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <profiles>
+    <participant profile_name="pc_to_robot" is_default_profile="true">
+      <rtps>
+        <useBuiltinTransports>true</useBuiltinTransports>
+        <builtin>
+          <initialPeersList>
+            <locator>
+              <udpv4>
+                <address>192.168.50.3</address>
+              </udpv4>
+            </locator>
+            <locator>
+              <udpv4>
+                <address>192.168.50.95</address>
+              </udpv4>
+            </locator>
+          </initialPeersList>
+        </builtin>
+      </rtps>
+    </participant>
+  </profiles>
+</dds>

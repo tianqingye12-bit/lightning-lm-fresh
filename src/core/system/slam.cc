@@ -21,6 +21,9 @@
 #include <rclcpp/executors/multi_threaded_executor.hpp>
 #include <stdexcept>
 #include <opencv2/opencv.hpp>
+#include <pcl/common/transforms.h>
+#include <pcl/filters/voxel_grid.h>
+#include <pcl_conversions/pcl_conversions.h>
 
 namespace lightning {
 
@@ -192,6 +195,22 @@ bool SlamSystem::Init(const std::string& yaml_path) {
             livox_topic_, qos, [this](livox_ros_driver2::msg::CustomMsg ::SharedPtr cloud) {
                 Timer::Evaluate([&]() { ProcessLidar(cloud); }, "Receive Lidar", false);
             });
+
+        publish_rviz_ = yaml["system"]["publish_rviz"].as<bool>(false);
+        rviz_map_leaf_ = yaml["system"]["rviz_map_leaf"].as<float>(0.5f);
+        if (!(rviz_map_leaf_ > 0.05f && rviz_map_leaf_ < 5.0f)) {
+            LOG(ERROR) << "system.rviz_map_leaf must be between 0.05 and 5 meters";
+            return false;
+        }
+        if (publish_rviz_) {
+            const auto latched = rclcpp::QoS(1).reliable().transient_local();
+            map_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>("/lightning/map", latched);
+            path_pub_ = node_->create_publisher<nav_msgs::msg::Path>("/lightning/path", latched);
+            scan_pub_ = node_->create_publisher<sensor_msgs::msg::PointCloud2>(
+                "/lightning/current_scan", rclcpp::QoS(2).reliable());
+            rviz_path_.header.frame_id = "map";
+            LOG(INFO) << "publishing mapping view on /lightning/map, /lightning/current_scan, /lightning/path";
+        }
 
         save_callback_group_ = node_->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
         savemap_service_ = node_->create_service<SaveMapService>(
@@ -459,7 +478,8 @@ void SlamSystem::ProcessLidar(const sensor_msgs::msg::PointCloud2::SharedPtr& cl
     RuntimeStats::Scope frame_time(lio_->Stats(), RuntimeStats::frame_total);
 
     lio_->ProcessPointCloud2(cloud);
-    lio_->Run();
+    const bool mapped = lio_->Run();
+    PublishMappingView(mapped);
 
     auto kf = lio_->GetKeyframe();
     if (kf != cur_kf_) {
@@ -471,6 +491,8 @@ void SlamSystem::ProcessLidar(const sensor_msgs::msg::PointCloud2::SharedPtr& cl
     if (cur_kf_ == nullptr) {
         return;
     }
+
+    AppendKeyframeToMap(cur_kf_);
 
     if (options_.with_loop_closing_) {
         lc_->AddKF(cur_kf_);
@@ -496,7 +518,8 @@ void SlamSystem::ProcessLidar(const livox_ros_driver2::msg::CustomMsg::SharedPtr
     RuntimeStats::Scope frame_time(lio_->Stats(), RuntimeStats::frame_total);
 
     lio_->ProcessPointCloud2(cloud);
-    lio_->Run();
+    const bool mapped = lio_->Run();
+    PublishMappingView(mapped);
 
     auto kf = lio_->GetKeyframe();
     if (kf != cur_kf_) {
@@ -509,6 +532,8 @@ void SlamSystem::ProcessLidar(const livox_ros_driver2::msg::CustomMsg::SharedPtr
         return;
     }
 
+    AppendKeyframeToMap(cur_kf_);
+
     if (options_.with_loop_closing_) {
         lc_->AddKF(cur_kf_);
     }
@@ -520,6 +545,70 @@ void SlamSystem::ProcessLidar(const livox_ros_driver2::msg::CustomMsg::SharedPtr
     if (ui_) {
         ui_->UpdateKF(cur_kf_);
     }
+}
+
+namespace {
+
+builtin_interfaces::msg::Time StampFromSec(double t) {
+    builtin_interfaces::msg::Time stamp;
+    if (!(t > 0.0)) return stamp;
+    const int64_t ns = static_cast<int64_t>(t * 1e9);
+    stamp.sec = static_cast<int32_t>(ns / 1000000000LL);
+    stamp.nanosec = static_cast<uint32_t>(ns % 1000000000LL);
+    return stamp;
+}
+
+}  // namespace
+
+void SlamSystem::PublishMappingView(bool mapped) {
+    if (!publish_rviz_ || !mapped || !scan_pub_) return;
+    const CloudPtr world = lio_->LatestWorldScan();
+    if (!world || world->empty()) return;
+    sensor_msgs::msg::PointCloud2 msg;
+    pcl::toROSMsg(*world, msg);
+    msg.header.frame_id = "map";
+    msg.header.stamp = StampFromSec(lio_->GetState().timestamp_);
+    scan_pub_->publish(msg);
+}
+
+void SlamSystem::AppendKeyframeToMap(const Keyframe::Ptr& kf) {
+    if (!publish_rviz_ || !kf || !kf->GetCloud() || !map_pub_) return;
+
+    PointCloudType transformed;
+    pcl::transformPointCloud(*kf->GetCloud(), transformed, kf->GetLIOPose().matrix().cast<float>());
+    if (!rviz_map_) rviz_map_.reset(new PointCloudType);
+    *rviz_map_ += transformed;
+
+    pcl::VoxelGrid<PointType> voxel;
+    voxel.setLeafSize(rviz_map_leaf_, rviz_map_leaf_, rviz_map_leaf_);
+    voxel.setInputCloud(rviz_map_);
+    CloudPtr filtered(new PointCloudType);
+    voxel.filter(*filtered);
+    rviz_map_ = filtered;
+
+    const auto stamp = StampFromSec(kf->GetState().timestamp_);
+    sensor_msgs::msg::PointCloud2 map_msg;
+    pcl::toROSMsg(*rviz_map_, map_msg);
+    map_msg.header.frame_id = "map";
+    map_msg.header.stamp = stamp;
+    map_pub_->publish(map_msg);
+
+    const SE3 pose = kf->GetLIOPose();
+    const auto q = pose.so3().unit_quaternion();
+    geometry_msgs::msg::PoseStamped pose_msg;
+    pose_msg.header.frame_id = "map";
+    pose_msg.header.stamp = stamp;
+    pose_msg.pose.position.x = pose.translation().x();
+    pose_msg.pose.position.y = pose.translation().y();
+    pose_msg.pose.position.z = pose.translation().z();
+    pose_msg.pose.orientation.x = q.x();
+    pose_msg.pose.orientation.y = q.y();
+    pose_msg.pose.orientation.z = q.z();
+    pose_msg.pose.orientation.w = q.w();
+    rviz_path_.header.frame_id = "map";
+    rviz_path_.header.stamp = stamp;
+    rviz_path_.poses.push_back(pose_msg);
+    path_pub_->publish(rviz_path_);
 }
 
 void SlamSystem::Spin() {

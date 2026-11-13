@@ -15,6 +15,7 @@
 #include "core/lio/feature_quality.h"
 #include "core/lio/registration_quality.h"
 #include "core/lio/scan_trajectory.h"
+#include "core/lio/scan_timing.h"
 #include "core/lio/surface_support.h"
 #include "core/lio/map_detail.h"
 #include "core/lio/imu_prediction.h"
@@ -132,6 +133,8 @@ class LaserMapping {
     CloudPtr CloudInImuFrame(const CloudPtr& cloud) const;
 
     CloudPtr GetScanUndist() const { return scan_undistort_; }
+    /// 当前已配准扫描，点已变到世界系（与 state_point_ 一致）。无有效扫描时返回空。
+    CloudPtr LatestWorldScan() const;
     CloudPtr GetProjCloud();
 
     /// 获取最新的点云
@@ -157,6 +160,7 @@ class LaserMapping {
     bool AdvanceImuPrediction(const IMUPtr& imu, const char* source);
     void RebaseImuPrediction(bool update_accepted);
     void RecordScan(trajectory::Status status);
+    bool NormalizeScanTime(CloudPtr cloud, double header, double& begin);
 
 
     inline void PointBodyToWorld(const PointType &pi, PointType &po) {
@@ -186,6 +190,8 @@ class LaserMapping {
     Options options_;
     trajectory::Recorder trajectory_recorder_;
     trajectory::Scan current_scan_record_;
+    timing::Options scan_timing_options_;
+    double last_normalized_end_ = -std::numeric_limits<double>::infinity();
 
     /// modules
     IVoxType::Options ivox_options_;

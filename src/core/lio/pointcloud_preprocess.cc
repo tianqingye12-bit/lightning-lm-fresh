@@ -1,5 +1,7 @@
 #include "pointcloud_preprocess.h"
+#include <algorithm>
 #include <execution>
+#include <stdexcept>
 
 #include <glog/logging.h>
 
@@ -181,10 +183,19 @@ void PointCloudPreprocess::VelodyneHandler(const sensor_msgs::msg::PointCloud2::
     cloud_out_.clear();
     cloud_full_.clear();
 
+    if (require_header_offsets_) {
+        const auto field = std::find_if(msg->fields.begin(), msg->fields.end(),
+            [](const auto& f) { return f.name == "time"; });
+        if (field == msg->fields.end() || field->count != 1 ||
+            field->datatype != sensor_msgs::msg::PointField::FLOAT32)
+            throw std::invalid_argument("relative_header Velodyne timing requires scalar FLOAT32 field 'time'");
+    }
+
     pcl::PointCloud<velodyne_ros::Point> pl_orig;
     pcl::fromROSMsg(*msg, pl_orig);
     int plsize = pl_orig.points.size();
     cloud_out_.reserve(plsize);
+    if (plsize == 0) return;
 
     /*** These variables only works when no point timestamps given ***/
     double omega_l = 3.61;  // scan angular velocity
@@ -194,7 +205,7 @@ void PointCloudPreprocess::VelodyneHandler(const sensor_msgs::msg::PointCloud2::
     std::vector<float> time_last(num_scans_, 0.0);  // last offset time
     /*****************************************************************/
 
-    if (pl_orig.points[plsize - 1].time > 0) {
+    if (require_header_offsets_ || pl_orig.points[plsize - 1].time > 0) {
         given_offset_time_ = true;
     } else {
         given_offset_time_ = false;
@@ -216,10 +227,11 @@ void PointCloudPreprocess::VelodyneHandler(const sensor_msgs::msg::PointCloud2::
         added_pt.y = pl_orig.points[i].y;
         added_pt.z = pl_orig.points[i].z;
         added_pt.intensity = pl_orig.points[i].intensity;
-        added_pt.time = pl_orig.points[i].time * time_scale_;  // curvature unit: ms
+        added_pt.time = static_cast<double>(pl_orig.points[i].time) * time_scale_;  // ms
 
         if (!given_offset_time_) {
             int layer = pl_orig.points[i].ring;
+            if (layer < 0 || layer >= num_scans_) continue;
             double yaw_angle = atan2(added_pt.y, added_pt.x) * 57.2957;
 
             if (is_first[layer]) {

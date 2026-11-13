@@ -18,6 +18,9 @@ int main(int argc, char** argv) {
     assert(timing.count == 6 && timing.nonfinite == 1 && timing.negative == 1);
     assert(timing.minimum_s == -.001 && timing.maximum_s == .1 && timing.last_s == .05);
     assert(InspectPointTiming(std::vector<Point>{}).count == 0);
+    assert(!UsablePointTiming(InspectPointTiming(std::vector<Point>{{.05},{98.56}}),.0006428));
+    assert(!UsablePointTiming(InspectPointTiming(std::vector<Point>{{-99.5},{.6428}}),.0006428));
+    assert(UsablePointTiming(InspectPointTiming(std::vector<Point>{{0},{100.14}}),.10014));
     Options options; assert(options.Valid() && !options.enabled);
     auto invalid=options; invalid.max_records=99; assert(!invalid.Valid());
     Recorder disabled; disabled.Add(Scan{}); assert(disabled.Scans().empty());
@@ -37,7 +40,7 @@ int main(int argc, char** argv) {
     const std::vector<Anchor> identity{{0,10,Pose(0),Pose(0)},{1,12,Pose(2),Pose(2)}};
     assert((Correct(11,Pose(1,1,.3),identity).pose.matrix()-Pose(1,1,.3).matrix()).norm()<1e-10);
 
-    Recorder recorder; options.enabled=true; recorder.Configure(options);
+    Recorder recorder; options.enabled=true; options.normalized_timing=true; recorder.Configure(options);
     for(int index=-1;index<=21;++index) {
         const double t=10+index*.1;
         const double a=(t-10)/2;
@@ -55,6 +58,8 @@ int main(int argc, char** argv) {
     for(int i=0;i<101;++i) { duplicate.begin=20+i*.1;duplicate.timestamp=duplicate.begin+.1;limited.Add(duplicate); }
     assert(limited.Scans().size()==100 && limited.Faults()==1);
     limited.Add(duplicate); assert(limited.Faults()==2);
+    limited.MarkFault(); assert(limited.Faults()==3);
+    disabled.MarkFault(); assert(disabled.Faults()==0);
     if(argc>1) {
         const std::filesystem::path directory(argv[1]);
         std::filesystem::create_directories(directory);

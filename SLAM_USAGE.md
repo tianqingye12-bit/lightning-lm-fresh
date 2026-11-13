@@ -47,31 +47,34 @@ ros2 service call /save_map std_srvs/srv/Trigger
 
 ## 4. 话题订阅
 
-SLAM 需要订阅：
-- `/rslidar_points` 或配置中的 `lidar_topic` - 点云
-- `/imu/data` 或配置中的 `imu_topic` - IMU 数据
+S100（`config/default_robosense.yaml`）订阅本机实测话题：
+- `/lidar/lidar_02/points` — RoboSense Airy 点云（`airy_frame`）
+- `/lidar/lidar_02/imu` — Airy 内置 IMU（与点云同机，用于去畸变）
+
+去车脚本（`config/garage_clean.yaml`）使用：
+- `/camera/color/image_raw`、`/camera/depth/image_raw`（本机无 compressed）
 
 ## 5. 配置文件
 
 ### 可用配置
 - `config/default.yaml` - 默认 LiDAR 配置
-- `config/default_robosense.yaml` - 速腾雷达配置
-- `config/garage_clean.yaml` - 地下车库（车辆去除用）
+- `config/default_robosense.yaml` - S100 / RoboSense Airy 在线配置
+- `config/garage_clean.yaml` - Astra 相机去车配置
 
 ### 主要参数
 
 ```yaml
 common:
-  lidar_topic: /rslidar_points      # 点云话题
-  imu_topic: /imu/data              # IMU 话题
+  lidar_topic: /lidar/lidar_02/points
+  imu_topic: /lidar/lidar_02/imu
   
 fasterlio:
-  lidar_type: 4                     # 0=Avia 1=Velodyne 2=Ouster 3=Robosense 4=其他
+  lidar_type: 4                     # 1=Livox 2=Velodyne 3=Ouster 4=RoboSense
   filter_size_map: 0.5              # 地图体素大小
   ivox_grid_resolution: 0.5         # iVox 网格分辨率
   
 system:
-  map_path: data/default_map        # 地图保存路径
+  map_path: ./data/s100_airy_map/   # 地图保存路径
   with_loop_closing: true           # 是否启用回环检测
   with_ui: true                     # 是否启用可视化
 ```

@@ -1,0 +1,281 @@
+# PC 端跨机观察 S100 / Lightning 在线建图
+# 用法（PC）：
+#   source /opt/ros/humble/setup.bash
+#   export ROS_DOMAIN_ID=0 RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+#   export FASTRTPS_DEFAULT_PROFILES_FILE=$HOME/fastdds_pc_peer.xml
+#   export FASTDDS_DEFAULT_PROFILES_FILE=$HOME/fastdds_pc_peer.xml
+#   rviz2 -d slam_online_pc.rviz
+#
+# Fixed Frame 使用 map。建图点云和轨迹由 run_slam_online 发布在 map 下：
+#   /lightning/map、/lightning/current_scan、/lightning/path
+# 需要 default_robosense.yaml 里 system.publish_rviz: true。
+
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+        - /Raw LiDAR (Airy)1
+        - /Lightning (future)1
+      Splitter Ratio: 0.5
+    Tree Height: 700
+  - Class: rviz_common/Selection
+    Name: Selection
+  - Class: rviz_common/Tool Properties
+    Name: Tool Properties
+    Expanded: ~
+    Splitter Ratio: 0.5
+  - Class: rviz_common/Views
+    Name: Views
+    Expanded:
+      - /Current View1
+    Splitter Ratio: 0.5
+  - Class: rviz_common/Time
+    Name: Time
+    SyncMode: 0
+    SyncSource: ""
+
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Cell Size: 1
+      Plane Cell Count: 40
+      Normal Cell Count: 0
+      Line Style:
+        Line Width: 0.03
+        Value: Lines
+      Color: 80; 80; 80
+      Alpha: 0.5
+      Plane: XY
+      Reference Frame: <Fixed Frame>
+      Offset: {X: 0, Y: 0, Z: 0}
+      Value: true
+
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: true
+      Frame Timeout: 15
+      Marker Scale: 0.6
+      Show Arrows: true
+      Show Axes: true
+      Show Names: true
+      Update Interval: 0
+      Value: true
+
+    - Class: rviz_default_plugins/RobotModel
+      Name: RobotModel
+      Enabled: false
+      Description Topic:
+        Value: /robot_description
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+      Visual Enabled: true
+      Collision Enabled: false
+      Alpha: 0.8
+      Value: false
+
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Raw LiDAR (Airy)
+      Enabled: false
+      Topic:
+        Value: /lidar/lidar_02/points
+        Depth: 2
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+      Queue Size: 2
+      Use Fixed Frame: true
+      Selectable: true
+      Style: Points
+      Size (m): 0.03
+      Size (Pixels): 2
+      Alpha: 1
+      Decay Time: 0
+      Color Transformer: AxisColor
+      Axis: Z
+      Autocompute Value Bounds:
+        Value: true
+        Min Value: -2
+        Max Value: 4
+      Position Transformer: XYZ
+      Channel Name: intensity
+      Value: false
+
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Raw LiDAR trail (调试用，会糊)
+      Enabled: false
+      Topic:
+        Value: /lidar/lidar_02/points
+        Depth: 2
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+      Queue Size: 2
+      Use Fixed Frame: true
+      Style: Points
+      Size (m): 0.02
+      Alpha: 0.4
+      Decay Time: 15
+      Color Transformer: FlatColor
+      Color: 180; 180; 255
+      Position Transformer: XYZ
+      Value: false
+
+    - Class: rviz_default_plugins/Image
+      Name: Camera color
+      Enabled: true
+      Topic:
+        Value: /camera/color/image_raw
+        Depth: 1
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+      Max Value: 1
+      Min Value: 0
+      Median window: 5
+      Normalize Range: true
+      Value: true
+
+    - Class: rviz_default_plugins/Odometry
+      Name: Wheel odom (参考)
+      Enabled: false
+      Topic:
+        Value: /odom
+        Depth: 10
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+      Keep: 100
+      Shape: Arrow
+      Color: 0; 200; 255
+      Position Tolerance: 0.05
+      Angle Tolerance: 0.05
+      Value: false
+
+    # 建图结果显示在 map 坐标系。原始雷达仍在 airy_frame，默认关掉。
+    - Class: rviz_common/Group
+      Name: Lightning (future)
+      Enabled: true
+      Displays:
+        - Class: rviz_default_plugins/PointCloud2
+          Name: /lightning/current_scan
+          Enabled: true
+          Topic:
+            Value: /lightning/current_scan
+            Depth: 2
+            Durability Policy: Volatile
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+          Style: Points
+          Size (m): 0.04
+          Alpha: 1
+          Decay Time: 0
+          Color Transformer: FlatColor
+          Color: 0; 255; 80
+          Position Transformer: XYZ
+          Value: true
+
+        - Class: rviz_default_plugins/PointCloud2
+          Name: /lightning/map
+          Enabled: true
+          Topic:
+            Value: /lightning/map
+            Depth: 1
+            Durability Policy: Transient Local
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+          Style: Points
+          Size (m): 0.03
+          Alpha: 0.85
+          Decay Time: 0
+          Color Transformer: Intensity
+          Channel Name: intensity
+          Position Transformer: XYZ
+          Value: true
+
+        - Class: rviz_default_plugins/Path
+          Name: /lightning/path
+          Enabled: true
+          Topic:
+            Value: /lightning/path
+            Depth: 1
+            Durability Policy: Transient Local
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+          Color: 255; 200; 0
+          Line Style: Lines
+          Line Width: 0.05
+          Buffer Length: 1
+          Value: true
+
+        - Class: rviz_default_plugins/Odometry
+          Name: /lightning/odom
+          Enabled: false
+          Topic:
+            Value: /lightning/odom
+            Depth: 20
+            Durability Policy: Volatile
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+          Keep: 200
+          Shape: Axes
+          Axes Length: 0.4
+          Axes Radius: 0.04
+          Value: false
+
+  Enabled: true
+  Global Options:
+    Background Color: 28; 28; 30
+    Fixed Frame: map
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/Interact
+      Hide Inactive Objects: true
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+      Line color: 128; 128; 0
+  Transformation:
+    Current:
+      Class: rviz_default_plugins/TF
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Name: Current View
+      Distance: 12
+      Focal Point: {X: 0, Y: 0, Z: 0}
+      Focal Shape Fixed Size: true
+      Focal Shape Size: 0.05
+      Invert Z Axis: false
+      Near Clip Distance: 0.01
+      Pitch: 0.55
+      Target Frame: <Fixed Frame>
+      Yaw: 0.8
+      Value: Orbit (rviz)
+      Enable Stereo Rendering:
+        Stereo Eye Separation: 0.06
+        Stereo Focal Distance: 1
+        Swap Stereo Eyes: false
+        Value: false
+    Saved: ~
+
+Window Geometry:
+  Displays:
+    collapsed: false
+  Height: 900
+  Width: 1600
+  Hide Left Dock: false
+  Hide Right Dock: false
+  Camera color:
+    collapsed: false
+  X: 60
+  Y: 40
