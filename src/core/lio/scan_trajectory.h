@@ -19,6 +19,7 @@ namespace lightning::trajectory {
 
 struct Options {
     bool enabled = false;
+    bool normalized_timing = false;
     int max_records = 200000;
     bool Valid() const { return max_records >= 100 && max_records <= 2000000; }
 };
@@ -61,6 +62,14 @@ template <class PointRange> PointTiming InspectPointTiming(const PointRange& poi
         else { out.minimum_s = std::min(out.minimum_s, value); out.maximum_s = std::max(out.maximum_s, value); }
     }
     return out;
+}
+
+inline bool UsablePointTiming(const PointTiming& points, double duration) {
+    return points.count >= 2 && points.nonfinite == 0 && points.negative == 0 &&
+        std::isfinite(points.minimum_s) && std::isfinite(points.maximum_s) &&
+        std::isfinite(duration) && duration > 0 && duration <= 1 &&
+        points.minimum_s >= 0 && points.minimum_s <= points.maximum_s &&
+        std::abs(points.maximum_s-duration) <= .002;
 }
 
 inline bool Rigid(const Eigen::Isometry3d& pose) {
@@ -128,6 +137,7 @@ class Recorder {
     bool Enabled() const { return options_.enabled; }
     const std::vector<Scan>& Scans() const { return scans_; }
     std::size_t Faults() const { return faults_; }
+    void MarkFault() { if (Enabled()) ++faults_; }
     void Add(const Scan& scan) {
         if (!Enabled()) return;
         if (scans_.size() >= static_cast<std::size_t>(options_.max_records) ||
@@ -173,9 +183,11 @@ class Recorder {
             const auto& s = scans_[i];
             const auto raw = Unpack(s.raw);
             const auto corrected = Correct(s.timestamp, raw, anchors);
+            const double duration = s.timestamp-s.begin;
+            const bool timing_valid = UsablePointTiming(s.points,duration);
             const bool usable = s.pose_valid && Rigid(raw) &&
                 (s.status == Status::Accepted || s.status == Status::Bootstrap) && !s.imu_gap &&
-                s.points.nonfinite == 0 && s.points.negative == 0 &&
+                timing_valid &&
                 std::isfinite(s.state_timestamp) && std::abs(s.state_timestamp-s.timestamp) <= 1e-5;
             usable_count += usable;
             file << i << ',' << s.begin << ',' << s.timestamp << ',' << s.state_timestamp << ',' << Name(s.status) << ',' << usable;
@@ -188,11 +200,15 @@ class Recorder {
         }
         file.close();
         auto metadata = open("trajectory.yaml");
-        metadata << "format_version: 1\npose_frame: imu\ncoordinate_frame: exported_map\n"
+        metadata << "format_version: " << (options_.normalized_timing ? 2 : 1)
+                 << "\npose_frame: imu\ncoordinate_frame: exported_map\n"
                  << "timestamp_reference: lidar_end\ncorrection_method: interpolated_keyframe_correction\n"
                  << "complete: " << (faults_ == 0 ? "true" : "false") << "\nrows: " << scans_.size()
                  << "\nusable_rows: " << usable_count << "\nrecording_faults: " << faults_
                  << "\nkeyframes: " << anchors.size() << '\n';
+        if (options_.normalized_timing)
+            metadata << "point_time_reference: scan_begin\nscan_timing_policy: relative_header\n"
+                     << "point_end_tolerance_s: 0.002\n";
         metadata.close();
     }
  private:

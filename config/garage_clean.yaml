@@ -1,24 +1,32 @@
-# 地下车库离线去车配置 (scripts/clean_map_vehicles.py)
-# 速腾雷达 + 奥比中光深度相机。标定参数必须替换为实测值，下方仅为占位。
+# S100 离线去车配置 (scripts/clean_map_vehicles.py)
+# 本机实测话题（Astra + Airy）：
+#   彩色 /camera/color/image_raw          （无 /compressed）
+#   深度 /camera/depth/image_raw
+#   雷达 /lidar/lidar_02/points
+# 内参取自当前 /camera/color/camera_info（640x480）。
+# 外参：Astra_Airy_72samples_2026-11-05（稳健点平面·Huber 10mm，72/81 帧）
+#   拟合 RMS 9.65 mm，整轮留出 9.91 mm；r05 整轮 9 帧被排除。
 
-color_topic: /camera/color/image_raw        # sensor_msgs/Image 或 CompressedImage
-# 与彩色图对齐的深度图 (奥比 ROS 驱动开启 depth_registration)，不用则留空，改用地图 z-buffer 判断遮挡
+color_topic: /camera/color/image_raw        # sensor_msgs/Image（本机无 compressed）
+# 与彩色图对齐的深度图；驱动若开 depth_registration 可改用对齐深度
 depth_topic: /camera/depth/image_raw
 depth_scale: 0.001                           # 深度图数值 -> 米 (16UC1 毫米为 0.001)
 
-width: 1280
-height: 720
-K: [1.0, 0.0, 640.0,
-    0.0, 1.0, 360.0,
-    0.0, 0.0, 1.0]                           # TODO: 彩色相机内参 (camera_info.k)
-distortion: [0.0, 0.0, 0.0, 0.0, 0.0]        # TODO: camera_info.d (plumb_bob)
-# 雷达坐标系 -> 彩色相机光学坐标系 (z 朝前, x 朝右, y 朝下), 行优先 4x4
-T_cam_lidar: [0.0, -1.0, 0.0, 0.0,
-              0.0, 0.0, -1.0, 0.0,
-              1.0, 0.0, 0.0, 0.0,
-              0.0, 0.0, 0.0, 1.0]            # TODO: 雷达-相机外参标定结果
+width: 640
+height: 480
+K: [570.3422047415297, 0.0, 319.5,
+    0.0, 570.3422047415297, 239.5,
+    0.0, 0.0, 1.0]                           # /camera/color/camera_info.k
+distortion: [0.0, 0.0, 0.0, 0.0, 0.0]        # 当前 camera_info.d 全 0（驱动默认，未精标定）
+# 雷达 → 相机光学坐标：p_cam = R_CL * p_lidar + t_CL（与标定报告 T_CL 一致）
+T_cam_lidar: [-0.002254466, -0.999996099,  0.001649104, -0.011029192,
+               0.299673027, -0.002248922, -0.954039317, -0.079439054,
+               0.954039304, -0.001656657,  0.299676928, -0.015268582,
+               0.0,          0.0,          0.0,          1.0]
 # 图像时间戳相对雷达时间戳的固定偏差 (秒)，t_lidar = t_image + time_offset
 time_offset: 0.0
+lidar_topic: /lidar/lidar_02/points          # 与 SLAM 配置一致，便于 bag/脚本复用
+
 
 # 检测
 yolo_model: yolo26n-seg.pt                   # 必须是分割模型 (-seg)，检测框会把背景一起删掉

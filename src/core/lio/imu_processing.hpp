@@ -19,6 +19,7 @@
 #include "core/lio/eskf.hpp"
 #include "core/lio/imu_filter.h"
 #include "core/lio/imu_prediction.h"
+#include "core/lio/scan_timing.h"
 #include "core/lio/pose6d.h"
 #include "utils/timer.h"
 
@@ -45,6 +46,7 @@ class ImuProcess {
     bool LastScanHadImuGap() const { return last_scan_had_gap_; }
     bool IsIMUInited() const { return imu_need_init_ == false; }
     void SetUseIMUFilter(bool b) { use_imu_filter_ = b; }
+    void RequireNormalizedScanTiming(bool enabled) { normalized_scan_timing_ = enabled; }
 
     double GetMeanAccNorm() const { return mean_acc_.norm(); }
     double GetAccScaleFactor() const { return acc_scale_factor_; }
@@ -84,6 +86,7 @@ class ImuProcess {
     bool propagation_fault_ = false;
     bool last_scan_had_gap_ = false;
     bool use_imu_filter_ = true;
+    bool normalized_scan_timing_ = false;
     IMUFilter filter_;
 };
 
@@ -196,17 +199,50 @@ inline void ImuProcess::UndistortPcl(const MeasureGroup &meas, ESKF &kf_state, C
                    << " state_time=" << std::setprecision(16) << before.GetX().timestamp_
                    << " scan_end=" << pcl_end_time << "; restart SLAM and replay slower";
     };
-    if (!std::isfinite(pcl_beg_time) || !std::isfinite(pcl_end_time) || pcl_beg_time > pcl_end_time ||
-        !prediction::PlanPropagation(kf_state.GetX().timestamp_, pcl_end_time).valid) {
-        fail("invalid frame interval or gap longer than 1 second");
+    // Soft-skip recoverable backlog/gaps. Only latch on clearly corrupt samples.
+    const auto soft_skip = [&](const char* reason) {
+        kf_state = before;
+        last_scan_had_gap_ = true;
+        pcl_out.reset(new PointCloudType());
+        LOG(WARNING) << "[imu_clock] skip scan (" << reason << ") state_time="
+                     << std::setprecision(16) << before.GetX().timestamp_
+                     << " scan_end=" << pcl_end_time;
+    };
+    if (!std::isfinite(pcl_beg_time) || !std::isfinite(pcl_end_time) || pcl_beg_time > pcl_end_time) {
+        fail("invalid frame interval");
+        return;
+    }
+    if (!prediction::PlanPropagation(kf_state.GetX().timestamp_, pcl_end_time).valid) {
+        const double state_time = kf_state.GetX().timestamp_;
+        // A forward dropout must move the clock. Restoring the old time makes every later
+        // scan fail the same 1s check, so mapping never resumes after the lidar returns.
+        if (pcl_end_time > state_time + 1.0 && !meas.imu_.empty() &&
+            meas.imu_.back()->timestamp + 1e-3 >= pcl_end_time) {
+            auto state = kf_state.GetX();
+            state.timestamp_ = pcl_end_time;
+            state.vel_.setZero();
+            kf_state.ChangeX(state);
+            last_imu_ = meas.imu_.back();
+            last_lidar_end_time_ = pcl_end_time;
+            angvel_last_.setZero();
+            last_scan_had_gap_ = true;
+            pcl_out.reset(new PointCloudType());
+            LOG(WARNING) << "[imu_clock] reanchor across forward gap of " << std::setprecision(6)
+                         << (pcl_end_time - state_time) << "s; this scan is not inserted";
+            return;
+        }
+        soft_skip("gap longer than 1 second / backlog");
         return;
     }
     double previous_stamp = v_imu.front()->timestamp;
     for (const auto& imu : v_imu) {
-        if (!std::isfinite(imu->timestamp) || imu->timestamp < previous_stamp ||
-            imu->timestamp > pcl_end_time + 1e-6 || !imu->angular_velocity.allFinite() ||
+        if (!std::isfinite(imu->timestamp) || !imu->angular_velocity.allFinite() ||
             !imu->linear_acceleration.allFinite()) {
-            fail("invalid or unordered IMU samples");
+            fail("invalid IMU samples");
+            return;
+        }
+        if (imu->timestamp < previous_stamp || imu->timestamp > pcl_end_time + 1e-6) {
+            soft_skip("unordered IMU or last_imu newer than stale scan");
             return;
         }
         previous_stamp = imu->timestamp;
@@ -214,6 +250,19 @@ inline void ImuProcess::UndistortPcl(const MeasureGroup &meas, ESKF &kf_state, C
 
     auto imu_state = kf_state.GetX();
     imu_pose_.clear();
+    if (normalized_scan_timing_ && imu_state.timestamp_ > pcl_beg_time) {
+        const double dt_start = pcl_beg_time-imu_state.timestamp_;
+        if (timing::CanBackcast(pcl_beg_time, imu_state.timestamp_)) {
+            // Adjacent Velodyne packets can overlap by fractions of a millisecond.
+            // Include this bounded prefix in deskew, without moving the ESKF clock backwards.
+            const Mat3d rotation = (imu_state.rot_ * SO3::exp(angvel_last_*dt_start)).matrix();
+            imu_pose_.emplace_back(0., acc_s_last_, angvel_last_,
+                imu_state.vel_+acc_s_last_*dt_start,
+                imu_state.pos_+imu_state.vel_*dt_start+.5*acc_s_last_*dt_start*dt_start, rotation);
+        } else {
+            last_scan_had_gap_ = true;  // Predict through the interval; skip registration and insertion.
+        }
+    }
     imu_pose_.emplace_back(imu_state.timestamp_ - pcl_beg_time, acc_s_last_, angvel_last_,
                            imu_state.vel_, imu_state.pos_, imu_state.rot_.matrix());
     Vec3d angvel_avr, acc_avr, acc_imu, vel_imu, pos_imu;

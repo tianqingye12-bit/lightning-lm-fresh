@@ -97,7 +97,36 @@ int check_gap_and_recovery() {
     return 0;
 }
 
+int check_normalized_prefix(double overlap) {
+    ImuProcess proc;
+    proc.SetUseIMUFilter(false);
+    proc.RequireNormalizedScanTiming(true);
+    proc.SetAccCov(Vec3d::Constant(.1));proc.SetGyrCov(Vec3d::Constant(.1));
+    ESKF filter;
+    MeasureGroup init;init.lidar_begin_time_=0;init.lidar_end_time_=.2;
+    for (int i=0;i<=20;++i) init.imu_.push_back(sample(i*.01,9.81));
+    CloudPtr out(new PointCloudType);proc.Process(init,filter,out);
+    auto state=filter.GetX();state.vel_=Vec3d(2,0,0);filter.ChangeX(state);
+    // Initialized gyro bias cancels the constant gyro; this isolates prefix translation.
+    MeasureGroup scan;scan.lidar_begin_time_=.2-overlap;scan.lidar_end_time_=.3;
+    scan.scan_.reset(new PointCloudType);
+    for (int i=1;i<=10;++i) scan.imu_.push_back(sample(.2+i*.01,9.81));
+    for (int i=0;i<=20;++i) {
+        const double t=-overlap+(.1+overlap)*i/20.;
+        PointType p;p.x=10-2*t;p.y=0;p.z=1;p.time=(t+overlap)*1000.;p.intensity=1;
+        scan.scan_->push_back(p);
+    }
+    const double old_interval=lo::lidar_time_interval;
+    lo::lidar_time_interval=.1+overlap;
+    proc.Process(scan,filter,out);lo::lidar_time_interval=old_interval;
+    if (std::abs(filter.GetX().timestamp_-.3)>1e-10) return 20;
+    if(overlap>.002) return out->empty()&&proc.LastScanHadImuGap() ? 0 : 21;
+    if(out->empty()||proc.LastScanHadImuGap()) return 22;
+    for(const auto& p:*out) if(std::abs(p.x-9.8)>1e-5) return 23;
+    return 0;
+}
+
 int main() {
     return check(0., 9.81) || check(2., 9.81) || check(0., 10.02) || check(0., 1.02) ||
-           check_gap_and_recovery();
+           check_gap_and_recovery() || check_normalized_prefix(.0006) || check_normalized_prefix(.003);
 }

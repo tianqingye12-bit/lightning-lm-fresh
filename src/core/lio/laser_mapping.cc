@@ -143,12 +143,28 @@ bool LaserMapping::LoadParamsFromYAML(const std::string &yaml_file) {
         if (!options_.registration_quality_.Valid()) throw std::invalid_argument("invalid registration_quality options");
 
         trajectory::Options recording;
+        const auto timing_config = yaml["fasterlio"]["scan_timing"];
+        if (timing_config && !timing_config.IsMap()) throw std::invalid_argument("scan_timing must be a map");
+        if (timing_config) {
+            const auto reference = timing_config["reference"].as<std::string>("legacy");
+            if (reference != "legacy" && reference != "relative_header")
+                throw std::invalid_argument("scan_timing.reference must be legacy or relative_header");
+            scan_timing_options_.enabled = reference == "relative_header";
+            scan_timing_options_.min_duration_s = timing_config["min_duration_s"].as<double>(.05);
+            scan_timing_options_.max_duration_s = timing_config["max_duration_s"].as<double>(.15);
+            scan_timing_options_.max_header_offset_s = timing_config["max_header_offset_s"].as<double>(.2);
+        }
+        if (!scan_timing_options_.Valid() || (scan_timing_options_.enabled && lidar_type != 2))
+            throw std::invalid_argument("relative_header timing requires Velodyne and valid duration/window limits");
+        preprocess_->RequireHeaderOffsets(scan_timing_options_.enabled);
+        p_imu_->RequireNormalizedScanTiming(scan_timing_options_.enabled);
         const auto trajectory_config = yaml["fasterlio"]["trajectory_recording"];
         if (trajectory_config && !trajectory_config.IsMap()) throw std::invalid_argument("trajectory_recording must be a map");
         if (trajectory_config) {
             recording.enabled = trajectory_config["enabled"].as<bool>(false);
             recording.max_records = trajectory_config["max_records"].as<int>(200000);
         }
+        recording.normalized_timing = scan_timing_options_.enabled;
         trajectory_recorder_.Configure(recording);
 
         const auto detail = yaml["fasterlio"]["map_detail"];
@@ -218,6 +234,9 @@ bool LaserMapping::LoadParamsFromYAML(const std::string &yaml_file) {
               << " diagnostics=" << options_.registration_quality_.diagnostics
               << " rotation_scale_m=" << options_.registration_quality_.rotation_scale_m;
     LOG(INFO) << "[scan_trajectory] enabled=" << trajectory_recorder_.Enabled();
+    LOG(INFO) << "[scan_timing] reference=" << (scan_timing_options_.enabled ? "relative_header" : "legacy")
+              << " duration_limits_s=" << scan_timing_options_.min_duration_s << ","
+              << scan_timing_options_.max_duration_s;
     LOG(INFO) << "feature quality: pca=" << options_.plane_quality_.enabled
               << " min_spread=" << options_.plane_quality_.min_spread
               << " tangent_ratio=" << options_.plane_quality_.min_tangent_ratio
@@ -440,8 +459,20 @@ bool LaserMapping::Run() {
     Measure(runtime_stats_, RuntimeStats::deskew, [&] { p_imu_->Process(measures_, kf_, scan_undistort_); });
 
     if (!scan_undistort_ || scan_undistort_->empty()) {
-        if (p_imu_->IsIMUInited()) RebaseImuPrediction(false);
-        LOG(WARNING) << "No point or unreliable IMU coverage, skip this scan!";
+        if (p_imu_->IsIMUInited()) {
+            const double jumped = kf_.GetX().timestamp_ - last_accepted_lio_time_;
+            if (last_accepted_lio_time_ > 0 && jumped > 1.0) last_accepted_lio_time_ = kf_.GetX().timestamp_;
+            RebaseImuPrediction(false);
+        }
+        const char* reason = p_imu_->HasPropagationFault() ? "propagation_fault"
+                             : !p_imu_->IsIMUInited()      ? "imu_initializing"
+                             : p_imu_->LastScanHadImuGap() ? "imu_gap_>0.10s"
+                             : measures_.imu_.empty()      ? "empty_imu_package"
+                                                           : "empty_cloud_after_deskew";
+        LOG(WARNING) << "No point or unreliable IMU coverage, skip this scan! reason=" << reason
+                     << " imu_n=" << measures_.imu_.size() << std::setprecision(14)
+                     << " lidar=[" << measures_.lidar_begin_time_ << "," << measures_.lidar_end_time_ << "]"
+                     << " latest_imu=" << last_timestamp_imu_;
         RecordScan(p_imu_->HasPropagationFault() ? trajectory::Status::PropagationFault :
                    !p_imu_->IsIMUInited() ? trajectory::Status::Initializing :
                    p_imu_->LastScanHadImuGap() ? trajectory::Status::ImuGap : trajectory::Status::NoPoints);
@@ -750,6 +781,30 @@ void LaserMapping::MakeKF() {
     // }
 }
 
+bool LaserMapping::NormalizeScanTime(CloudPtr cloud, double header, double& begin) {
+    begin = header;
+    if (!scan_timing_options_.enabled) return true;
+    const auto interval = timing::NormalizeHeaderOffsets(cloud->points, header, scan_timing_options_);
+    if (!interval.valid || interval.end <= last_normalized_end_ ||
+        (std::isfinite(last_normalized_end_) && header <= last_timestamp_lidar_)) {
+        input_buffer_fault_ = true; imu_prediction_suspended_ = true;
+        trajectory_recorder_.MarkFault();
+        if (ui_) ui_->UpdatePredictionStatus(false, "scan_timing_fault", 0);
+        LOG(ERROR) << "[scan_timing] stopped: " << (interval.valid ? "non-increasing scan end" : interval.reason)
+                   << " header=" << std::setprecision(16) << header
+                   << " raw_min_s=" << interval.minimum_s << " raw_max_s=" << interval.maximum_s
+                   << "; inspect the raw time field and restart; no timing fallback";
+        return false;
+    }
+    begin = interval.begin;
+    last_normalized_end_ = interval.end;
+    if (scan_count_ == 1 || scan_count_ % 200 == 0)
+        LOG(INFO) << "[scan_timing] begin=" << std::setprecision(16) << begin << " end=" << interval.end
+                  << " duration_s=" << interval.end-begin << " raw_min_s=" << interval.minimum_s
+                  << " raw_max_s=" << interval.maximum_s;
+    return true;
+}
+
 void LaserMapping::ProcessPointCloud2(const sensor_msgs::msg::PointCloud2::SharedPtr &msg) {
     UL lock(mtx_buffer_);
     if (input_buffer_fault_) return;
@@ -764,6 +819,10 @@ void LaserMapping::ProcessPointCloud2(const sensor_msgs::msg::PointCloud2::Share
             scan_count_++;
             double timestamp = ToSec(msg->header.stamp);
             if (timestamp < last_timestamp_lidar_) {
+                if (scan_timing_options_.enabled) {
+                    input_buffer_fault_ = true; imu_prediction_suspended_ = true;
+                    trajectory_recorder_.MarkFault();
+                }
                 LOG(ERROR) << "lidar loop back, dt: " << timestamp - last_timestamp_lidar_;
                 return;
             }
@@ -772,10 +831,20 @@ void LaserMapping::ProcessPointCloud2(const sensor_msgs::msg::PointCloud2::Share
                       << ", latest imu: " << last_timestamp_imu_;
 
             CloudPtr cloud(new PointCloudType());
-            Measure(runtime_stats_, RuntimeStats::preprocess, [&] { preprocess_->Process(msg, cloud); });
+            try {
+                Measure(runtime_stats_, RuntimeStats::preprocess, [&] { preprocess_->Process(msg, cloud); });
+            } catch (const std::exception& error) {
+                if (!scan_timing_options_.enabled) throw;
+                input_buffer_fault_ = true; imu_prediction_suspended_ = true;
+                trajectory_recorder_.MarkFault();
+                LOG(ERROR) << "[scan_timing] stopped during preprocessing: " << error.what();
+                return;
+            }
 
+            double begin = timestamp;
+            if (!NormalizeScanTime(cloud, timestamp, begin)) return;
             lidar_buffer_.push_back(cloud);
-            time_buffer_.push_back(timestamp);
+            time_buffer_.push_back(begin);
             last_timestamp_lidar_ = timestamp;
         },
         "Preprocess (Standard)");
@@ -784,6 +853,11 @@ void LaserMapping::ProcessPointCloud2(const sensor_msgs::msg::PointCloud2::Share
 void LaserMapping::ProcessPointCloud2(const livox_ros_driver2::msg::CustomMsg::SharedPtr &msg) {
     UL lock(mtx_buffer_);
     if (input_buffer_fault_) return;
+    if (scan_timing_options_.enabled) {
+        input_buffer_fault_ = true; imu_prediction_suspended_ = true;trajectory_recorder_.MarkFault();
+        LOG(ERROR) << "[scan_timing] relative_header profile accepts Velodyne PointCloud2 only";
+        return;
+    }
     if (max_lidar_buffer_ && lidar_buffer_.size() >= max_lidar_buffer_) {
         ++dropped_input_lidar_;
         if (dropped_input_lidar_ == 1 || dropped_input_lidar_ % 20 == 0)
@@ -827,12 +901,19 @@ void LaserMapping::ProcessPointCloud2(CloudPtr cloud) {
 
             double timestamp = math::ToSec(cloud->header.stamp);
             if (timestamp < last_timestamp_lidar_) {
+                if (scan_timing_options_.enabled) {
+                    input_buffer_fault_ = true; imu_prediction_suspended_ = true;trajectory_recorder_.MarkFault();
+                    LOG(ERROR) << "[scan_timing] non-increasing input header";return;
+                }
                 LOG(ERROR) << "lidar loop back, clear buffer";
                 lidar_buffer_.clear();
             }
 
+            if (scan_timing_options_.enabled) cloud.reset(new PointCloudType(*cloud));
+            double begin = timestamp;
+            if (!NormalizeScanTime(cloud, timestamp, begin)) return;
             lidar_buffer_.push_back(cloud);
-            time_buffer_.push_back(timestamp);
+            time_buffer_.push_back(begin);
             last_timestamp_lidar_ = timestamp;
         },
         "Preprocess (Standard)");
@@ -844,27 +925,60 @@ bool LaserMapping::SyncPackages() {
         return false;
     }
 
+    // Drop stale front frames when the queue falls behind (common on S100).
+    // Otherwise one stuck sync holds the head while newer clouds pile up, then
+    // Undistort sees a >1s jump and used to latch a permanent propagation fault.
+    while (!time_buffer_.empty() && last_timestamp_imu_ > 0 &&
+           (last_timestamp_imu_ - time_buffer_.front()) > 0.75) {
+        LOG(WARNING) << "[runtime] drop stale lidar head age_s="
+                     << (last_timestamp_imu_ - time_buffer_.front())
+                     << " queue=" << lidar_buffer_.size();
+        lidar_buffer_.pop_front();
+        time_buffer_.pop_front();
+        lidar_pushed_ = false;
+        ++dropped_input_lidar_;
+    }
+    if (lidar_buffer_.empty() || imu_buffer_.empty()) return false;
+
     /*** push a lidar scan ***/
     if (!lidar_pushed_) {
         measures_.scan_ = lidar_buffer_.front();
         measures_.lidar_begin_time_ = time_buffer_.front();
 
-        if (measures_.scan_->points.size() <= 1) {
+        if (scan_timing_options_.enabled) {
+            const auto points = trajectory::InspectPointTiming(measures_.scan_->points);
+            if (points.count < 2 || points.nonfinite || points.negative ||
+                !std::isfinite(points.maximum_s) || std::abs(points.minimum_s) > 1e-6 ||
+                points.maximum_s < scan_timing_options_.min_duration_s ||
+                points.maximum_s > scan_timing_options_.max_duration_s) {
+                input_buffer_fault_ = true;
+                imu_prediction_suspended_ = true;trajectory_recorder_.MarkFault();
+                LOG(ERROR) << "[scan_timing] normalized scan failed synchronization validation";
+                return false;
+            }
+            lidar_end_time_ = measures_.lidar_begin_time_ + points.maximum_s;
+            lidar_mean_scantime_ = points.maximum_s;
+        } else if (measures_.scan_->points.size() <= 1) {
             LOG(WARNING) << "Too few input point cloud!";
             lidar_end_time_ = measures_.lidar_begin_time_ + lidar_mean_scantime_;
-        } else if (measures_.scan_->points.back().time / double(1000) < 0.5 * lidar_mean_scantime_) {
-            lidar_end_time_ = measures_.lidar_begin_time_ + lidar_mean_scantime_;
         } else {
-            scan_num_++;
-            lidar_end_time_ = measures_.lidar_begin_time_ + measures_.scan_->points.back().time / double(1000);
-
-            lidar_mean_scantime_ +=
-                (measures_.scan_->points.back().time / double(1000) - lidar_mean_scantime_) / scan_num_;
-
-            if ((lidar_end_time_ - measures_.lidar_begin_time_) > 5 * lo::lidar_time_interval) {
-                /// timestamp 有异常
-                lidar_end_time_ = measures_.lidar_begin_time_ + lo::lidar_time_interval;
-                lidar_mean_scantime_ = lo::lidar_time_interval;
+            // Use max relative time, not points.back() (Airy order is usually sorted, but
+            // max is the correct scan end even if a later push reorders).
+            double max_time_ms = 0;
+            for (const auto& pt : measures_.scan_->points) {
+                if (std::isfinite(pt.time) && pt.time > max_time_ms) max_time_ms = pt.time;
+            }
+            const double span_s = max_time_ms / 1000.0;
+            if (span_s < 0.5 * lidar_mean_scantime_ && lidar_mean_scantime_ > 0) {
+                lidar_end_time_ = measures_.lidar_begin_time_ + lidar_mean_scantime_;
+            } else {
+                scan_num_++;
+                lidar_end_time_ = measures_.lidar_begin_time_ + span_s;
+                lidar_mean_scantime_ += (span_s - lidar_mean_scantime_) / scan_num_;
+                if ((lidar_end_time_ - measures_.lidar_begin_time_) > 5 * lo::lidar_time_interval) {
+                    lidar_end_time_ = measures_.lidar_begin_time_ + lo::lidar_time_interval;
+                    lidar_mean_scantime_ = lo::lidar_time_interval;
+                }
             }
         }
 
@@ -1338,6 +1452,14 @@ void LaserMapping::SaveMap() {
     pcl::io::savePCDFileBinaryCompressed("./data/lio.pcd", *global_map);
 
     LOG(INFO) << "lio map is saved to ./data/lio.pcd";
+}
+
+CloudPtr LaserMapping::LatestWorldScan() const {
+    if (!scan_down_body_ || scan_down_body_->empty()) return nullptr;
+    CloudPtr world(new PointCloudType);
+    const SE3 T_world_lidar = state_point_.GetPose() * GetTImuLidar();
+    pcl::transformPointCloud(*scan_down_body_, *world, T_world_lidar.matrix().cast<float>());
+    return world;
 }
 
 CloudPtr LaserMapping::GetRecentCloud() {

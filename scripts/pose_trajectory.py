@@ -13,13 +13,17 @@ MODES = ('anchor', 'head_hold', 'tail_hold', 'interpolated_correction')
 
 
 def trajectory_options(cfg):
-    options = dict(source='auto', max_gap_s=.2)
+    options = dict(source='auto', max_gap_s=.2, require_normalized_timing=False)
     supplied = cfg.get('pose_trajectory', {})
     if not isinstance(supplied, dict) or set(supplied)-set(options):
         raise ValueError('Unknown pose_trajectory option')
     options.update(supplied)
     if options['source'] not in ('auto', 'dense', 'keyframes'):
         raise ValueError('pose_trajectory.source must be auto, dense or keyframes')
+    if not isinstance(options['require_normalized_timing'], bool):
+        raise ValueError('require_normalized_timing must be boolean')
+    if options['require_normalized_timing'] and options['source'] != 'dense':
+        raise ValueError('require_normalized_timing requires source=dense')
     gap = options['max_gap_s']
     if isinstance(gap, bool) or not isinstance(gap, (int, float)) or not np.isfinite(gap) or gap <= 0 or gap > 2:
         raise ValueError('pose_trajectory.max_gap_s must be numeric in (0, 2]')
@@ -78,10 +82,18 @@ class PoseTrajectory:
         if contract != 'imu_v2':
             raise ValueError('Dense IMU trajectory requires the version-2 map frame contract')
         metadata = yaml.safe_load((directory/'trajectory.yaml').read_text())
-        required = dict(format_version=1, pose_frame='imu', coordinate_frame='exported_map',
+        required = dict(pose_frame='imu', coordinate_frame='exported_map',
                         timestamp_reference='lidar_end', correction_method='interpolated_keyframe_correction')
-        if not isinstance(metadata, dict) or any(metadata.get(k) != v for k,v in required.items()):
+        if (not isinstance(metadata, dict) or metadata.get('format_version') not in (1,2) or
+                any(metadata.get(k) != v for k,v in required.items())):
             raise ValueError('Unsupported dense trajectory coordinate/version contract')
+        normalized = metadata['format_version'] == 2
+        if normalized and (metadata.get('point_time_reference') != 'scan_begin' or
+                metadata.get('scan_timing_policy') != 'relative_header' or
+                metadata.get('point_end_tolerance_s') != .002):
+            raise ValueError('Unsupported normalized point timing contract')
+        if self.options['require_normalized_timing'] and not normalized:
+            raise ValueError('This profile needs a NEW map recorded with scan_timing.reference=relative_header; old usable flags cannot repair timing')
         if metadata.get('complete') is not True or metadata.get('recording_faults') != 0:
             raise ValueError('Dense recording incomplete (capacity/time fault); no automatic sparse fallback')
         for key in ('rows', 'usable_rows', 'keyframes'):
@@ -120,9 +132,22 @@ class PoseTrajectory:
                 if min(counters)<0 or row['imu_gap'] not in ('0','1'):
                     raise ValueError('Invalid dense scan timing flags')
                 bad_points = sum(counters)
+                end_difference = float(row['point_end_difference_s'])
+                timing_bad = not np.isfinite(end_difference) or abs(end_difference) > .002
+                if normalized:
+                    begin = float(row['begin_time'])
+                    duration = float(row['scan_duration_s'])
+                    minimum,maximum = float(row['point_min_s']),float(row['point_max_s'])
+                    if not np.isfinite([begin,duration,minimum,maximum]).all():
+                        timing_bad = True
+                    else:
+                        timing_bad |= (int(row['point_count']) < 2 or not 0 < duration <= 1 or
+                            abs(vector[0]-begin-duration) > 1e-6 or abs(minimum) > 1e-6 or minimum < 0 or minimum > maximum or
+                            abs(maximum-duration) > .002 or
+                            abs(end_difference-(maximum-duration)) > 1e-6)
                 if valid and (row['status'] not in ('accepted','bootstrap') or row['imu_gap'] != '0' or
-                              bad_points or not np.isfinite(clock_error) or abs(clock_error) > 1e-5):
-                    raise ValueError('Dense usable flag contradicts scan quality')
+                              bad_points or timing_bad or not np.isfinite(clock_error) or abs(clock_error) > 1e-5):
+                    raise ValueError('Dense usable flag contradicts scan quality/point timing; rebuild a NEW map, do not change usable flags')
                 values.extend(vector); usable.append(valid); modes.append(MODES.index(row['correction_mode']))
                 status_counts[row['status']] = status_counts.get(row['status'],0)+1
                 timing['imu_gap_scans'] += int(row['imu_gap'])
@@ -139,13 +164,18 @@ class PoseTrajectory:
         # Every graph anchor must be represented exactly in this recording.
         for i,t in enumerate(self.t):
             j = int(np.searchsorted(self.dense_t,t))
-            if (j == len(data) or abs(self.dense_t[j]-t)>1e-6 or not self.usable[j] or
+            candidates = [k for k in (j-1,j) if 0 <= k < len(data)]
+            j = min(candidates,key=lambda k:abs(self.dense_t[k]-t))
+            if abs(self.dense_t[j]-t)<=1e-6 and not self.usable[j]:
+                raise ValueError(f'Saved keyframe {self.ids[i]} is marked unusable in dense trajectory; inspect point timing and rebuild a NEW map')
+            if (abs(self.dense_t[j]-t)>1e-6 or
                     np.linalg.norm(self.dense_p[j]-self.p[i])>1e-5 or
                     abs(abs(np.dot(self.dense_q[j],self.q[i]))-1)>1e-6):
                 raise ValueError('Dense trajectory does not reproduce a saved keyframe pose')
         self.source = 'dense'
         self.description = dict(source='dense', max_gap_s=float(self.options['max_gap_s']),
             rows=len(data), usable_rows=int(self.usable.sum()), statuses=status_counts, timing=timing,
+            format_version=metadata['format_version'],normalized_timing=normalized,
             correction_method=metadata['correction_method'], hashes={name:file_digest(directory/name) for name in DENSE_FILES})
 
     def _lookup(self, timestamp):

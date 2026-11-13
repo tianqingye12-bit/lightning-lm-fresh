@@ -8,9 +8,10 @@ from clean_map_vehicles import Trajectory
 from clean_map_runtime import load_frame_contract
 
 directory=Path(sys.argv[1])
-cfg=dict(max_kf_gap=3,pose_trajectory=dict(source='dense',max_gap_s=.2))
+cfg=dict(max_kf_gap=3,pose_trajectory=dict(source='dense',max_gap_s=.2,require_normalized_timing=True))
 traj=load_trajectory(directory,cfg,Trajectory)
 assert traj.source=='dense' and traj.description['rows']==23 and traj.description['usable_rows']==22
+assert traj.description['format_version']==2 and traj.description['normalized_timing']
 expected=np.array([5+np.cos(.4)-np.sin(.4),np.sin(.4)+np.cos(.4),0])
 np.testing.assert_allclose(traj.pose(11)[:3,3],expected,atol=1e-10)
 assert np.linalg.norm(traj.pose(11)[:3,3]-traj.keyframes.pose(11)[:3,3])>.5

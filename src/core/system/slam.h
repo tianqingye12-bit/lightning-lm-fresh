@@ -6,6 +6,7 @@
 #define LIGHTNING_SLAM_H
 
 #include <rclcpp/rclcpp.hpp>
+#include <nav_msgs/msg/path.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <string>
@@ -79,6 +80,9 @@ class SlamSystem {
     /// ros端保存地图的实现
     void SaveMap(const SaveMapService::Request::SharedPtr request, SaveMapService::Response::SharedPtr response);
 
+    void PublishMappingView(bool mapped);
+    void AppendKeyframeToMap(const Keyframe::Ptr& kf);
+
     void Enqueue(SerialWorker::Kind kind, std::function<void()> task);
     void ReportRuntime();
     std::unique_ptr<SerialWorker> online_worker_;
@@ -113,6 +117,14 @@ class SlamSystem {
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_ = nullptr;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_ = nullptr;
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr livox_sub_ = nullptr;
+
+    bool publish_rviz_ = false;
+    float rviz_map_leaf_ = 0.5f;
+    CloudPtr rviz_map_;
+    nav_msgs::msg::Path rviz_path_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr map_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr scan_pub_;
+    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
 };
 }  // namespace lightning
 
