@@ -28,16 +28,23 @@ def write_profile(source,output):
     return result
 
 
-def prepare(source,output,resolution=.1):
+def prepare(source,output,resolution=.1,require_dense=False):
     from clean_map_runtime import load_frame_contract
     from clean_map_keyframes import load_manifest
     from clean_map_vehicles import Trajectory,read_pcd
     from voxel_pcd_stream import VoxelPcdStream
+    from pose_trajectory import DENSE_FILES, load_trajectory
     source=Path(source).expanduser().resolve()
     if (source/'INCOMPLETE').exists():raise ValueError('Source map is incomplete')
     if not np.isfinite(resolution) or not .02<=resolution<=.2:raise ValueError('Resolution must be in [0.02,0.2] metres')
     _,contract=load_frame_contract(source)
     trajectory=Trajectory(source/'keyframes.txt',2.)
+    dense_present=[(source/name).is_file() for name in DENSE_FILES]
+    if require_dense and any(dense_present) and not all(dense_present):
+        raise ValueError('Source contains a partial dense trajectory; restore the complete export before preparing')
+    if require_dense:
+        load_trajectory(source,dict(max_kf_gap=2.,pose_trajectory=dict(
+            source='dense',max_gap_s=.2,require_normalized_timing=True)),Trajectory)
     original=source/'global.pcd'
     entries=None
     if not original.is_file():
@@ -68,9 +75,12 @@ def prepare(source,output,resolution=.1):
             if writer is not None:writer.close()
     for name in ('keyframes.txt','map_frames.yaml'):
         if (source/name).exists():shutil.copy2(source/name,output/name)
+    if require_dense:
+        for name in DENSE_FILES: shutil.copy2(source/name,output/name)
     report=dict(source_map=str(source),output_map=str(output),preparation=mode,
         reconstruction_resolution_m=resolution if entries is not None else None,
-        source_unchanged=True,semantic_cleaning_performed=False)
+        source_unchanged=True,semantic_cleaning_performed=False,
+        dense_trajectory_copied=bool(require_dense),normalized_dense_verified=bool(require_dense))
     (output/'PREPARED_MAP.json').write_text(json.dumps(report,indent=2)+'\n')
     (output/'INCOMPLETE').unlink()
     print(f'Map-mode input ready: {output}',flush=True)
@@ -84,8 +94,10 @@ if __name__=='__main__':
     profile=sub.add_parser('config');profile.add_argument('--input',required=True);profile.add_argument('--output',required=True)
     preparation=sub.add_parser('prepare');preparation.add_argument('--map',required=True);preparation.add_argument('--output',required=True)
     preparation.add_argument('--voxel-size',type=float,default=.1)
+    preparation.add_argument('--require-dense',action='store_true',
+        help='Validate the normalized dense trajectory before creating a map-mode input')
     args=parser.parse_args()
     try:
         if args.command=='config':write_profile(args.input,args.output)
-        else:prepare(args.map,args.output,args.voxel_size)
+        else:prepare(args.map,args.output,args.voxel_size,args.require_dense)
     except (ValueError,TypeError,OSError,yaml.YAMLError) as error:parser.exit(1,f'{error}\n')

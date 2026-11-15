@@ -19,6 +19,7 @@
 #include "core/lio/eskf.hpp"
 #include "core/lio/imu_filter.h"
 #include "core/lio/imu_prediction.h"
+#include "core/lio/scan_timing.h"
 #include "core/lio/pose6d.h"
 #include "utils/timer.h"
 
@@ -45,6 +46,7 @@ class ImuProcess {
     bool LastScanHadImuGap() const { return last_scan_had_gap_; }
     bool IsIMUInited() const { return imu_need_init_ == false; }
     void SetUseIMUFilter(bool b) { use_imu_filter_ = b; }
+    void RequireNormalizedScanTiming(bool enabled) { normalized_scan_timing_ = enabled; }
 
     double GetMeanAccNorm() const { return mean_acc_.norm(); }
     double GetAccScaleFactor() const { return acc_scale_factor_; }
@@ -84,6 +86,7 @@ class ImuProcess {
     bool propagation_fault_ = false;
     bool last_scan_had_gap_ = false;
     bool use_imu_filter_ = true;
+    bool normalized_scan_timing_ = false;
     IMUFilter filter_;
 };
 
@@ -214,6 +217,19 @@ inline void ImuProcess::UndistortPcl(const MeasureGroup &meas, ESKF &kf_state, C
 
     auto imu_state = kf_state.GetX();
     imu_pose_.clear();
+    if (normalized_scan_timing_ && imu_state.timestamp_ > pcl_beg_time) {
+        const double dt_start = pcl_beg_time-imu_state.timestamp_;
+        if (timing::CanBackcast(pcl_beg_time, imu_state.timestamp_)) {
+            // Adjacent Velodyne packets can overlap by fractions of a millisecond.
+            // Include this bounded prefix in deskew, without moving the ESKF clock backwards.
+            const Mat3d rotation = (imu_state.rot_ * SO3::exp(angvel_last_*dt_start)).matrix();
+            imu_pose_.emplace_back(0., acc_s_last_, angvel_last_,
+                imu_state.vel_+acc_s_last_*dt_start,
+                imu_state.pos_+imu_state.vel_*dt_start+.5*acc_s_last_*dt_start*dt_start, rotation);
+        } else {
+            last_scan_had_gap_ = true;  // Predict through the interval; skip registration and insertion.
+        }
+    }
     imu_pose_.emplace_back(imu_state.timestamp_ - pcl_beg_time, acc_s_last_, angvel_last_,
                            imu_state.vel_, imu_state.pos_, imu_state.rot_.matrix());
     Vec3d angvel_avr, acc_avr, acc_imu, vel_imu, pos_imu;

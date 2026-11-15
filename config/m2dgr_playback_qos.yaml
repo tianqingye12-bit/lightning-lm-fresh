@@ -1,0 +1,10 @@
+/velodyne_points:
+  reliability: reliable
+  durability: volatile
+  history: keep_last
+  depth: 100
+/handsfree/imu:
+  reliability: reliable
+  durability: volatile
+  history: keep_last
+  depth: 100

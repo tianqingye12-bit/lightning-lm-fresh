@@ -1,0 +1,94 @@
+color_topic: /camera/color/image_raw/compressed
+depth_topic: ''
+depth_scale: 0.001
+width: 640
+height: 480
+K:
+- 617.971050917033
+- 0.0
+- 327.710279392468
+- 0.0
+- 616.44513152479
+- 253.976983707814
+- 0.0
+- 0.0
+- 1.0
+distortion:
+- 0.148000794688248
+- -0.217835187249065
+- 0.0
+- 0.0
+T_cam_lidar:
+- -0.0
+- -1.0
+- -0.0
+- 0.00065
+- -0.0
+- -0.0
+- -1.0
+- 0.65376
+- 1.0
+- 0.0
+- 0.0
+- -0.30456
+- 0.0
+- 0.0
+- 0.0
+- 1.0
+time_offset: 0.0
+yolo_model: yolo26n-seg.pt
+yolo_conf: 0.25
+vehicle_classes:
+- 1
+- 2
+- 3
+- 5
+- 7
+mask_dilate_px: 2
+depth_margin: 2.0
+image_period: 0.2
+max_kf_gap: 2.0
+voxel_size: 0.1
+max_range: 15.0
+occlusion_tol: 0.25
+min_views: 3
+vehicle_ratio: 0.5
+floor_cell: 1.0
+floor_keep: 0.12
+cluster_voxel: 0.15
+cluster_min_observed: 20
+cluster_vehicle_ratio: 0.5
+cluster_max_extent:
+- 7.0
+- 7.0
+- 3.0
+view_selection:
+  translation_m: 0.0
+  rotation_deg: 0.0
+  max_period_s: 0.0
+cache:
+  enabled: true
+  directory: ''
+rviz_max_points: 300000
+diagnostics:
+  every_views: 20
+  max_overlays: 20
+clean_mode: keyframes
+keyframe_clean:
+  max_image_dt_s: 0.35
+  max_active_frames: 8
+storage:
+  write_global_clean: false
+  write_removed_points: false
+  compress_keyframes: true
+semantic_evidence:
+  enabled: true
+  min_classified_ratio: 0.6
+  min_positive_baseline_m: 0.05
+  write_uncertain: false
+segmentation_quality:
+  enabled: true
+  min_instance_confidence: 0.4
+  class_confidence: {}
+  core_erode_px: 1
+  min_mean_confidence: 0.55
